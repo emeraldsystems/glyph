@@ -89,6 +89,18 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_binary_expr_prec(&mut self, min_prec: u8) -> Option<Expr> {
         let mut lhs = self.parse_call_or_primary()?;
 
+        // `expr as Type` binds tighter than any binary operator.
+        while self.at(TokenKind::As) {
+            self.advance();
+            let target = self.parse_type_expr()?;
+            let span = Span::new(self.expr_start(&lhs), target.span().end);
+            lhs = Expr::Cast {
+                expr: Box::new(lhs),
+                target,
+                span,
+            };
+        }
+
         loop {
             let Some(op) = self.peek_binary_op() else {
                 break;

@@ -308,6 +308,7 @@ impl<'a> Parser<'a> {
             Expr::Match { span, .. } => span.start,
             Expr::Tuple { span, .. } => span.start,
             Expr::Try { span, .. } => span.start,
+            Expr::Cast { span, .. } => span.start,
             Expr::ForIn { span, .. } => span.start,
         }
     }
@@ -333,6 +334,7 @@ impl<'a> Parser<'a> {
             Expr::Match { span, .. } => span.end,
             Expr::Tuple { span, .. } => span.end,
             Expr::Try { span, .. } => span.end,
+            Expr::Cast { span, .. } => span.end,
             Expr::ForIn { span, .. } => span.end,
         }
     }

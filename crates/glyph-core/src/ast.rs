@@ -32,6 +32,18 @@ pub enum TypeExpr {
     },
 }
 
+impl TypeExpr {
+    pub fn span(&self) -> Span {
+        match self {
+            TypeExpr::Path { span, .. }
+            | TypeExpr::App { span, .. }
+            | TypeExpr::Ref { span, .. }
+            | TypeExpr::Array { span, .. }
+            | TypeExpr::Tuple { span, .. } => *span,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
     Int(i64),
@@ -131,6 +143,11 @@ pub enum Expr {
     },
     Try {
         expr: Box<Expr>,
+        span: Span,
+    },
+    Cast {
+        expr: Box<Expr>,
+        target: TypeExpr,
         span: Span,
     },
     ForIn {

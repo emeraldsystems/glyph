@@ -103,6 +103,11 @@ pub enum Rvalue {
         lhs: MirValue,
         rhs: MirValue,
     },
+    Cast {
+        value: MirValue,
+        from: Type,
+        to: Type,
+    },
     Call {
         name: String,
         args: Vec<MirValue>,

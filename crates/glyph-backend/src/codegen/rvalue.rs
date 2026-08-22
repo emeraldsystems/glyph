@@ -145,11 +145,77 @@ impl CodegenContext {
         }
     }
 
+    /// Emit `expr as T` numeric conversions. Sign/zero extension follows the
+    /// SOURCE type's signedness (Rust semantics); float->int truncates toward
+    /// zero with the DEST type's signedness.
+    pub(super) fn codegen_numeric_cast(
+        &mut self,
+        val: LLVMValueRef,
+        from: &Type,
+        to: &Type,
+    ) -> Result<LLVMValueRef> {
+        let src_unsigned = matches!(
+            from,
+            Type::U8 | Type::U32 | Type::U64 | Type::Usize | Type::Char | Type::Bool
+        );
+        let dst_signed = matches!(to, Type::I8 | Type::I32 | Type::I64);
+        let from_is_float = from.is_float();
+        let to_is_float = to.is_float();
+
+        unsafe {
+            let dst_llvm = self.get_llvm_type(to)?;
+            let src_llvm = LLVMTypeOf(val);
+            if src_llvm == dst_llvm {
+                return Ok(val);
+            }
+            let name = CString::new("cast")?;
+
+            let result = match (from_is_float, to_is_float) {
+                (true, true) => {
+                    if matches!(to, Type::F64) {
+                        LLVMBuildFPExt(self.builder, val, dst_llvm, name.as_ptr())
+                    } else {
+                        LLVMBuildFPTrunc(self.builder, val, dst_llvm, name.as_ptr())
+                    }
+                }
+                (true, false) => {
+                    if dst_signed {
+                        LLVMBuildFPToSI(self.builder, val, dst_llvm, name.as_ptr())
+                    } else {
+                        LLVMBuildFPToUI(self.builder, val, dst_llvm, name.as_ptr())
+                    }
+                }
+                (false, true) => {
+                    if src_unsigned {
+                        LLVMBuildUIToFP(self.builder, val, dst_llvm, name.as_ptr())
+                    } else {
+                        LLVMBuildSIToFP(self.builder, val, dst_llvm, name.as_ptr())
+                    }
+                }
+                (false, false) => {
+                    let src_bits = LLVMGetIntTypeWidth(src_llvm);
+                    let dst_bits = LLVMGetIntTypeWidth(dst_llvm);
+                    if dst_bits > src_bits {
+                        if src_unsigned {
+                            LLVMBuildZExt(self.builder, val, dst_llvm, name.as_ptr())
+                        } else {
+                            LLVMBuildSExt(self.builder, val, dst_llvm, name.as_ptr())
+                        }
+                    } else {
+                        LLVMBuildTrunc(self.builder, val, dst_llvm, name.as_ptr())
+                    }
+                }
+            };
+            Ok(result)
+        }
+    }
+
     pub(super) fn rvalue_tag(&self, rvalue: &Rvalue) -> &'static str {
         match rvalue {
             Rvalue::ConstInt(_) => "ConstInt",
             Rvalue::ConstFloat(_) => "ConstFloat",
             Rvalue::ConstBool(_) => "ConstBool",
+            Rvalue::Cast { .. } => "Cast",
             Rvalue::StringLit { .. } => "StringLit",
             Rvalue::Move(_) => "Move",
             Rvalue::Binary { .. } => "Binary",
@@ -300,6 +366,10 @@ impl CodegenContext {
                 Rvalue::ConstFloat(fl) => {
                     let ty = LLVMDoubleTypeInContext(self.context);
                     Ok(LLVMConstReal(ty, *fl))
+                }
+                Rvalue::Cast { value, from, to } => {
+                    let val = self.codegen_value(value, func, local_map)?;
+                    self.codegen_numeric_cast(val, from, to)
                 }
                 Rvalue::ConstBool(b) => {
                     let ty = LLVMInt1TypeInContext(self.context);

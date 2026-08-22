@@ -541,6 +541,7 @@ pub fn expr_span(expr: &Expr) -> Span {
         Expr::Match { span, .. } => *span,
         Expr::Tuple { span, .. } => *span,
         Expr::Try { span, .. } => *span,
+        Expr::Cast { span, .. } => *span,
         Expr::ForIn { span, .. } => *span,
     }
 }

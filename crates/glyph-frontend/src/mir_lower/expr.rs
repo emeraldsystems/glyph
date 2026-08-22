@@ -218,6 +218,15 @@ pub(crate) fn lower_expr_with_expected<'a>(
             Some(Rvalue::ConstFloat(*fl))
         }
         Expr::Lit(glyph_core::ast::Literal::Bool(b), _) => Some(Rvalue::ConstBool(*b)),
+        Expr::Lit(glyph_core::ast::Literal::Char(c), _) => {
+            let tmp = ctx.fresh_local(None);
+            ctx.locals[tmp.0 as usize].ty = Some(Type::Char);
+            ctx.push_inst(MirInst::Assign {
+                local: tmp,
+                value: Rvalue::ConstInt(*c as i64),
+            });
+            Some(Rvalue::Move(tmp))
+        }
         Expr::Lit(glyph_core::ast::Literal::Str(s), _) => Some(Rvalue::StringLit {
             content: s.clone(),
             global_name: ctx.fresh_string_global(),
@@ -303,8 +312,60 @@ pub(crate) fn lower_expr_with_expected<'a>(
         } => lower_method_call(ctx, receiver, method, args, *span),
         Expr::Tuple { elements, span } => lower_tuple_expr(ctx, elements, *span),
         Expr::Try { expr, span } => lower_try(ctx, expr, *span),
+        Expr::Cast { expr, target, span } => lower_cast(ctx, expr, target, *span),
         _ => None,
     }
+}
+
+fn lower_cast<'a>(
+    ctx: &mut LowerCtx<'a>,
+    expr: &'a Expr,
+    target: &glyph_core::ast::TypeExpr,
+    span: Span,
+) -> Option<Rvalue> {
+    use super::types::{resolve_type_name, type_expr_to_string};
+
+    let Some(to_ty) = resolve_type_name(&type_expr_to_string(target), ctx.resolver) else {
+        ctx.error("unknown cast target type", Some(span));
+        return None;
+    };
+
+    if !(to_ty.is_int() || to_ty.is_float()) {
+        ctx.error(
+            format!(
+                "cast target must be a numeric type (integer or float), got '{}'",
+                type_expr_to_string(target)
+            ),
+            Some(span),
+        );
+        return None;
+    }
+
+    let value = lower_value(ctx, expr)?;
+    let from_ty = infer_value_type(&value, ctx).unwrap_or(Type::I32);
+
+    let castable_source = from_ty.is_int()
+        || from_ty.is_float()
+        || matches!(from_ty, Type::Char | Type::Bool);
+    if !castable_source {
+        ctx.error(
+            "only numeric values (integers, floats, char, bool) can be cast with 'as'",
+            Some(span),
+        );
+        return None;
+    }
+
+    let tmp = ctx.fresh_local(None);
+    ctx.locals[tmp.0 as usize].ty = Some(to_ty.clone());
+    ctx.push_inst(MirInst::Assign {
+        local: tmp,
+        value: Rvalue::Cast {
+            value,
+            from: from_ty,
+            to: to_ty,
+        },
+    });
+    Some(Rvalue::Move(tmp))
 }
 
 fn lookup_const_value<'a>(ctx: &mut LowerCtx<'a>, name: &str, span: Span) -> Option<ConstValue> {
@@ -1743,6 +1804,9 @@ pub(crate) fn lower_value_with_expected<'a>(
             UnaryOp::Not => lower_unary_not(ctx, expr, *span).and_then(rvalue_to_value),
             UnaryOp::Neg => lower_unary_neg(ctx, expr, *span).and_then(rvalue_to_value),
         },
+        Expr::Cast { expr, target, span } => {
+            lower_cast(ctx, expr, target, *span).and_then(rvalue_to_value)
+        }
         Expr::Binary { op, lhs, rhs, .. } => match *op {
             glyph_core::ast::BinaryOp::And | glyph_core::ast::BinaryOp::Or => {
                 lower_logical(ctx, op, lhs, rhs).and_then(rvalue_to_value)

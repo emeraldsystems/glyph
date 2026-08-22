@@ -173,6 +173,7 @@ pub(crate) fn update_local_type_from_rvalue(ctx: &mut LowerCtx, local: LocalId, 
 pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
     match rv {
         Rvalue::ConstFloat(_) => Some(Type::F64),
+        Rvalue::Cast { to, .. } => Some(to.clone()),
         Rvalue::StructLit { struct_name, .. } => Some(Type::Named(struct_name.clone())),
         Rvalue::Move(local) => ctx
             .locals
@@ -293,6 +294,7 @@ pub(crate) fn expr_span(expr: &Expr) -> Option<Span> {
         Expr::InterpString { span, .. } => Some(*span),
         Expr::Tuple { span, .. } => Some(*span),
         Expr::Try { span, .. } => Some(*span),
+        Expr::Cast { span, .. } => Some(*span),
         Expr::ForIn { span, .. } => Some(*span),
     }
 }
