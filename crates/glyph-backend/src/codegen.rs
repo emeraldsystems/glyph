@@ -29,8 +29,10 @@ pub struct CodegenContext {
     string_globals: HashMap<String, LLVMValueRef>,
     function_types: HashMap<String, LLVMTypeRef>,
     function_ref_thunks: HashMap<String, LLVMValueRef>,
+    closure_artifacts: HashMap<String, ClosureArtifacts>,
     sret_functions: HashMap<String, Type>,
     target_data: Option<LLVMTargetDataRef>,
+    requested_target_triple: Option<String>,
     argv_global: Option<LLVMValueRef>,
     argc_global: Option<LLVMValueRef>,
     argv_vec_global: Option<LLVMValueRef>,
@@ -38,11 +40,19 @@ pub struct CodegenContext {
     clone_fns: HashMap<String, LLVMValueRef>,
 }
 
+#[derive(Clone, Copy)]
+struct ClosureArtifacts {
+    env_type: LLVMTypeRef,
+    invoke: LLVMValueRef,
+    drop: LLVMValueRef,
+}
+
 mod aggregate;
 mod array;
 mod atomic;
 mod callable;
 mod clone;
+mod closure;
 mod context;
 mod emit;
 mod entry;
@@ -57,6 +67,7 @@ mod ownership;
 mod rvalue;
 mod string;
 mod string_ops;
+mod thread;
 mod types;
 mod vec;
 

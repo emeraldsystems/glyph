@@ -96,7 +96,10 @@ fn main() -> i32 {
         output.diagnostics
     );
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("Cast"), "MIR should contain a Cast rvalue");
+    assert!(
+        mir_text.contains("Cast"),
+        "MIR should contain a Cast rvalue"
+    );
 }
 
 #[test]

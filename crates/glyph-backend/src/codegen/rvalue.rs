@@ -239,7 +239,11 @@ impl CodegenContext {
             Rvalue::StringClone { .. } => "StringClone",
             Rvalue::Call { .. } => "Call",
             Rvalue::FunctionRef { .. } => "FunctionRef",
+            Rvalue::MakeClosure { .. } => "MakeClosure",
             Rvalue::CallIndirect { .. } => "CallIndirect",
+            Rvalue::ThreadSpawnUnit { .. } => "ThreadSpawnUnit",
+            Rvalue::ThreadJoinUnit { .. } => "ThreadJoinUnit",
+            Rvalue::ThreadDetachUnit { .. } => "ThreadDetachUnit",
             Rvalue::Ref { .. } => "Ref",
             Rvalue::ArrayLit { .. } => "ArrayLit",
             Rvalue::ArrayIndex { .. } => "ArrayIndex",
@@ -974,11 +978,27 @@ impl CodegenContext {
                 Rvalue::FunctionRef { name, signature } => {
                     self.codegen_function_ref(name, signature, functions, mir_module)
                 }
+                Rvalue::MakeClosure {
+                    function,
+                    signature,
+                    captures,
+                } => self.codegen_make_closure(
+                    function, signature, captures, func, local_map, functions, mir_module,
+                ),
                 Rvalue::CallIndirect {
                     callee,
                     signature,
                     args,
                 } => self.codegen_call_indirect(*callee, signature, args, func, local_map),
+                Rvalue::ThreadSpawnUnit { task, out_handle } => {
+                    self.codegen_thread_spawn_unit(*task, *out_handle, func, local_map)
+                }
+                Rvalue::ThreadJoinUnit { handle } => {
+                    self.codegen_thread_join_unit(*handle, func, local_map)
+                }
+                Rvalue::ThreadDetachUnit { handle } => {
+                    self.codegen_thread_detach_unit(*handle, func, local_map)
+                }
                 Rvalue::Ref { base, .. } => {
                     let base_ptr = local_map
                         .get(base)

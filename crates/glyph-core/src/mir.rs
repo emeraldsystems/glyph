@@ -22,6 +22,24 @@ pub struct Local {
     pub skip_drop: bool,
 }
 
+/// Ownership action performed when a local enters a closure environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaptureTransfer {
+    /// Duplicate a trivially copyable value; the source remains usable.
+    Copy,
+    /// Transfer the sole owner into the environment; the source is consumed.
+    Move,
+}
+
+/// One deterministic field in a compiler-generated closure environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirCapture {
+    pub name: String,
+    pub local: LocalId,
+    pub ty: Type,
+    pub transfer: CaptureTransfer,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MirModule {
     pub struct_types: HashMap<String, StructType>,
@@ -86,6 +104,13 @@ pub enum MirInst {
         else_bb: BlockId,
     },
     Drop(LocalId),
+    /// Nonblocking cleanup for an internal native-thread handle local.
+    ///
+    /// The handle local has the private MIR representation `RawPtr<I8>`.
+    /// Codegen calls `glyph_thread_detach` only while it is non-null. The
+    /// surface language must expose a canonical nominal `JoinHandle<()>`
+    /// instead of allowing this raw representation to be named or forged.
+    DropThreadHandle(LocalId),
     Nop,
 }
 
@@ -121,11 +146,42 @@ pub enum Rvalue {
         name: String,
         signature: Type,
     },
+    /// Construct an owned callable around a lifted closure body.
+    ///
+    /// The lifted function receives capture values first, in this vector's
+    /// order, followed by the callable's declared parameters. Its return type
+    /// must match `signature`. The backend owns the environment layout and
+    /// generates the erased invoke/drop thunks.
+    MakeClosure {
+        function: String,
+        signature: Type,
+        captures: Vec<MirCapture>,
+    },
     /// Consume an owned callable and invoke it once.
     CallIndirect {
         callee: LocalId,
         signature: Type,
         args: Vec<MirValue>,
+    },
+    /// Transfer an owned `FnOnce() -> ()` carrier to a native thread.
+    ///
+    /// `out_handle` is private compiler storage with type `RawPtr<I8>`. The
+    /// result is the runtime's `i32` status: zero means that `out_handle` now
+    /// owns a live joinable thread, while a negative value means the runtime
+    /// consumed and dropped the callable without publishing a handle.
+    ThreadSpawnUnit {
+        task: LocalId,
+        out_handle: LocalId,
+    },
+    /// Join a private unit-thread handle, returning the runtime `i32` status.
+    /// The runtime nulls handle storage only after a successful join.
+    ThreadJoinUnit {
+        handle: LocalId,
+    },
+    /// Detach a private unit-thread handle, returning the runtime `i32` status.
+    /// The runtime nulls handle storage only after a successful detach.
+    ThreadDetachUnit {
+        handle: LocalId,
     },
     StructLit {
         struct_name: String,
@@ -312,17 +368,24 @@ pub enum Rvalue {
         value: MirValue,
         scalar: AtomicScalar,
     },
+    /// Atomically load from addressable storage. `atomic` must name either an
+    /// `Atomic<T>` local or a `Ref<Atomic<T>>`; the latter preserves identity
+    /// when storage is borrowed, captured, or selected from an aggregate.
     AtomicLoad {
         atomic: LocalId,
         scalar: AtomicScalar,
         ordering: AtomicOrdering,
     },
+    /// Atomically store through the same addressable target contract as
+    /// [`Rvalue::AtomicLoad`]. Atomic mutation is interior mutability, so an
+    /// immutable reference to the wrapper is sufficient.
     AtomicStore {
         atomic: LocalId,
         value: MirValue,
         scalar: AtomicScalar,
         ordering: AtomicOrdering,
     },
+    /// Atomic read-modify-write through an addressable atomic target.
     AtomicRmw {
         atomic: LocalId,
         value: MirValue,
@@ -330,8 +393,9 @@ pub enum Rvalue {
         op: AtomicRmwOp,
         ordering: AtomicOrdering,
     },
-    /// Returns the value observed before the compare-exchange attempt. The
-    /// exchange succeeded exactly when the result equals `expected`.
+    /// Compare-exchange through an addressable atomic target. Returns the
+    /// value observed before the attempt; the exchange succeeded exactly when
+    /// the result equals `expected`.
     AtomicCompareExchange {
         atomic: LocalId,
         expected: MirValue,
@@ -375,7 +439,7 @@ pub enum MirValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalId, MirValue, Rvalue};
+    use super::{CaptureTransfer, LocalId, MirCapture, MirValue, Rvalue};
     use crate::atomic::{AtomicOrdering, AtomicRmwOp, AtomicScalar};
     use crate::types::Type;
 
@@ -392,8 +456,18 @@ mod tests {
             },
             Rvalue::CallIndirect {
                 callee: LocalId(4),
-                signature,
+                signature: signature.clone(),
                 args: vec![MirValue::Int(3), MirValue::Bool(true)],
+            },
+            Rvalue::MakeClosure {
+                function: "main::__closure_0".into(),
+                signature: signature.clone(),
+                captures: vec![MirCapture {
+                    name: "message".into(),
+                    local: LocalId(2),
+                    ty: Type::String,
+                    transfer: CaptureTransfer::Move,
+                }],
             },
         ];
 

@@ -8,7 +8,8 @@ use crate::resolver::{ConstValue, ResolvedSymbol};
 use super::call::{call_types_compatible, lower_call, lower_method_call};
 use super::context::{LocalState, LowerCtx};
 use super::flow::{
-    lower_block_with_expected, lower_for, lower_for_in, lower_if_value, lower_while,
+    lower_block_with_expected, lower_closure_rvalue, lower_for, lower_for_in, lower_if_value,
+    lower_while,
 };
 use super::types::{tuple_struct_name, vec_elem_type_from_type};
 use super::value::{
@@ -356,15 +357,18 @@ pub(crate) fn lower_expr_with_expected<'a>(
             start,
             end,
             body,
-            ..
+            span,
         } => {
-            lower_for(ctx, var, start, end, body);
+            lower_for(ctx, var, start, end, body, *span);
             None
         }
         Expr::ForIn {
-            var, iter, body, ..
+            var,
+            iter,
+            body,
+            span,
         } => {
-            lower_for_in(ctx, var, iter, body);
+            lower_for_in(ctx, var, iter, body, *span);
             None
         }
         Expr::StructLit { name, fields, span } => lower_struct_lit(ctx, name, fields, *span),
@@ -387,13 +391,12 @@ pub(crate) fn lower_expr_with_expected<'a>(
         Expr::Tuple { elements, span } => lower_tuple_expr(ctx, elements, *span),
         Expr::Try { expr, span } => lower_try(ctx, expr, *span),
         Expr::Cast { expr, target, span } => lower_cast(ctx, expr, target, *span),
-        Expr::Closure { span, .. } => {
-            ctx.error(
-                "closure syntax is available, but closure conversion is not implemented yet",
-                Some(*span),
-            );
-            None
-        }
+        Expr::Closure {
+            capture,
+            params,
+            body,
+            span,
+        } => lower_closure_rvalue(ctx, *capture, params, body, *span, expected),
     }
 }
 
@@ -928,7 +931,8 @@ pub(crate) fn lower_match<'a>(
                         let payload_ty = substitute_match_params(&payload_ty, enum_args.as_deref());
                         let binding_local = ctx.fresh_local(Some(&bind_ident.0));
                         ctx.locals[binding_local.0 as usize].ty = Some(payload_ty.clone());
-                        ctx.bindings.insert(&bind_ident.0, binding_local);
+                        ctx.bind_name(&bind_ident.0, binding_local);
+                        ctx.register_source_binding(&bind_ident.0, arm.span, binding_local);
                         ctx.push_inst(MirInst::Assign {
                             local: binding_local,
                             value: Rvalue::EnumPayload {
@@ -1979,12 +1983,24 @@ pub(crate) fn lower_value_with_expected<'a>(
             lower_tuple_expr(ctx, elements, *span).and_then(rvalue_to_value)
         }
         Expr::Try { expr, span } => lower_try(ctx, expr, *span).and_then(rvalue_to_value),
-        Expr::Closure { span, .. } => {
-            ctx.error(
-                "closure syntax is available, but closure conversion is not implemented yet",
-                Some(*span),
-            );
-            None
+        Expr::Closure {
+            capture,
+            params,
+            body,
+            span,
+        } => {
+            let rv = lower_closure_rvalue(ctx, *capture, params, body, *span, expected)?;
+            let signature = match &rv {
+                Rvalue::MakeClosure { signature, .. } => signature.clone(),
+                _ => unreachable!("closure lowering always constructs a closure"),
+            };
+            let tmp = ctx.fresh_local(None);
+            ctx.locals[tmp.0 as usize].ty = Some(signature);
+            ctx.push_inst(MirInst::Assign {
+                local: tmp,
+                value: rv,
+            });
+            Some(MirValue::Local(tmp))
         }
         _ => None,
     }

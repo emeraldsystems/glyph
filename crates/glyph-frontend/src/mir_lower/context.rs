@@ -6,6 +6,7 @@ use glyph_core::mir::{BlockId, Local, LocalId, MirBlock, MirInst, MirValue, Rval
 use glyph_core::span::Span;
 use glyph_core::types::Type;
 
+use crate::closure_analysis::ClosureInfo;
 use crate::resolver::ResolverContext;
 
 use super::signatures::FnSig;
@@ -32,7 +33,7 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) fn_sigs: &'a HashMap<String, FnSig>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) locals: Vec<Local>,
-    pub(crate) bindings: HashMap<&'a str, LocalId>,
+    pub(crate) bindings: HashMap<String, LocalId>,
     pub(crate) next_local: u32,
     pub(crate) function_name: String,
     pub(crate) fn_ret_type: Option<Type>,
@@ -40,8 +41,18 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) current: BlockId,
     pub(crate) loop_stack: Vec<LoopContext>,
     pub(crate) scope_stack: Vec<Vec<LocalId>>,
+    /// Previous lexical bindings to restore when the corresponding local
+    /// scope exits. MIR locals remain function-wide, but source names must
+    /// still obey block shadowing.
+    binding_undo: Vec<Vec<(String, Option<LocalId>)>>,
     pub(crate) local_states: Vec<LocalState>,
     pub(crate) string_counter: u32,
+    /// Source declaration identities are stable across closure analysis and
+    /// MIR lowering even when the same spelling is shadowed.
+    pub(crate) source_binding_locals: HashMap<(String, u32, u32), LocalId>,
+    pub(crate) closure_infos: Vec<ClosureInfo>,
+    pub(crate) lifted_functions: Vec<glyph_core::mir::MirFunction>,
+    pub(crate) closure_name_root: String,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -61,15 +72,58 @@ impl<'a> LowerCtx<'a> {
             locals: Vec::new(),
             bindings: HashMap::new(),
             next_local: 0,
-            function_name,
+            function_name: function_name.clone(),
             fn_ret_type: None,
             blocks,
             current: BlockId(0),
             loop_stack: Vec::new(),
             scope_stack: vec![Vec::new()],
+            binding_undo: vec![Vec::new()],
             local_states: Vec::new(),
             string_counter: 0,
+            source_binding_locals: HashMap::new(),
+            closure_infos: Vec::new(),
+            lifted_functions: Vec::new(),
+            closure_name_root: function_name,
         }
+    }
+
+    pub(crate) fn bind_name(&mut self, name: &str, local: LocalId) {
+        let previous = self.bindings.insert(name.to_string(), local);
+        self.binding_undo
+            .last_mut()
+            .expect("MIR lowering always has a lexical scope")
+            .push((name.to_string(), previous));
+    }
+
+    pub(crate) fn register_source_binding(
+        &mut self,
+        name: &str,
+        declaration_span: Span,
+        local: LocalId,
+    ) {
+        self.source_binding_locals.insert(
+            (
+                name.to_string(),
+                declaration_span.start,
+                declaration_span.end,
+            ),
+            local,
+        );
+    }
+
+    pub(crate) fn source_binding_local(
+        &self,
+        name: &str,
+        declaration_span: Span,
+    ) -> Option<LocalId> {
+        self.source_binding_locals
+            .get(&(
+                name.to_string(),
+                declaration_span.start,
+                declaration_span.end,
+            ))
+            .copied()
     }
 
     pub(crate) fn error(&mut self, message: impl Into<String>, span: Option<Span>) {
@@ -235,6 +289,7 @@ impl<'a> LowerCtx<'a> {
 
     pub(crate) fn enter_scope(&mut self) {
         self.scope_stack.push(Vec::new());
+        self.binding_undo.push(Vec::new());
     }
 
     pub(crate) fn exit_scope(&mut self) {
@@ -244,6 +299,15 @@ impl<'a> LowerCtx<'a> {
         if let Some(locals) = self.scope_stack.pop() {
             for local in locals.into_iter().rev() {
                 self.drop_local_if_needed(local);
+            }
+        }
+        if let Some(bindings) = self.binding_undo.pop() {
+            for (name, previous) in bindings.into_iter().rev() {
+                if let Some(local) = previous {
+                    self.bindings.insert(name, local);
+                } else {
+                    self.bindings.remove(&name);
+                }
             }
         }
     }
@@ -575,6 +639,17 @@ impl<'a> LowerCtx<'a> {
             Rvalue::CallIndirect { callee, .. } => {
                 if let Some(state) = self.local_states.get_mut(callee.0 as usize) {
                     *state = LocalState::Moved;
+                }
+            }
+            // Closure construction immediately transfers every non-Copy
+            // capture into its owned environment.
+            Rvalue::MakeClosure { captures, .. } => {
+                for capture in captures {
+                    if capture.transfer == glyph_core::mir::CaptureTransfer::Move {
+                        if let Some(state) = self.local_states.get_mut(capture.local.0 as usize) {
+                            *state = LocalState::Moved;
+                        }
+                    }
                 }
             }
             // Map mutations take ownership of keys/values.

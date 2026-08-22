@@ -3,6 +3,7 @@ pub mod atomic;
 pub mod diag;
 pub mod mir;
 pub mod span;
+pub mod thread;
 pub mod thread_safety;
 pub mod token;
 pub mod types;

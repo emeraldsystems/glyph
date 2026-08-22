@@ -177,14 +177,13 @@ impl CodegenContext {
             LLVM_InitializeAllTargetMCs();
             LLVM_InitializeAllAsmPrinters();
 
-            // Get the default target triple for this machine (e.g., "x86_64-apple-darwin24.0.0")
-            let target_triple = LLVMGetDefaultTargetTriple();
-            LLVMSetTarget(self.module, target_triple);
+            let target_triple = self.effective_target_triple()?;
+            LLVMSetTarget(self.module, target_triple.as_ptr());
 
             // Get target from triple
             let mut target = std::ptr::null_mut();
             let mut error = std::ptr::null_mut();
-            if LLVMGetTargetFromTriple(target_triple, &mut target, &mut error) != 0 {
+            if LLVMGetTargetFromTriple(target_triple.as_ptr(), &mut target, &mut error) != 0 {
                 let err_msg = if error.is_null() {
                     "unknown error".to_string()
                 } else {
@@ -192,7 +191,6 @@ impl CodegenContext {
                     LLVMDisposeMessage(error);
                     msg
                 };
-                LLVMDisposeMessage(target_triple);
                 return Err(anyhow!("Failed to get target: {}", err_msg));
             }
 
@@ -201,7 +199,7 @@ impl CodegenContext {
             let features = CString::new("")?;
             let target_machine = LLVMCreateTargetMachine(
                 target,
-                target_triple,
+                target_triple.as_ptr(),
                 cpu.as_ptr(),
                 features.as_ptr(),
                 LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
@@ -210,7 +208,6 @@ impl CodegenContext {
             );
 
             if target_machine.is_null() {
-                LLVMDisposeMessage(target_triple);
                 return Err(anyhow!("Failed to create target machine"));
             }
 
@@ -242,13 +239,11 @@ impl CodegenContext {
                     msg
                 };
                 LLVMDisposeTargetMachine(target_machine);
-                LLVMDisposeMessage(target_triple);
                 return Err(anyhow!("Failed to emit object file: {}", err_msg));
             }
 
             // Clean up
             LLVMDisposeTargetMachine(target_machine);
-            LLVMDisposeMessage(target_triple);
 
             Ok(())
         }

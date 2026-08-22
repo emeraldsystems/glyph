@@ -26,7 +26,10 @@ fn main() -> i32 {
 
     // Verify MIR contains fmt_i32 call
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_i32"), "MIR should call fmt_i32");
+    assert!(
+        mir_text.contains("glyph_fmt_write_i32"),
+        "MIR should call fmt_i32"
+    );
 }
 
 #[test]
@@ -55,7 +58,10 @@ fn main() -> i32 {
 
     // Verify MIR contains fmt_bool call
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_bool"), "MIR should call fmt_bool");
+    assert!(
+        mir_text.contains("glyph_fmt_write_bool"),
+        "MIR should call fmt_bool"
+    );
 }
 
 #[test]
@@ -83,7 +89,10 @@ fn main() -> i32 {
     );
 
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_u32"), "MIR should call fmt_u32");
+    assert!(
+        mir_text.contains("glyph_fmt_write_u32"),
+        "MIR should call fmt_u32"
+    );
 }
 
 #[test]
@@ -111,7 +120,10 @@ fn main() -> i32 {
     );
 
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_i64"), "MIR should call fmt_i64");
+    assert!(
+        mir_text.contains("glyph_fmt_write_i64"),
+        "MIR should call fmt_i64"
+    );
 }
 
 #[test]
@@ -139,7 +151,10 @@ fn main() -> i32 {
     );
 
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_u64"), "MIR should call fmt_u64");
+    assert!(
+        mir_text.contains("glyph_fmt_write_u64"),
+        "MIR should call fmt_u64"
+    );
 }
 
 #[test]
@@ -167,7 +182,10 @@ fn main() -> i32 {
     );
 
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_char"), "MIR should call fmt_char");
+    assert!(
+        mir_text.contains("glyph_fmt_write_char"),
+        "MIR should call fmt_char"
+    );
 }
 
 #[test]
@@ -196,7 +214,10 @@ fn main() -> i32 {
 
     // Verify MIR contains fmt_str call
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_str"), "MIR should call fmt_str");
+    assert!(
+        mir_text.contains("glyph_fmt_write_str"),
+        "MIR should call fmt_str"
+    );
 }
 
 #[test]
@@ -227,9 +248,18 @@ fn main() -> i32 {
 
     // Verify MIR contains all fmt calls
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_i32"), "MIR should call fmt_i32");
-    assert!(mir_text.contains("glyph_fmt_write_bool"), "MIR should call fmt_bool");
-    assert!(mir_text.contains("glyph_fmt_write_str"), "MIR should call fmt_str");
+    assert!(
+        mir_text.contains("glyph_fmt_write_i32"),
+        "MIR should call fmt_i32"
+    );
+    assert!(
+        mir_text.contains("glyph_fmt_write_bool"),
+        "MIR should call fmt_bool"
+    );
+    assert!(
+        mir_text.contains("glyph_fmt_write_str"),
+        "MIR should call fmt_str"
+    );
 }
 
 #[test]
@@ -262,7 +292,10 @@ fn main() -> i32 {
         mir_text.contains("raw_write"),
         "MIR should use raw_write for literals"
     );
-    assert!(mir_text.contains("glyph_fmt_write_i32"), "MIR should call fmt_i32");
+    assert!(
+        mir_text.contains("glyph_fmt_write_i32"),
+        "MIR should call fmt_i32"
+    );
 }
 
 #[test]
@@ -475,5 +508,8 @@ fn main() -> i32 {
 
     // Should work with only holes, no literal segments
     let mir_text = format!("{:?}", output.mir);
-    assert!(mir_text.contains("glyph_fmt_write_i32"), "MIR should call fmt_i32");
+    assert!(
+        mir_text.contains("glyph_fmt_write_i32"),
+        "MIR should call fmt_i32"
+    );
 }

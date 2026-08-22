@@ -1,7 +1,7 @@
 use super::*;
 use glyph_core::atomic::{
-    guaranteed_native_atomic_width, validate_compare_exchange_orderings, AtomicOrdering,
-    AtomicRmwOp, AtomicScalar, AtomicTargetCapabilities,
+    AtomicOrdering, AtomicRmwOp, AtomicScalar, AtomicTargetCapabilities,
+    guaranteed_native_atomic_width, validate_compare_exchange_orderings,
 };
 use llvm_sys::{LLVMAtomicOrdering, LLVMAtomicRMWBinOp};
 
@@ -122,7 +122,7 @@ impl CodegenContext {
     }
 
     fn atomic_pointer(
-        &self,
+        &mut self,
         atomic: LocalId,
         scalar: AtomicScalar,
         func: &MirFunction,
@@ -132,18 +132,32 @@ impl CodegenContext {
             .locals
             .get(atomic.0 as usize)
             .and_then(|local| local.ty.as_ref());
-        if actual != Some(&Type::Atomic(scalar)) {
-            bail!(
-                "atomic MIR references local {:?} as {}, but its type is {:?}",
+        let slot = local_map
+            .get(&atomic)
+            .copied()
+            .ok_or_else(|| anyhow!("undefined atomic local {:?}", atomic))?;
+
+        match actual {
+            Some(Type::Atomic(actual_scalar)) if *actual_scalar == scalar => Ok(slot),
+            Some(Type::Ref(inner, _)) if matches!(inner.as_ref(), Type::Atomic(actual_scalar) if *actual_scalar == scalar) =>
+            {
+                let pointer_ty = self.get_llvm_type(actual.expect("matched reference type"))?;
+                Ok(unsafe {
+                    LLVMBuildLoad2(
+                        self.builder,
+                        pointer_ty,
+                        slot,
+                        CString::new("atomic.ref")?.as_ptr(),
+                    )
+                })
+            }
+            _ => bail!(
+                "atomic MIR references local {:?} as {}, but its addressable type is {:?}",
                 atomic,
                 scalar.type_name(),
                 actual
-            );
+            ),
         }
-        local_map
-            .get(&atomic)
-            .copied()
-            .ok_or_else(|| anyhow!("undefined atomic local {:?}", atomic))
     }
 
     pub(super) fn codegen_atomic_new(

@@ -132,9 +132,7 @@ impl CodegenContext {
     /// spellings of a type share one clone function.
     fn canonical_clone_type(&self, ty: &Type) -> Type {
         match ty {
-            Type::Named(name) if self.enum_layouts.contains_key(name) => {
-                Type::Enum(name.clone())
-            }
+            Type::Named(name) if self.enum_layouts.contains_key(name) => Type::Enum(name.clone()),
             _ => ty.clone(),
         }
     }
@@ -224,11 +222,8 @@ impl CodegenContext {
             );
             LLVMBuildStore(self.builder, LLVMConstPointerNull(ptr_ty), dst);
 
-            let is_null = LLVMBuildIsNull(
-                self.builder,
-                s,
-                CString::new("clone.str.isnull")?.as_ptr(),
-            );
+            let is_null =
+                LLVMBuildIsNull(self.builder, s, CString::new("clone.str.isnull")?.as_ptr());
             let parent_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
             let dup_bb = LLVMAppendBasicBlockInContext(
                 self.context,
@@ -262,12 +257,7 @@ impl CodegenContext {
         Ok(())
     }
 
-    fn emit_clone_own(
-        &mut self,
-        dst: LLVMValueRef,
-        src: LLVMValueRef,
-        inner: &Type,
-    ) -> Result<()> {
+    fn emit_clone_own(&mut self, dst: LLVMValueRef, src: LLVMValueRef, inner: &Type) -> Result<()> {
         unsafe {
             let ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(self.context), 0);
             let p = LLVMBuildLoad2(
@@ -278,11 +268,8 @@ impl CodegenContext {
             );
             LLVMBuildStore(self.builder, LLVMConstPointerNull(ptr_ty), dst);
 
-            let is_null = LLVMBuildIsNull(
-                self.builder,
-                p,
-                CString::new("clone.own.isnull")?.as_ptr(),
-            );
+            let is_null =
+                LLVMBuildIsNull(self.builder, p, CString::new("clone.own.isnull")?.as_ptr());
             let parent_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
             let copy_bb = LLVMAppendBasicBlockInContext(
                 self.context,
@@ -357,8 +344,7 @@ impl CodegenContext {
             let usize_ty = LLVMInt64TypeInContext(self.context);
             let elem_llvm_ty = self.get_llvm_type(inner)?;
             let mut field_tys = vec![usize_ty, elem_llvm_ty];
-            let rc_struct =
-                LLVMStructTypeInContext(self.context, field_tys.as_mut_ptr(), 2, 0);
+            let rc_struct = LLVMStructTypeInContext(self.context, field_tys.as_mut_ptr(), 2, 0);
             let rc_ptr = LLVMBuildStructGEP2(
                 self.builder,
                 rc_struct,
@@ -501,12 +487,7 @@ impl CodegenContext {
         Ok(())
     }
 
-    fn emit_clone_named(
-        &mut self,
-        dst: LLVMValueRef,
-        src: LLVMValueRef,
-        name: &str,
-    ) -> Result<()> {
+    fn emit_clone_named(&mut self, dst: LLVMValueRef, src: LLVMValueRef, name: &str) -> Result<()> {
         if self.enum_layouts.contains_key(name) {
             return self.emit_clone_enum(dst, src, name);
         }

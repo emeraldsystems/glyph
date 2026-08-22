@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -40,6 +41,16 @@ typedef struct {
 } GlyphWavState;
 
 static GlyphWavState wav_states[GLYPH_WAV_MAX_HANDLES];
+static atomic_flag wav_states_lock = ATOMIC_FLAG_INIT;
+
+static void glyph_wav_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&wav_states_lock, memory_order_acquire)) {
+    }
+}
+
+static void glyph_wav_unlock(void) {
+    atomic_flag_clear_explicit(&wav_states_lock, memory_order_release);
+}
 
 static void wav_write_u16(FILE* f, uint16_t v) {
     unsigned char b[2] = {(unsigned char)(v & 0xff), (unsigned char)(v >> 8)};
@@ -84,21 +95,31 @@ int32_t glyph_audio_wav_open(const char* path, uint32_t sample_rate, uint32_t ch
     }
 
     int32_t slot = -1;
+    glyph_wav_lock();
     for (int32_t i = 0; i < GLYPH_WAV_MAX_HANDLES; i++) {
         if (!wav_states[i].used) {
             slot = i;
+            // Reserve the slot while fopen runs. Public operations accept
+            // only used == 1, so a partially initialized handle is invisible.
+            wav_states[i].used = -1;
             break;
         }
     }
+    glyph_wav_unlock();
     if (slot < 0) {
         return -EMFILE;
     }
 
     FILE* f = fopen(path, "wb");
     if (f == NULL) {
-        return errno > 0 ? -errno : -EIO;
+        int open_error = errno > 0 ? errno : EIO;
+        glyph_wav_lock();
+        wav_states[slot].used = 0;
+        glyph_wav_unlock();
+        return -open_error;
     }
 
+    glyph_wav_lock();
     GlyphWavState* st = &wav_states[slot];
     st->file = f;
     st->sample_rate = sample_rate;
@@ -106,17 +127,20 @@ int32_t glyph_audio_wav_open(const char* path, uint32_t sample_rate, uint32_t ch
     st->data_bytes = 0;
     st->used = 1;
     wav_write_header(st); // placeholder sizes; patched on close
+    glyph_wav_unlock();
     return slot;
 }
 
 // Appends len f64 samples (clamped to [-1, 1], converted to 16-bit PCM).
 // Returns the number of samples written, or a negative errno-style code.
 int32_t glyph_audio_wav_write(int32_t handle, const GlyphVec* samples) {
-    if (handle < 0 || handle >= GLYPH_WAV_MAX_HANDLES || !wav_states[handle].used) {
-        return -EBADF;
-    }
     if (samples == NULL || (samples->data == NULL && samples->len > 0)) {
         return -EINVAL;
+    }
+    glyph_wav_lock();
+    if (handle < 0 || handle >= GLYPH_WAV_MAX_HANDLES || wav_states[handle].used != 1) {
+        glyph_wav_unlock();
+        return -EBADF;
     }
 
     GlyphWavState* st = &wav_states[handle];
@@ -132,15 +156,19 @@ int32_t glyph_audio_wav_write(int32_t handle, const GlyphVec* samples) {
         unsigned char b[2] = {(unsigned char)((uint16_t)pcm & 0xff),
                               (unsigned char)((uint16_t)pcm >> 8)};
         if (fwrite(b, 1, 2, st->file) != 2) {
+            glyph_wav_unlock();
             return -EIO;
         }
         st->data_bytes += 2;
     }
+    glyph_wav_unlock();
     return (int32_t)samples->len;
 }
 
 int32_t glyph_audio_wav_close(int32_t handle) {
-    if (handle < 0 || handle >= GLYPH_WAV_MAX_HANDLES || !wav_states[handle].used) {
+    glyph_wav_lock();
+    if (handle < 0 || handle >= GLYPH_WAV_MAX_HANDLES || wav_states[handle].used != 1) {
+        glyph_wav_unlock();
         return -EBADF;
     }
     GlyphWavState* st = &wav_states[handle];
@@ -148,6 +176,7 @@ int32_t glyph_audio_wav_close(int32_t handle) {
     int rc = fclose(st->file);
     st->file = NULL;
     st->used = 0;
+    glyph_wav_unlock();
     return rc == 0 ? 0 : -EIO;
 }
 
@@ -175,6 +204,13 @@ typedef struct {
 } GlyphOutState;
 
 static GlyphOutState out_states[GLYPH_OUT_MAX_HANDLES];
+static pthread_mutex_t out_states_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void glyph_out_release_slot(GlyphOutState* st) {
+    pthread_mutex_lock(&out_states_lock);
+    st->used = 0;
+    pthread_mutex_unlock(&out_states_lock);
+}
 
 static void glyph_out_callback(void* user_data, AudioQueueRef queue, AudioQueueBufferRef buf) {
     (void)queue;
@@ -194,20 +230,32 @@ int32_t glyph_audio_out_open(uint32_t sample_rate, uint32_t channels) {
     }
 
     int32_t slot = -1;
+    pthread_mutex_lock(&out_states_lock);
     for (int32_t i = 0; i < GLYPH_OUT_MAX_HANDLES; i++) {
-        if (!out_states[i].used) {
+        if (out_states[i].used == 0) {
             slot = i;
+            memset(&out_states[i], 0, sizeof(out_states[i]));
+            out_states[i].used = -1;
             break;
         }
     }
+    pthread_mutex_unlock(&out_states_lock);
     if (slot < 0) {
         return -EMFILE;
     }
 
     GlyphOutState* st = &out_states[slot];
-    memset(st, 0, sizeof(*st));
-    pthread_mutex_init(&st->lock, NULL);
-    pthread_cond_init(&st->cond, NULL);
+    int init_rc = pthread_mutex_init(&st->lock, NULL);
+    if (init_rc != 0) {
+        glyph_out_release_slot(st);
+        return -init_rc;
+    }
+    init_rc = pthread_cond_init(&st->cond, NULL);
+    if (init_rc != 0) {
+        pthread_mutex_destroy(&st->lock);
+        glyph_out_release_slot(st);
+        return -init_rc;
+    }
     st->channels = channels;
 
     AudioStreamBasicDescription fmt;
@@ -223,6 +271,9 @@ int32_t glyph_audio_out_open(uint32_t sample_rate, uint32_t channels) {
 
     OSStatus rc = AudioQueueNewOutput(&fmt, glyph_out_callback, st, NULL, NULL, 0, &st->queue);
     if (rc != noErr) {
+        pthread_cond_destroy(&st->cond);
+        pthread_mutex_destroy(&st->lock);
+        glyph_out_release_slot(st);
         return -EIO;
     }
 
@@ -232,6 +283,9 @@ int32_t glyph_audio_out_open(uint32_t sample_rate, uint32_t channels) {
         rc = AudioQueueAllocateBuffer(st->queue, buf_bytes, &buf);
         if (rc != noErr) {
             AudioQueueDispose(st->queue, true);
+            pthread_cond_destroy(&st->cond);
+            pthread_mutex_destroy(&st->lock);
+            glyph_out_release_slot(st);
             return -EIO;
         }
         st->free_bufs[st->free_count++] = buf;
@@ -240,10 +294,15 @@ int32_t glyph_audio_out_open(uint32_t sample_rate, uint32_t channels) {
     rc = AudioQueueStart(st->queue, NULL);
     if (rc != noErr) {
         AudioQueueDispose(st->queue, true);
+        pthread_cond_destroy(&st->cond);
+        pthread_mutex_destroy(&st->lock);
+        glyph_out_release_slot(st);
         return -EIO;
     }
 
+    pthread_mutex_lock(&out_states_lock);
     st->used = 1;
+    pthread_mutex_unlock(&out_states_lock);
     return slot;
 }
 
@@ -311,7 +370,7 @@ int32_t glyph_audio_out_close(int32_t handle) {
     AudioQueueDispose(st->queue, true);
     pthread_mutex_destroy(&st->lock);
     pthread_cond_destroy(&st->cond);
-    st->used = 0;
+    glyph_out_release_slot(st);
     return 0;
 }
 

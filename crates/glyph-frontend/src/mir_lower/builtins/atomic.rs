@@ -2,10 +2,12 @@ use glyph_core::ast::Expr;
 use glyph_core::atomic::{AtomicOrdering, AtomicRmwOp, AtomicScalar};
 use glyph_core::mir::{LocalId, MirInst, Rvalue};
 use glyph_core::span::Span;
+use glyph_core::types::Mutability;
 use glyph_core::types::Type;
 
 use super::super::context::LowerCtx;
-use super::super::expr::lower_value_with_expected;
+use super::super::expr::{lower_ref_expr, lower_value_with_expected};
+use super::super::value::update_local_type_from_rvalue;
 
 fn scalar_type(scalar: AtomicScalar) -> Type {
     match scalar {
@@ -56,29 +58,52 @@ pub(crate) fn lower_atomic_constructor<'a>(
     Some(Rvalue::Move(result))
 }
 
-fn atomic_receiver(
-    ctx: &mut LowerCtx<'_>,
-    receiver: &Expr,
+fn atomic_receiver<'a>(
+    ctx: &mut LowerCtx<'a>,
+    receiver: &'a Expr,
     span: Span,
 ) -> Option<(LocalId, AtomicScalar)> {
-    let Expr::Ident(name, _) = receiver else {
-        ctx.error(
-            "atomic methods currently require an atomic local receiver",
-            Some(span),
-        );
-        return None;
+    let local = match receiver {
+        Expr::Ident(name, _) => {
+            let Some(local) = ctx.bindings.get(name.0.as_str()).copied() else {
+                ctx.error(format!("unknown identifier '{}'", name.0), Some(span));
+                return None;
+            };
+            if !ctx.check_local_available(local, Some(span)) {
+                return None;
+            }
+            local
+        }
+        Expr::FieldAccess { .. } => {
+            // Atomic operations need the field's address, not a loaded copy of
+            // its value. Reuse the ordinary field-borrow lowering so nested
+            // references and aggregate layout stay centralized.
+            let mut field_ref = lower_ref_expr(ctx, receiver, Mutability::Immutable, span)?;
+            let local = ctx.fresh_local(None);
+            update_local_type_from_rvalue(ctx, local, &mut field_ref);
+            ctx.push_inst(MirInst::Assign {
+                local,
+                value: field_ref,
+            });
+            local
+        }
+        _ => {
+            ctx.error(
+                "atomic methods require an atomic local, reference, or aggregate field",
+                Some(span),
+            );
+            return None;
+        }
     };
-    let Some(local) = ctx.bindings.get(name.0.as_str()).copied() else {
-        ctx.error(format!("unknown identifier '{}'", name.0), Some(span));
-        return None;
-    };
-    if !ctx.check_local_available(local, Some(span)) {
-        return None;
+
+    match ctx.local_ty(local) {
+        Some(Type::Atomic(scalar)) => Some((local, *scalar)),
+        Some(Type::Ref(inner, _)) => match inner.as_ref() {
+            Type::Atomic(scalar) => Some((local, *scalar)),
+            _ => None,
+        },
+        _ => None,
     }
-    let Some(Type::Atomic(scalar)) = ctx.local_ty(local).cloned() else {
-        return None;
-    };
-    Some((local, scalar))
 }
 
 fn require_arity(

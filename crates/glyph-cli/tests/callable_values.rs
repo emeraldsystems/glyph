@@ -348,3 +348,60 @@ fn main() -> i32 {
         diagnostics
     );
 }
+
+#[test]
+fn capturing_closure_executes_and_consumes_owned_environment() {
+    let source = r#"
+fn main() -> i32 {
+  let offset: i32 = 40
+  let add: FnOnce<i32, i32> = (value: i32) -> offset + value
+  ret add(2)
+}
+"#;
+
+    assert_eq!(compile_and_run(source), 42);
+}
+
+#[test]
+fn returned_closure_keeps_its_captured_environment_alive() {
+    let source = r#"
+fn make_adder(offset: i32) -> FnOnce<i32, i32> {
+  ret (value: i32) -> offset + value
+}
+
+fn main() -> i32 {
+  let add = make_adder(40)
+  ret add(2)
+}
+"#;
+
+    assert_eq!(compile_and_run(source), 42);
+}
+
+#[test]
+fn nested_closure_carries_transitive_captures() {
+    let source = r#"
+fn main() -> i32 {
+  let base: i32 = 40
+  let outer: FnOnce<i32, FnOnce<i32, i32>> =
+    (left: i32) -> (right: i32) -> base + left + right
+  let inner = outer(1)
+  ret inner(1)
+}
+"#;
+
+    assert_eq!(compile_and_run(source), 42);
+}
+
+#[test]
+fn uncalled_move_closure_drops_owned_capture_without_running_body() {
+    let source = r#"
+fn main() -> i32 {
+  let message: String = String::from_str("owned capture")
+  let callback: FnOnce<(), usize> = move () -> message.len()
+  ret 42
+}
+"#;
+
+    assert_eq!(compile_and_run(source), 42);
+}

@@ -4,7 +4,7 @@ use glyph_backend::{
     codegen::CodegenContext,
     linker::{Linker, LinkerOptions},
 };
-use glyph_frontend::{compile_source, FrontendOptions};
+use glyph_frontend::{FrontendOptions, compile_source};
 
 fn compile(source: &str) -> glyph_frontend::FrontendOutput {
     compile_source(

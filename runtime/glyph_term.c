@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 // Minimal terminal runtime hooks for std/term.
 // This first pass keeps behavior deterministic and test-safe:
@@ -7,7 +8,7 @@
 // - idempotent session end,
 // - per-process single active UI session.
 
-static int32_t glyph_term_active_session = 0;
+static _Atomic(int) glyph_term_active_session = 0;
 
 int32_t glyph_term_stdout(void) {
     // Single process-local terminal handle for stdout.
@@ -18,10 +19,15 @@ int32_t glyph_term_enter_ui_session(int32_t term_id) {
     if (term_id != 1) {
         return -2;
     }
-    if (glyph_term_active_session != 0) {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &glyph_term_active_session,
+            &expected,
+            1,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
         return -1;
     }
-    glyph_term_active_session = 1;
     return 0;
 }
 
@@ -30,7 +36,7 @@ int32_t glyph_term_session_end(int32_t term_id) {
         return -2;
     }
     // Idempotent cleanup.
-    glyph_term_active_session = 0;
+    atomic_store_explicit(&glyph_term_active_session, 0, memory_order_release);
     return 0;
 }
 

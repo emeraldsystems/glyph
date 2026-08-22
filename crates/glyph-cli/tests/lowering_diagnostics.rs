@@ -14,7 +14,11 @@ fn diagnostics_for(source: &str) -> Vec<String> {
             include_std: true,
         },
     );
-    output.diagnostics.iter().map(|d| d.message.clone()).collect()
+    output
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect()
 }
 
 #[test]
@@ -106,9 +110,7 @@ fn integer_literal_beyond_u64_is_rejected() {
 "#,
     );
     assert!(
-        diags
-            .iter()
-            .any(|d| d.contains("out of range (max u64)")),
+        diags.iter().any(|d| d.contains("out of range (max u64)")),
         "diags: {:?}",
         diags
     );

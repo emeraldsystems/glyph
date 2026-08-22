@@ -1,9 +1,13 @@
-use glyph_core::ast::{Block, Expr, Function, Ident, Stmt};
-use glyph_core::mir::{BlockId, LocalId, MirFunction, MirInst, MirValue, Rvalue};
+use glyph_core::ast::{Block, CaptureMode, Expr, Function, Ident, Param, Stmt};
+use glyph_core::diag::Severity;
+use glyph_core::mir::{
+    BlockId, CaptureTransfer, LocalId, MirCapture, MirFunction, MirInst, MirValue, Rvalue,
+};
 use glyph_core::span::Span;
 use glyph_core::types::{Mutability, Type};
 
 use crate::resolver::ResolverContext;
+use crate::{CaptureOwnership, analyze_function_closure_ownership};
 
 use super::context::{LocalState, LowerCtx};
 use super::expr::{lower_expr, lower_expr_with_expected, lower_value, lower_value_with_expected};
@@ -65,7 +69,11 @@ pub(crate) fn lower_function(
     module: &glyph_core::ast::Module,
     resolver: &ResolverContext,
     fn_sigs: &std::collections::HashMap<String, super::signatures::FnSig>,
-) -> (MirFunction, Vec<glyph_core::diag::Diagnostic>) {
+) -> (
+    MirFunction,
+    Vec<MirFunction>,
+    Vec<glyph_core::diag::Diagnostic>,
+) {
     // Resolve return type
     let ret_type = func
         .ret_type
@@ -74,6 +82,13 @@ pub(crate) fn lower_function(
 
     let mut ctx = LowerCtx::new(resolver, module, fn_sigs, func.name.0.clone());
     ctx.fn_ret_type = ret_type.clone();
+    let closure_analysis = analyze_function_closure_ownership(func, resolver);
+    let closure_analysis_failed = closure_analysis
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error);
+    ctx.closure_infos = closure_analysis.closures;
+    ctx.diagnostics.extend(closure_analysis.diagnostics);
 
     // Create locals for parameters and bind them
     let mut param_locals = Vec::new();
@@ -90,8 +105,24 @@ pub(crate) fn lower_function(
         if let Some(state) = ctx.local_states.get_mut(local.0 as usize) {
             *state = LocalState::Initialized;
         }
-        ctx.bindings.insert(&param.name.0, local);
+        ctx.bind_name(&param.name.0, local);
+        ctx.register_source_binding(&param.name.0, param.span, local);
         param_locals.push(local);
+    }
+
+    // Ownership/cycle/escape errors make closure conversion unsound. Keep a
+    // skeletal function for diagnostic tooling, but do not emit MakeClosure
+    // or any lifted body from a function whose analysis failed.
+    if closure_analysis_failed {
+        ctx.push_inst(MirInst::Return(None));
+        let lowered = MirFunction {
+            name: func.name.0.clone(),
+            ret_type,
+            params: param_locals,
+            locals: ctx.locals,
+            blocks: ctx.blocks,
+        };
+        return (lowered, Vec::new(), ctx.diagnostics);
     }
 
     if imports_sys_argv(resolver) && !ctx.bindings.contains_key("argv") {
@@ -104,7 +135,7 @@ pub(crate) fn lower_function(
             *state = LocalState::Initialized;
         }
         ctx.locals[argv_local.0 as usize].skip_drop = true;
-        ctx.bindings.insert("argv", argv_local);
+        ctx.bind_name("argv", argv_local);
         ctx.push_inst(MirInst::Assign {
             local: argv_local,
             value: Rvalue::Call {
@@ -138,7 +169,312 @@ pub(crate) fn lower_function(
         blocks: ctx.blocks,
     };
 
-    (lowered, ctx.diagnostics)
+    let closure_order: std::collections::HashMap<_, _> = ctx
+        .closure_infos
+        .iter()
+        .map(|info| {
+            (
+                format!(
+                    "{}::__glyph_closure_{}",
+                    ctx.closure_name_root, info.closure_id
+                ),
+                info.closure_id,
+            )
+        })
+        .collect();
+    ctx.lifted_functions.sort_by_key(|function| {
+        closure_order
+            .get(&function.name)
+            .copied()
+            .unwrap_or(u32::MAX)
+    });
+
+    (lowered, ctx.lifted_functions, ctx.diagnostics)
+}
+
+fn type_has_concrete_layout(ty: &Type) -> bool {
+    match ty {
+        Type::Param(_) => false,
+        Type::App { args, .. } | Type::Tuple(args) | Type::Function { params: args, .. } => {
+            args.iter().all(type_has_concrete_layout)
+                && match ty {
+                    Type::Function { ret, .. } => type_has_concrete_layout(ret),
+                    _ => true,
+                }
+        }
+        Type::Ref(inner, _)
+        | Type::Array(inner, _)
+        | Type::Own(inner)
+        | Type::RawPtr(inner)
+        | Type::Shared(inner) => type_has_concrete_layout(inner),
+        _ => true,
+    }
+}
+
+fn mir_value_type(ctx: &LowerCtx<'_>, value: Option<&MirValue>) -> Type {
+    match value {
+        None | Some(MirValue::Unit) => Type::Void,
+        Some(MirValue::Int(_)) => Type::I32,
+        Some(MirValue::Float(_)) => Type::F64,
+        Some(MirValue::Bool(_)) => Type::Bool,
+        Some(MirValue::Local(local)) => ctx.local_ty(*local).cloned().unwrap_or(Type::Void),
+    }
+}
+
+fn closure_return_types(ctx: &LowerCtx<'_>) -> Vec<Type> {
+    ctx.blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .filter_map(|inst| match inst {
+            MirInst::Return(value) => Some(mir_value_type(ctx, value.as_ref())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Convert one source closure into an owned callable plus a collision-safe
+/// lifted MIR function. Capture locals are looked up by their declaration
+/// identity, not just their spelling, so shadowed bindings remain distinct.
+pub(crate) fn lower_closure_rvalue<'a>(
+    ctx: &mut LowerCtx<'a>,
+    capture_mode: CaptureMode,
+    params: &'a [Param],
+    body: &'a Expr,
+    span: Span,
+    expected: Option<&Type>,
+) -> Option<Rvalue> {
+    let Some(info) = ctx
+        .closure_infos
+        .iter()
+        .find(|info| info.span == span)
+        .cloned()
+    else {
+        ctx.error(
+            "closure ownership analysis did not produce metadata for this expression",
+            Some(span),
+        );
+        return None;
+    };
+
+    if info.capture_mode != capture_mode {
+        ctx.error(
+            "closure capture mode changed between analysis and MIR lowering",
+            Some(span),
+        );
+        return None;
+    }
+
+    let expected_signature = match expected {
+        Some(Type::Function { params, ret }) => Some((params.clone(), ret.as_ref().clone())),
+        Some(other) => {
+            ctx.error(
+                format!(
+                    "closure has a callable type, but '{}' is required here",
+                    LowerCtx::type_label(other)
+                ),
+                Some(span),
+            );
+            return None;
+        }
+        None => None,
+    };
+
+    if let Some((expected_params, _)) = &expected_signature {
+        if expected_params.len() != params.len() {
+            ctx.error(
+                format!(
+                    "closure expects {} parameters from its contextual FnOnce type, but declares {}",
+                    expected_params.len(),
+                    params.len()
+                ),
+                Some(span),
+            );
+            return None;
+        }
+    }
+
+    let mut callable_params = Vec::with_capacity(params.len());
+    for (index, param) in params.iter().enumerate() {
+        let annotated = param
+            .ty
+            .as_ref()
+            .and_then(|ty| crate::resolver::resolve_type_expr_to_type(ty, ctx.resolver));
+        let contextual = expected_signature
+            .as_ref()
+            .and_then(|(types, _)| types.get(index))
+            .cloned();
+        if let (Some(annotated), Some(contextual)) = (&annotated, &contextual) {
+            if !super::call::call_types_compatible(annotated, contextual) {
+                ctx.error(
+                    format!(
+                        "closure parameter '{}' has type '{}', but contextual FnOnce requires '{}'",
+                        param.name.0,
+                        LowerCtx::type_label(annotated),
+                        LowerCtx::type_label(contextual)
+                    ),
+                    Some(param.span),
+                );
+                return None;
+            }
+        }
+        let Some(param_ty) = annotated.or(contextual) else {
+            ctx.error(
+                format!(
+                    "cannot infer type of closure parameter '{}'; add a type annotation or a FnOnce context",
+                    param.name.0
+                ),
+                Some(param.span),
+            );
+            return None;
+        };
+        if !type_has_concrete_layout(&param_ty) {
+            ctx.error(
+                format!(
+                    "closure parameter '{}' has unknown runtime layout '{}'",
+                    param.name.0,
+                    LowerCtx::type_label(&param_ty)
+                ),
+                Some(param.span),
+            );
+            return None;
+        }
+        callable_params.push(param_ty);
+    }
+
+    let lifted_name = format!(
+        "{}::__glyph_closure_{}",
+        ctx.closure_name_root, info.closure_id
+    );
+    let mut lifted = LowerCtx::new(ctx.resolver, ctx.module, ctx.fn_sigs, lifted_name.clone());
+    lifted.closure_name_root = ctx.closure_name_root.clone();
+    lifted.closure_infos = ctx.closure_infos.clone();
+
+    let mut mir_captures = Vec::with_capacity(info.captures.len());
+    let mut lifted_params = Vec::with_capacity(info.captures.len() + params.len());
+    for capture in &info.captures {
+        let Some(ty) = capture.resolved_type.clone() else {
+            ctx.error(
+                format!(
+                    "cannot lower capture '{}' because its runtime layout is unknown; add a type annotation",
+                    capture.name
+                ),
+                Some(capture.first_use_span),
+            );
+            return None;
+        };
+        if !type_has_concrete_layout(&ty) {
+            ctx.error(
+                format!(
+                    "cannot lower capture '{}' with unknown runtime layout '{}'",
+                    capture.name,
+                    LowerCtx::type_label(&ty)
+                ),
+                Some(capture.first_use_span),
+            );
+            return None;
+        }
+        let Some(source_local) = ctx.source_binding_local(&capture.name, capture.declaration_span)
+        else {
+            ctx.error(
+                format!(
+                    "could not map closure capture '{}' to its source declaration",
+                    capture.name
+                ),
+                Some(capture.declaration_span),
+            );
+            return None;
+        };
+        if !ctx.check_local_available(source_local, Some(capture.first_use_span)) {
+            return None;
+        }
+
+        mir_captures.push(MirCapture {
+            name: capture.name.clone(),
+            local: source_local,
+            ty: ty.clone(),
+            transfer: match capture.ownership {
+                CaptureOwnership::Copy => CaptureTransfer::Copy,
+                CaptureOwnership::Move => CaptureTransfer::Move,
+            },
+        });
+
+        let local = lifted.fresh_local(Some(&capture.name));
+        lifted.locals[local.0 as usize].ty = Some(ty);
+        lifted.local_states[local.0 as usize] = LocalState::Initialized;
+        lifted.bind_name(&capture.name, local);
+        lifted.register_source_binding(&capture.name, capture.declaration_span, local);
+        lifted_params.push(local);
+    }
+
+    for (param, ty) in params.iter().zip(&callable_params) {
+        let local = lifted.fresh_local(Some(&param.name.0));
+        lifted.locals[local.0 as usize].ty = Some(ty.clone());
+        lifted.local_states[local.0 as usize] = LocalState::Initialized;
+        lifted.bind_name(&param.name.0, local);
+        lifted.register_source_binding(&param.name.0, param.span, local);
+        lifted_params.push(local);
+    }
+
+    let expected_ret = expected_signature.as_ref().map(|(_, ret)| ret.clone());
+    lifted.fn_ret_type = expected_ret.clone();
+    let mut implicit_return = match body {
+        Expr::Block(block) => {
+            lower_block_with_expected(&mut lifted, block, expected_ret.as_ref(), true, true)
+        }
+        _ => lower_value_with_expected(&mut lifted, body, expected_ret.as_ref()),
+    };
+    if expected_ret.as_ref().is_some_and(is_void_type)
+        && implicit_return
+            .as_ref()
+            .is_some_and(|value| is_void_value(&lifted, value))
+    {
+        implicit_return = None;
+    }
+    if !lifted.terminated() {
+        if let Some(MirValue::Local(local)) = implicit_return.as_ref() {
+            lifted.local_states[local.0 as usize] = LocalState::Moved;
+        }
+        lifted.drop_all_active_locals();
+        lifted.push_inst(MirInst::Return(implicit_return));
+    }
+
+    let return_types = closure_return_types(&lifted);
+    let inferred_ret = return_types.first().cloned().unwrap_or(Type::Void);
+    for actual in &return_types {
+        let required = expected_ret.as_ref().unwrap_or(&inferred_ret);
+        if !super::call::call_types_compatible(actual, required) {
+            lifted.error(
+                format!(
+                    "closure return has type '{}', expected '{}'",
+                    LowerCtx::type_label(actual),
+                    LowerCtx::type_label(required)
+                ),
+                Some(span),
+            );
+        }
+    }
+    let ret = expected_ret.unwrap_or(inferred_ret);
+    let signature = Type::Function {
+        params: callable_params,
+        ret: Box::new(ret.clone()),
+    };
+    let lifted_function = MirFunction {
+        name: lifted_name.clone(),
+        ret_type: (!is_void_type(&ret)).then_some(ret),
+        params: lifted_params,
+        locals: lifted.locals,
+        blocks: lifted.blocks,
+    };
+
+    ctx.diagnostics.extend(lifted.diagnostics);
+    ctx.lifted_functions.extend(lifted.lifted_functions);
+    ctx.lifted_functions.push(lifted_function);
+
+    Some(Rvalue::MakeClosure {
+        function: lifted_name,
+        signature,
+        captures: mir_captures,
+    })
 }
 
 pub(crate) fn lower_block<'a>(ctx: &mut LowerCtx<'a>, block: &'a Block) -> Option<MirValue> {
@@ -164,10 +500,11 @@ pub(crate) fn lower_block_with_expected<'a>(
                 mutable,
                 ty,
                 value,
-                ..
+                span,
             } => {
                 let local = ctx.fresh_local(Some(&name.0));
-                ctx.bindings.insert(&name.0, local);
+                ctx.bind_name(&name.0, local);
+                ctx.register_source_binding(&name.0, *span, local);
 
                 // Set mutability
                 ctx.locals[local.0 as usize].mutable = *mutable;
@@ -280,7 +617,7 @@ pub(crate) fn lower_block_with_expected<'a>(
                             body,
                             span,
                         } => {
-                            lower_for(ctx, var, start, end, body);
+                            lower_for(ctx, var, start, end, body, *span);
                             if control_value_context {
                                 if !matches!(expected, Some(Type::Void)) {
                                     ctx.error("for expression produces unit", Some(*span));
@@ -294,7 +631,7 @@ pub(crate) fn lower_block_with_expected<'a>(
                             body,
                             span,
                         } => {
-                            lower_for_in(ctx, var, iter, body);
+                            lower_for_in(ctx, var, iter, body, *span);
                             if control_value_context {
                                 if !matches!(expected, Some(Type::Void)) {
                                     ctx.error("for-in expression produces unit", Some(*span));
@@ -320,11 +657,14 @@ pub(crate) fn lower_block_with_expected<'a>(
                             start,
                             end,
                             body,
-                            ..
-                        } => lower_for(ctx, var, start, end, body),
+                            span,
+                        } => lower_for(ctx, var, start, end, body, *span),
                         Expr::ForIn {
-                            var, iter, body, ..
-                        } => lower_for_in(ctx, var, iter, body),
+                            var,
+                            iter,
+                            body,
+                            span,
+                        } => lower_for_in(ctx, var, iter, body, *span),
                         Expr::Block(block) => {
                             let _ = lower_block_with_expected(ctx, block, None, false, false);
                             ctx.push_inst(MirInst::Nop);
@@ -708,10 +1048,12 @@ pub(crate) fn lower_for<'a>(
     start: &'a Expr,
     end: &'a Expr,
     body_block: &'a Block,
+    span: Span,
 ) {
     // Initialize loop variable: let var = start
     let var_local = ctx.fresh_local(Some(&var.0));
-    ctx.bindings.insert(&var.0, var_local);
+    ctx.bind_name(&var.0, var_local);
+    ctx.register_source_binding(&var.0, span, var_local);
 
     let diags_before = ctx.diagnostics.len();
     if let Some(mut rv) = lower_expr(ctx, start) {
@@ -839,6 +1181,7 @@ pub(crate) fn lower_for_in<'a>(
     var: &'a Ident,
     iter_expr: &'a Expr,
     body_block: &'a Block,
+    span: Span,
 ) {
     use super::types::vec_elem_type_from_type;
 
@@ -953,7 +1296,8 @@ pub(crate) fn lower_for_in<'a>(
     // Bind loop variable
     let var_local = ctx.fresh_local(Some(&var.0));
     ctx.locals[var_local.0 as usize].ty = Some(elem_type.clone());
-    ctx.bindings.insert(&var.0, var_local);
+    ctx.bind_name(&var.0, var_local);
+    ctx.register_source_binding(&var.0, span, var_local);
 
     let index_rvalue = if is_vec {
         Rvalue::VecIndex {

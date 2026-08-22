@@ -1,6 +1,7 @@
 use super::*;
 use glyph_core::mir::{
-    Local, LocalId, MirBlock, MirExternFunction, MirFunction, MirInst, MirModule, MirValue, Rvalue,
+    CaptureTransfer, Local, LocalId, MirBlock, MirCapture, MirExternFunction, MirFunction, MirInst,
+    MirModule, MirValue, Rvalue,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -758,4 +759,332 @@ fn callable_views_are_never_silently_cloned() {
         .codegen_deep_clone_value(&signature, std::ptr::null_mut())
         .unwrap_err();
     assert!(error.to_string().contains("cannot be cloned"));
+}
+
+#[test]
+fn jit_invokes_closure_with_copied_scalar_capture() {
+    let signature = Type::Function {
+        params: vec![Type::I32],
+        ret: Box::new(Type::I32),
+    };
+    let mut ctx = CodegenContext::new("closure_scalar_capture").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "main::__closure_0".into(),
+                ret_type: Some(Type::I32),
+                params: vec![LocalId(0), LocalId(1)],
+                locals: vec![
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::Binary {
+                                op: glyph_core::ast::BinaryOp::Add,
+                                lhs: MirValue::Local(LocalId(0)),
+                                rhs: MirValue::Local(LocalId(1)),
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(2)))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    typed_local(Type::I32),
+                    typed_local(signature.clone()),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::ConstInt(40),
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::MakeClosure {
+                                function: "main::__closure_0".into(),
+                                signature: signature.clone(),
+                                captures: vec![MirCapture {
+                                    name: "offset".into(),
+                                    local: LocalId(0),
+                                    ty: Type::I32,
+                                    transfer: CaptureTransfer::Copy,
+                                }],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::CallIndirect {
+                                callee: LocalId(1),
+                                signature,
+                                args: vec![MirValue::Int(2)],
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(2)))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 42);
+    let ir = ctx.dump_ir();
+    assert!(ir.contains("__glyph_closure_invoke_"));
+    assert!(ir.contains("__glyph_closure_drop_"));
+    assert!(ir.contains("closure.env.malloc"));
+    assert!(ir.contains("call void @free"));
+}
+
+#[test]
+fn jit_drops_uncalled_closure_owned_capture_exactly_once() {
+    let signature = Type::Function {
+        params: vec![],
+        ret: Box::new(Type::Void),
+    };
+    let mut ctx = CodegenContext::new("closure_owned_drop").unwrap();
+    let owned_i32 = Type::Own(Box::new(Type::I32));
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "main::__closure_0".into(),
+                ret_type: None,
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(owned_i32.clone())],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Drop(LocalId(0)), MirInst::Return(None)],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    typed_local(owned_i32.clone()),
+                    typed_local(signature.clone()),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::OwnNew {
+                                value: MirValue::Int(7),
+                                elem_type: Type::I32,
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::MakeClosure {
+                                function: "main::__closure_0".into(),
+                                signature,
+                                captures: vec![MirCapture {
+                                    name: "message".into(),
+                                    local: LocalId(0),
+                                    ty: owned_i32,
+                                    transfer: CaptureTransfer::Move,
+                                }],
+                            },
+                        },
+                        MirInst::Drop(LocalId(1)),
+                        MirInst::Return(Some(MirValue::Int(9))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 9);
+    let ir = ctx.dump_ir();
+    assert!(ir.contains("closure.drop.capture.0"));
+    assert!(ir.contains("callable.drop.call"));
+}
+
+#[test]
+fn jit_invokes_capturing_closure_with_large_sret_result() {
+    let big_ty = Type::Named("Big".into());
+    let signature = Type::Function {
+        params: vec![],
+        ret: Box::new(big_ty.clone()),
+    };
+    let mut struct_types = HashMap::new();
+    struct_types.insert(
+        "Big".into(),
+        StructType {
+            name: "Big".into(),
+            fields: (0..5)
+                .map(|index| (format!("f{index}"), Type::I32))
+                .collect(),
+        },
+    );
+    let mut ctx = CodegenContext::new("closure_sret").unwrap();
+    let mir = MirModule {
+        struct_types,
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "main::__closure_0".into(),
+                ret_type: Some(big_ty.clone()),
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(Type::I32), typed_local(big_ty.clone())],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::StructLit {
+                                struct_name: "Big".into(),
+                                field_values: (0..5)
+                                    .map(|index| {
+                                        let value = if index == 4 {
+                                            MirValue::Local(LocalId(0))
+                                        } else {
+                                            MirValue::Int(index + 1)
+                                        };
+                                        (format!("f{index}"), value)
+                                    })
+                                    .collect(),
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(1)))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    typed_local(Type::I32),
+                    typed_local(signature.clone()),
+                    typed_local(big_ty),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::ConstInt(42),
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::MakeClosure {
+                                function: "main::__closure_0".into(),
+                                signature: signature.clone(),
+                                captures: vec![MirCapture {
+                                    name: "answer".into(),
+                                    local: LocalId(0),
+                                    ty: Type::I32,
+                                    transfer: CaptureTransfer::Copy,
+                                }],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::CallIndirect {
+                                callee: LocalId(1),
+                                signature,
+                                args: vec![],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(3),
+                            value: Rvalue::FieldAccess {
+                                base: LocalId(2),
+                                field_name: "f4".into(),
+                                field_index: 4,
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(3)))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 42);
+    assert!(ctx.dump_ir().contains("sret(%Big)"));
+}
+
+#[test]
+fn closure_rejects_bitwise_copy_of_ownership_bearing_capture() {
+    let owned_i32 = Type::Own(Box::new(Type::I32));
+    let signature = Type::Function {
+        params: vec![],
+        ret: Box::new(Type::Void),
+    };
+    let mut ctx = CodegenContext::new("closure_invalid_copy").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "main::__closure_0".into(),
+                ret_type: None,
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(owned_i32.clone())],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Drop(LocalId(0)), MirInst::Return(None)],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    typed_local(owned_i32.clone()),
+                    typed_local(signature.clone()),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::OwnNew {
+                                value: MirValue::Int(7),
+                                elem_type: Type::I32,
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::MakeClosure {
+                                function: "main::__closure_0".into(),
+                                signature,
+                                captures: vec![MirCapture {
+                                    name: "owned".into(),
+                                    local: LocalId(0),
+                                    ty: owned_i32,
+                                    transfer: CaptureTransfer::Copy,
+                                }],
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Int(0))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    let error = ctx.codegen_module(&mir).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot copy ownership-bearing type")
+    );
 }

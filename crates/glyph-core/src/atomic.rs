@@ -151,8 +151,8 @@ pub fn validate_compare_exchange_orderings(
 #[cfg(test)]
 mod tests {
     use super::{
-        guaranteed_native_atomic_width, validate_compare_exchange_orderings, AtomicOrdering,
-        AtomicScalar, AtomicTargetCapabilities,
+        AtomicOrdering, AtomicScalar, AtomicTargetCapabilities, guaranteed_native_atomic_width,
+        validate_compare_exchange_orderings,
     };
 
     #[test]
@@ -187,10 +187,12 @@ mod tests {
             max_atomic_width_bits: 32,
         };
         assert!(target32.validate(AtomicScalar::Usize).is_err());
-        assert!(target32
-            .validate(AtomicScalar::U64)
-            .unwrap_err()
-            .contains("guarantees only 32-bit atomics"));
+        assert!(
+            target32
+                .validate(AtomicScalar::U64)
+                .unwrap_err()
+                .contains("guarantees only 32-bit atomics")
+        );
 
         let target64 = AtomicTargetCapabilities {
             pointer_width_bits: 64,
@@ -218,26 +220,22 @@ mod tests {
 
     #[test]
     fn validates_compare_exchange_ordering_pairs() {
-        assert!(validate_compare_exchange_orderings(
-            AtomicOrdering::SeqCst,
-            AtomicOrdering::Acquire,
-        )
-        .is_ok());
-        assert!(validate_compare_exchange_orderings(
-            AtomicOrdering::AcqRel,
-            AtomicOrdering::Acquire,
-        )
-        .is_ok());
-        assert!(validate_compare_exchange_orderings(
-            AtomicOrdering::Acquire,
-            AtomicOrdering::SeqCst,
-        )
-        .is_err());
-        assert!(validate_compare_exchange_orderings(
-            AtomicOrdering::SeqCst,
-            AtomicOrdering::Release,
-        )
-        .is_err());
+        assert!(
+            validate_compare_exchange_orderings(AtomicOrdering::SeqCst, AtomicOrdering::Acquire,)
+                .is_ok()
+        );
+        assert!(
+            validate_compare_exchange_orderings(AtomicOrdering::AcqRel, AtomicOrdering::Acquire,)
+                .is_ok()
+        );
+        assert!(
+            validate_compare_exchange_orderings(AtomicOrdering::Acquire, AtomicOrdering::SeqCst,)
+                .is_err()
+        );
+        assert!(
+            validate_compare_exchange_orderings(AtomicOrdering::SeqCst, AtomicOrdering::Release,)
+                .is_err()
+        );
     }
 
     #[test]

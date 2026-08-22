@@ -8,6 +8,12 @@
 #include <stdlib.h>
 #include <errno.h>
 
+#if defined(_MSC_VER)
+#define GLYPH_THREAD_LOCAL __declspec(thread)
+#else
+#define GLYPH_THREAD_LOCAL _Thread_local
+#endif
+
 #if defined(__APPLE__) || defined(__linux__)
 
 #include <sys/socket.h>
@@ -18,8 +24,10 @@
 #include <netdb.h>
 #include <unistd.h>
 
-// Internal errno cache for string-returning functions
-static int32_t glyph_net_last_errno = 0;
+// String-returning receive functions cannot return an errno alongside their
+// owned string. Keep that compatibility cache per-thread so another socket
+// operation cannot overwrite the caller's result before it is queried.
+static GLYPH_THREAD_LOCAL int32_t glyph_net_last_errno = 0;
 
 // Helper: allocate an empty heap string (never returns NULL)
 static char* empty_string(void) {

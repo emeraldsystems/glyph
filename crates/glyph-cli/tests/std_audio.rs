@@ -170,10 +170,7 @@ fn wav_render_sine_verified() {
         expected_peak
     );
 
-    let zero_crossings = samples
-        .windows(2)
-        .filter(|w| w[0] < 0 && w[1] >= 0)
-        .count();
+    let zero_crossings = samples.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count();
     assert!(
         (438..=441).contains(&zero_crossings),
         "expected ~440 cycles, got {}",

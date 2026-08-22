@@ -3,6 +3,12 @@
 #include <stdio.h>
 #include <errno.h>
 
+#if defined(_MSC_VER)
+#define GLYPH_THREAD_LOCAL __declspec(thread)
+#else
+#define GLYPH_THREAD_LOCAL _Thread_local
+#endif
+
 uint64_t glyph_time_now(void) {
     time_t t = time(NULL);
     if (t == (time_t)-1) {
@@ -12,7 +18,10 @@ uint64_t glyph_time_now(void) {
 }
 
 const char* glyph_time_to_human_readable(uint64_t ts) {
-    static char buffer[20];
+    // The returned view remains valid until this thread calls the function
+    // again. Keeping the scratch storage thread-local prevents one worker
+    // from invalidating another worker's formatted timestamp.
+    static GLYPH_THREAD_LOCAL char buffer[20];
     buffer[0] = '\0';
 
     time_t t = (time_t)ts;

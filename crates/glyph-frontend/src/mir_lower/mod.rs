@@ -33,9 +33,11 @@ pub fn lower_module(module: &Module, resolver: &ResolverContext) -> (MirModule, 
     for item in &module.items {
         match item {
             Item::Function(func) => {
-                let (lowered, diags) = flow::lower_function(func, module, resolver, &fn_sigs);
+                let (lowered, lifted, diags) =
+                    flow::lower_function(func, module, resolver, &fn_sigs);
                 diagnostics.extend(diags);
                 mir.functions.push(lowered);
+                mir.functions.extend(lifted);
             }
             Item::Struct(_) | Item::Interface(_) | Item::Impl(_) | Item::Const(_) => {
                 // Handled during resolution or desugaring stages.

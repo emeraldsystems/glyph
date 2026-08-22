@@ -15,7 +15,10 @@ mod parser;
 mod resolver;
 mod stdlib;
 
-pub use closure_analysis::{ClosureCapture, ClosureInfo, analyze_function_closures};
+pub use closure_analysis::{
+    CaptureOwnership, ClosureAnalysis, ClosureCapture, ClosureEscape, ClosureEscapeKind,
+    ClosureInfo, analyze_function_closure_ownership, analyze_function_closures,
+};
 pub use lexer::{LexOutput, lex};
 pub use mir_lower::lower_module;
 pub use module_resolver::{

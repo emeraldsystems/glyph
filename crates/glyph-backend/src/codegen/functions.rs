@@ -485,6 +485,9 @@ impl CodegenContext {
                 MirInst::Drop(local) => {
                     self.codegen_drop_local(*local, func, local_map)?;
                 }
+                MirInst::DropThreadHandle(handle) => {
+                    self.codegen_drop_thread_handle(*handle, func, local_map)?;
+                }
                 MirInst::Nop => {}
             }
         }

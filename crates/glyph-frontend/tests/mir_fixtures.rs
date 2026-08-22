@@ -633,6 +633,10 @@ fn mir_float_arith() {
             include_std: false,
         },
     );
-    assert!(out.diagnostics.is_empty(), "diagnostics: {:?}", out.diagnostics);
+    assert!(
+        out.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        out.diagnostics
+    );
     assert_debug_snapshot!(out.mir);
 }

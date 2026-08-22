@@ -583,6 +583,22 @@ fn rewrite_rvalue(
         Rvalue::FunctionRef { signature, .. } | Rvalue::CallIndirect { signature, .. } => {
             *signature = rewrite_type(signature, templates, instantiations, worklist, diagnostics);
         }
+        Rvalue::MakeClosure {
+            signature,
+            captures,
+            ..
+        } => {
+            *signature = rewrite_type(signature, templates, instantiations, worklist, diagnostics);
+            for capture in captures {
+                capture.ty = rewrite_type(
+                    &capture.ty,
+                    templates,
+                    instantiations,
+                    worklist,
+                    diagnostics,
+                );
+            }
+        }
         _ => {}
     }
 }

@@ -25,14 +25,49 @@ impl CodegenContext {
                 string_globals: HashMap::new(),
                 function_types: HashMap::new(),
                 function_ref_thunks: HashMap::new(),
+                closure_artifacts: HashMap::new(),
                 sret_functions: HashMap::new(),
                 target_data: None,
+                requested_target_triple: None,
                 argv_global: None,
                 argc_global: None,
                 argv_vec_global: None,
                 drop_in_progress: std::collections::HashSet::new(),
                 clone_fns: HashMap::new(),
             })
+        }
+    }
+
+    /// Create a module for an explicit LLVM target triple.
+    ///
+    /// Target selection happens before any LLVM types are materialized so
+    /// target-dependent guarantees (notably lock-free atomic widths and
+    /// alignment) are validated against the requested target rather than the
+    /// build host.
+    pub fn new_for_target(module_name: &str, target_triple: &str) -> Result<Self> {
+        if target_triple.is_empty() {
+            bail!("target triple must not be empty");
+        }
+        CString::new(target_triple)?;
+        let mut context = Self::new(module_name)?;
+        context.requested_target_triple = Some(target_triple.to_owned());
+        Ok(context)
+    }
+
+    pub(super) fn effective_target_triple(&self) -> Result<CString> {
+        if let Some(target_triple) = self.requested_target_triple.as_ref() {
+            return Ok(CString::new(target_triple.as_str())?);
+        }
+        unsafe {
+            let default_triple = LLVMGetDefaultTargetTriple();
+            if default_triple.is_null() {
+                bail!("LLVM did not provide a default target triple");
+            }
+            let target_triple = CStr::from_ptr(default_triple)
+                .to_string_lossy()
+                .into_owned();
+            LLVMDisposeMessage(default_triple);
+            Ok(CString::new(target_triple)?)
         }
     }
 
@@ -49,12 +84,12 @@ impl CodegenContext {
                 LLVM_InitializeAllAsmPrinters();
             });
 
-            let target_triple = LLVMGetDefaultTargetTriple();
-            LLVMSetTarget(self.module, target_triple);
+            let target_triple = self.effective_target_triple()?;
+            LLVMSetTarget(self.module, target_triple.as_ptr());
 
             let mut target = std::ptr::null_mut();
             let mut error = std::ptr::null_mut();
-            if LLVMGetTargetFromTriple(target_triple, &mut target, &mut error) != 0 {
+            if LLVMGetTargetFromTriple(target_triple.as_ptr(), &mut target, &mut error) != 0 {
                 let err_msg = if error.is_null() {
                     "unknown error".to_string()
                 } else {
@@ -62,7 +97,6 @@ impl CodegenContext {
                     LLVMDisposeMessage(error);
                     msg
                 };
-                LLVMDisposeMessage(target_triple);
                 return Err(anyhow!("Failed to get target: {}", err_msg));
             }
 
@@ -70,7 +104,7 @@ impl CodegenContext {
             let features = CString::new("")?;
             let target_machine = LLVMCreateTargetMachine(
                 target,
-                target_triple,
+                target_triple.as_ptr(),
                 cpu.as_ptr(),
                 features.as_ptr(),
                 LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
@@ -79,7 +113,6 @@ impl CodegenContext {
             );
 
             if target_machine.is_null() {
-                LLVMDisposeMessage(target_triple);
                 return Err(anyhow!("Failed to create target machine"));
             }
 
@@ -88,7 +121,6 @@ impl CodegenContext {
             self.target_data = Some(data_layout);
 
             LLVMDisposeTargetMachine(target_machine);
-            LLVMDisposeMessage(target_triple);
         }
 
         Ok(())

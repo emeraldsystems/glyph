@@ -7,7 +7,7 @@ impl CodegenContext {
             .ok_or_else(|| anyhow!("indirect call signature is not callable: {:?}", signature))
     }
 
-    fn callable_invoke_type(&self, signature: &Type) -> Result<(LLVMTypeRef, bool)> {
+    pub(super) fn callable_invoke_type(&self, signature: &Type) -> Result<(LLVMTypeRef, bool)> {
         let (params, ret) = self.callable_signature(signature)?;
         let uses_sret = self.ret_uses_sret(ret)?;
         let llvm_ret = if uses_sret || Self::is_unit_type(ret) {
@@ -42,7 +42,7 @@ impl CodegenContext {
         ))
     }
 
-    fn function_signature_in_module(
+    pub(super) fn function_signature_in_module(
         &self,
         name: &str,
         mir_module: &MirModule,

@@ -968,6 +968,110 @@ fn main() -> usize {
 }
 
 #[test]
+fn lowers_atomic_operations_through_references_and_aggregate_fields() {
+    use glyph_core::atomic::{AtomicOrdering, AtomicRmwOp, AtomicScalar};
+
+    let src = r#"
+struct Counters {
+  completed: AtomicUsize
+}
+
+fn increment(counter: &AtomicUsize) -> usize {
+  ret counter.fetch_add(1)
+}
+
+fn main() -> usize {
+  let counters = Counters { completed: AtomicUsize::new(4) }
+  let before = increment(&counters.completed)
+  let after = counters.completed.fetch_add(2)
+  ret before + after
+}
+"#;
+    let out = compile_source(
+        src,
+        FrontendOptions {
+            emit_mir: true,
+            include_std: false,
+        },
+    );
+    assert!(
+        out.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        out.diagnostics
+    );
+
+    let increment = out
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "increment")
+        .expect("increment function");
+    assert!(matches!(
+        increment.locals[increment.params[0].0 as usize].ty.as_ref(),
+        Some(Type::Ref(inner, _)) if inner.as_ref() == &Type::Atomic(AtomicScalar::Usize)
+    ));
+    assert!(
+        increment
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(
+                inst,
+                MirInst::Assign {
+                    value: Rvalue::AtomicRmw {
+                        scalar: AtomicScalar::Usize,
+                        op: AtomicRmwOp::Add,
+                        ordering: AtomicOrdering::SeqCst,
+                        ..
+                    },
+                    ..
+                }
+            ))
+    );
+
+    let main = out
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main function");
+    let aggregate_atomic_targets: Vec<_> = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| match inst {
+            MirInst::Assign {
+                local,
+                value: Rvalue::FieldRef { field_name, .. },
+            } if field_name == "completed" => Some(*local),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !aggregate_atomic_targets.is_empty(),
+        "aggregate field reference"
+    );
+    for target in &aggregate_atomic_targets {
+        assert!(matches!(
+            main.locals[target.0 as usize].ty.as_ref(),
+            Some(Type::Ref(inner, _)) if inner.as_ref() == &Type::Atomic(AtomicScalar::Usize)
+        ));
+    }
+    assert!(
+        main.blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(
+                inst,
+                MirInst::Assign {
+                    value: Rvalue::AtomicRmw { atomic, .. },
+                    ..
+                } if aggregate_atomic_targets.contains(atomic)
+            ))
+    );
+}
+
+#[test]
 fn atomic_bool_rejects_integer_only_fetch_operations() {
     let out = compile_source(
         r#"
@@ -1197,19 +1301,30 @@ fn compile_ok(src: &str) {
 }
 
 #[test]
-fn closure_lowering_reports_the_staged_feature_boundary() {
+fn closure_lowering_emits_make_closure_and_a_lifted_function() {
     let out = compile_source(
-        "fn main() { let callback = (x: i32) -> x + 1 }",
+        "fn main() -> i32 { let callback = (x: i32) -> x + 1 ret callback(41) }",
         FrontendOptions {
             emit_mir: true,
             include_std: true,
         },
     );
-
-    assert!(out.diagnostics.iter().any(|diag| {
-        diag.message
-            .contains("closure conversion is not implemented yet")
-    }));
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    assert_eq!(out.mir.functions.len(), 2);
+    assert_eq!(out.mir.functions[1].name, "main::__glyph_closure_0");
+    assert!(
+        out.mir.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(
+                inst,
+                MirInst::Assign {
+                    value: Rvalue::MakeClosure { captures, .. },
+                    ..
+                } if captures.is_empty()
+            ))
+    );
 }
 
 #[test]

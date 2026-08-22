@@ -255,7 +255,9 @@ pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
         }),
         Rvalue::AtomicStore { .. } | Rvalue::AtomicFence { .. } => Some(Type::Void),
         Rvalue::AtomicIsLockFree { .. } => Some(Type::Bool),
-        Rvalue::FunctionRef { signature, .. } => Some(signature.clone()),
+        Rvalue::FunctionRef { signature, .. } | Rvalue::MakeClosure { signature, .. } => {
+            Some(signature.clone())
+        }
         Rvalue::CallIndirect { signature, .. } => {
             signature.function_signature().map(|(_, ret)| ret.clone())
         }
