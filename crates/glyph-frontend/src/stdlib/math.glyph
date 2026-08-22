@@ -1,0 +1,60 @@
+// std/math — libm bindings and float helpers.
+//
+// The C math library is part of libSystem on macOS; on Linux the Glyph
+// linker always passes -lm, so these externs resolve without any [link]
+// section in glyph.toml.
+//
+// All functions operate on f64. For f32 values, cast at the call site:
+// `sin(x as f64) as f32`.
+
+extern "C" fn sin(x: f64) -> f64;
+extern "C" fn cos(x: f64) -> f64;
+extern "C" fn tan(x: f64) -> f64;
+extern "C" fn asin(x: f64) -> f64;
+extern "C" fn acos(x: f64) -> f64;
+extern "C" fn atan(x: f64) -> f64;
+extern "C" fn atan2(y: f64, x: f64) -> f64;
+extern "C" fn sinh(x: f64) -> f64;
+extern "C" fn cosh(x: f64) -> f64;
+extern "C" fn tanh(x: f64) -> f64;
+extern "C" fn pow(base: f64, exponent: f64) -> f64;
+extern "C" fn sqrt(x: f64) -> f64;
+extern "C" fn cbrt(x: f64) -> f64;
+extern "C" fn exp(x: f64) -> f64;
+extern "C" fn exp2(x: f64) -> f64;
+extern "C" fn log(x: f64) -> f64;
+extern "C" fn log2(x: f64) -> f64;
+extern "C" fn log10(x: f64) -> f64;
+extern "C" fn floor(x: f64) -> f64;
+extern "C" fn ceil(x: f64) -> f64;
+extern "C" fn round(x: f64) -> f64;
+extern "C" fn trunc(x: f64) -> f64;
+extern "C" fn fabs(x: f64) -> f64;
+extern "C" fn fmod(numer: f64, denom: f64) -> f64;
+extern "C" fn fmin(a: f64, b: f64) -> f64;
+extern "C" fn fmax(a: f64, b: f64) -> f64;
+extern "C" fn hypot(x: f64, y: f64) -> f64;
+
+// Float consts are not supported yet, so mathematical constants are
+// exposed as functions.
+fn pi() -> f64 {
+  ret 3.141592653589793
+}
+
+fn tau() -> f64 {
+  ret 6.283185307179586
+}
+
+fn euler() -> f64 {
+  ret 2.718281828459045
+}
+
+fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+  if x < lo { ret lo }
+  if x > hi { ret hi }
+  ret x
+}
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+  ret a * (1.0 - t) + b * t
+}

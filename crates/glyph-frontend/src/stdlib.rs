@@ -911,6 +911,8 @@ pub fn std_modules() -> HashMap<String, Module> {
     modules.insert("std/term".into(), std_term_module);
     let std_net_module = parse_std_source("std/net", include_str!("stdlib/net.glyph"));
     modules.insert("std/net".into(), std_net_module);
+    let std_math_module = parse_std_source("std/math", include_str!("stdlib/math.glyph"));
+    modules.insert("std/math".into(), std_math_module);
 
     // std/process
     let run_extern = ExternFunctionDecl {

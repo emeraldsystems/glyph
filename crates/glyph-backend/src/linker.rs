@@ -127,8 +127,11 @@ impl Linker {
             cmd.arg(format!("-l{}", lib));
         }
 
-        // Linux-specific: Link against libc
+        // Linux-specific: Link against libc, and libm so std/math externs
+        // (sin, pow, ...) resolve without a [link] section. (On macOS libm
+        // is part of libSystem.)
         cmd.arg("-lc");
+        cmd.arg("-lm");
 
         // Execute the linker
         let output = cmd
