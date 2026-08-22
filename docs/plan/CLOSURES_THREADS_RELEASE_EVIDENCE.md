@@ -2,7 +2,7 @@
 
 **Status:** Complete.
 
-**Release candidate:** `1cc2c4c`
+**Release candidate:** `4ef0722`
 
 **Platforms:** macOS 26.5.2 arm64; Debian 13 arm64 container
 
@@ -51,21 +51,21 @@ or the detailed sanitizer transcript in
 ## Focused command record
 
 All final runs were performed on 2026-08-22 against the tree committed as
-`1cc2c4c`.
+`4ef0722`.
 
 - macOS full suite:
   `cargo test --workspace --all-features --no-fail-fast -- --test-threads=4`
   passed with zero failures or ignored tests.
-- macOS focused backend: all backend concurrency tests passed, including 11
+- macOS focused backend: all backend concurrency tests passed, including 12
   scoped codegen and 5 scoped runtime tests.
 - macOS focused source: Arc 3, borrowed closures 6, typed threads 8, Mutex 4,
   SPSC 2, scoped threads 2, and sequencer 3 tests passed.
-- Linux focused backend: 65 tests passed on Debian 13 arm64, Rust 1.98.0,
+- Linux focused backend: 66 tests passed on Debian 13 arm64, Rust 1.98.0,
   LLVM/Clang 20.1.8. This includes native object/link execution and JIT paths.
 - Linux focused source: 27 tests passed across borrowed closures, typed
   threads, Arc, Mutex, SPSC, scoped threads, and sequencer native/JIT paths.
 - ASan and TSan: Arc 6, Mutex codegen 5, Mutex runtime 4, SPSC 5, owned-thread
-  runtime 10, scoped codegen 10, and scoped runtime 5 passed under each tool.
+  runtime 10, scoped codegen 11, and scoped runtime 5 passed under each tool.
   The two nested AOT linker cases were filtered as documented in the sanitizer
   record and pass in ordinary macOS and Linux runs.
 - Tooling: glyphfmt 5, glyphlsp 7, mdBook build, release build, and install
@@ -93,6 +93,15 @@ droppable structs crossing ordinary calls, if/match branches, fields and map
 views crossing ownership boundaries, nested vectors, returned fields, and
 repeated drop stress. The closure/thread/Arc/Mutex/SPSC suites listed above add
 the corresponding transfer and cleanup coverage for every new carrier.
+
+The final ownership audit also added and passed:
+
+- two extern-boundary tests rejecting owned droppable by-value parameters while
+  accepting call-scoped references, scalars, `str`, and `RawPtr<T>`;
+- an invoked `FnOnce` test proving an owned capture and closure environment are
+  each released exactly once; and
+- scoped `String` result JIT/AOT coverage plus exact-once `Own<i32>` cleanup for
+  explicit join and implicit unclaimed-result drain.
 
 The unmodified strict Clippy invocation reaches one denied pre-existing lint in
 `glyph_process_run`: a public C ABI function dereferences raw pointers without

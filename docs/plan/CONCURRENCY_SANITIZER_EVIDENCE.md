@@ -4,7 +4,8 @@ This record covers the sanitizer acceptance evidence for typed thread results
 (GLYPH-43), bounded SPSC channels (GLYPH-45), `Arc<T>` (GLYPH-50), and
 `Mutex<T>` (GLYPH-51), and scoped threads (GLYPH-47). The original owned-thread,
 Arc, mutex, and SPSC runs used commit `870c27e`; the final rerun used release
-candidate `1cc2c4c`, including the complete scoped-thread surface.
+candidate `4ef0722`, including the complete scoped-thread surface and owned
+scoped-result cleanup.
 
 ## Environment
 
@@ -43,7 +44,7 @@ Result: PASS.
 - `arc_codegen`: 6 passed
 - `mutex_codegen`: 5 passed
 - `mutex_runtime`: 4 passed
-- `scoped_thread_codegen`: 10 passed, 1 deliberately filtered
+- `scoped_thread_codegen`: 11 passed, 1 deliberately filtered
 - `scoped_thread_runtime`: 5 passed
 - `spsc_codegen`: 5 passed
 - `thread_runtime`: 10 passed, 1 deliberately filtered
@@ -87,7 +88,7 @@ Result: PASS.
 - `arc_codegen`: 6 passed
 - `mutex_codegen`: 5 passed
 - `mutex_runtime`: 4 passed
-- `scoped_thread_codegen`: 10 passed, 1 deliberately filtered
+- `scoped_thread_codegen`: 11 passed, 1 deliberately filtered
 - `scoped_thread_runtime`: 5 passed
 - `spsc_codegen`: 5 passed
 - `thread_runtime`: 10 passed, 1 deliberately filtered
@@ -139,6 +140,7 @@ diagnose an uninstrumented JIT load or store by itself.
   the guard slot is nulled so the native mutex is unlocked exactly once.
 - GLYPH-47: scoped create, spawn, explicit typed join, implicit drain,
   unclaimed-result destruction, spawn failure, borrowed-environment ownership,
-  and forged-MIR rejection passed under both sanitizers. The AOT linker case is
-  filtered only because nested linking cannot inherit the sanitizer runtime;
-  it passes in ordinary macOS and Linux runs.
+  exact-once owned-result cleanup, and forged-MIR rejection passed under both
+  sanitizers. The AOT linker case is filtered only because nested linking
+  cannot inherit the sanitizer runtime; it passes in ordinary macOS and Linux
+  runs.
