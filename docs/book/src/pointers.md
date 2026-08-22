@@ -28,7 +28,7 @@ Notes:
 - References can only be taken to locals (not arbitrary expressions).
 - `&str` is the borrowed string type used for string parameters.
 
-## Own<T>
+## `Own<T>`
 
 `Own<T>` is a single-owner heap allocation.
 
@@ -52,9 +52,11 @@ Notes:
 - `into_raw()` transfers ownership to a `RawPtr<T>`.
 - `from_raw()` must be called exactly once for a given raw pointer to avoid leaks or double-free.
 
-## Shared<T>
+## `Shared<T>`
 
-`Shared<T>` is shared ownership (reference-counted).
+`Shared<T>` is shared ownership (reference-counted). A `Shared<T>` handle moves
+by default when passed or assigned by value. Use `.clone()` when you want another
+handle to the same allocation.
 
 ```glyph
 fn main() -> i32 {
@@ -65,7 +67,10 @@ fn main() -> i32 {
 }
 ```
 
-## RawPtr<T>
+Dropping each cloned handle decrements the reference count. The allocation is
+freed when the final handle is dropped.
+
+## `RawPtr<T>`
 
 `RawPtr<T>` is an unsafe, opaque pointer type primarily used for FFI boundaries.
 You can obtain one from `Own<T>::into_raw()`.

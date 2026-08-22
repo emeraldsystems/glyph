@@ -6,6 +6,7 @@ The standard library keeps a tight surface area:
 - `std/vec` for vectors
 - `std/map` for maps
 - `std/string` for strings
+- `std/enums` for `Option<T>` and `Result<T, E>`
 - `std/json` for JSON types (and `std/json/parser`)
 - `std/process` for launching external processes
 - `std/time` for timestamps and UTC formatting

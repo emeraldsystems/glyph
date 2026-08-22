@@ -59,7 +59,7 @@ Glyph supports the standard arithmetic, comparison, and logical operators:
 - Arithmetic: `+`, `-`, `*`, `/`, `%` (modulo — integer remainder)
 - Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`
 - Logical: `&&`, `||`, `!`
-- Error propagation: `?` (works on `Result` types)
+- Error propagation: `?` (works on `Result` and `Option` values)
 
 ## Control Flow
 
@@ -124,6 +124,46 @@ Struct field ownership:
 let name: str = user.name
 let owned = user.name.clone()
 ```
+
+## Ownership at Calls
+
+Glyph uses single-owner move semantics for values that own resources.
+
+Passing an owned droppable value to a by-value parameter consumes the caller's
+local. This includes `String`, `Own<T>`, `Shared<T>`, `Vec<T>`, `Map<K, V>`,
+and structs or enums that contain owned values.
+
+```glyph
+struct User {
+  name: String
+}
+
+fn consume(user: User) -> i32 {
+  let name: str = user.name
+  ret name.len()
+}
+
+fn main() -> i32 {
+  let user = User { name: String::from_str("ada") }
+  let n = consume(user)
+  // `user` has moved here.
+  ret n
+}
+```
+
+Use `&T` or `&mut T` when a function should borrow instead of consume:
+
+```glyph
+fn name_len(user: &User) -> i32 {
+  let name: str = user.name
+  ret name.len()
+}
+```
+
+Non-owning snapshots from field access, vector indexing, map lookup, and enum
+payload extraction are not independent owners. The compiler suppresses drops for
+these snapshots to avoid freeing data still owned elsewhere. Prefer borrowing or
+an explicit clone/deep-copy operation when an API needs to keep a value.
 
 ## Methods
 
@@ -344,6 +384,47 @@ fn main() -> i32 {
   ret status
 }
 ```
+
+## Error Propagation
+
+The `?` operator unwraps the success variant or returns early from the enclosing
+function.
+
+For `Result<T, E>`, `Ok(value)?` evaluates to `value`; `Err(error)?` returns
+`Err(error)` from the current function:
+
+```glyph
+from std/enums import Result
+
+fn parse_count() -> Result<i32, String> {
+  ret Ok(41)
+}
+
+fn next_count() -> Result<i32, String> {
+  let count = parse_count()?
+  ret Ok(count + 1)
+}
+```
+
+For `Option<T>`, `Some(value)?` evaluates to `value`; `None()?` returns
+`None()` from the current function:
+
+```glyph
+from std/enums import Option
+
+fn maybe_count(enabled: bool) -> Option<i32> {
+  if enabled { ret Some(41) }
+  ret None()
+}
+
+fn next_count(enabled: bool) -> Option<i32> {
+  let count = maybe_count(enabled)?
+  ret Some(count + 1)
+}
+```
+
+The enclosing function must return the same family: `Result` for `Result?`, or
+`Option` for `Option?`.
 
 ## Void Functions
 

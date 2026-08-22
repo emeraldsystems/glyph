@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-deca3218.js";
+            window.path_to_searchindex_js = "searchindex-33d7d0e9.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-24673502.js"></script>
@@ -220,7 +220,7 @@ let tab = "\x09"        // tab character
 <li>Arithmetic: <code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>%</code> (modulo — integer remainder)</li>
 <li>Comparison: <code>==</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></li>
 <li>Logical: <code>&amp;&amp;</code>, <code>||</code>, <code>!</code></li>
-<li>Error propagation: <code>?</code> (works on <code>Result</code> types)</li>
+<li>Error propagation: <code>?</code> (works on <code>Result</code> and <code>Option</code> values)</li>
 </ul>
 <h2 id="control-flow"><a class="header" href="#control-flow">Control Flow</a></h2>
 <p><code>if</code> and <code>match</code> are expressions, so you can assign their result.</p>
@@ -269,6 +269,185 @@ fn main() -&gt; i32 {
 <pre><code class="language-glyph">let name: str = user.name
 let owned = user.name.clone()
 </code></pre>
+<h2 id="ownership-at-calls"><a class="header" href="#ownership-at-calls">Ownership at Calls</a></h2>
+<p>Glyph uses single-owner move semantics for values that own resources.</p>
+<p>Passing an owned droppable value to a by-value parameter consumes the caller’s
+local. This includes <code>String</code>, <code>Own&lt;T&gt;</code>, <code>Shared&lt;T&gt;</code>, <code>Vec&lt;T&gt;</code>, <code>Map&lt;K, V&gt;</code>,
+and structs or enums that contain owned values.</p>
+<pre><code class="language-glyph">struct User {
+  name: String
+}
+
+fn consume(user: User) -&gt; i32 {
+  let name: str = user.name
+  ret name.len()
+}
+
+fn main() -&gt; i32 {
+  let user = User { name: String::from_str("ada") }
+  let n = consume(user)
+  // `user` has moved here.
+  ret n
+}
+</code></pre>
+<p>Use <code>&amp;T</code> or <code>&amp;mut T</code> when a function should borrow instead of consume:</p>
+<pre><code class="language-glyph">fn name_len(user: &amp;User) -&gt; i32 {
+  let name: str = user.name
+  ret name.len()
+}
+</code></pre>
+<p>Non-owning snapshots from field access, vector indexing, map lookup, and enum
+payload extraction are not independent owners. The compiler suppresses drops for
+these snapshots to avoid freeing data still owned elsewhere. Prefer borrowing or
+an explicit clone/deep-copy operation when an API needs to keep a value.</p>
+<h2 id="methods"><a class="header" href="#methods">Methods</a></h2>
+<p>Structs can have methods defined directly inside the struct body. The first
+parameter must be named <code>self</code> with an explicit type annotation.</p>
+<h3 id="inherent-methods"><a class="header" href="#inherent-methods">Inherent Methods</a></h3>
+<p>Methods declared directly inside a struct (without an <code>impl</code> block) are
+<em>inherent methods</em> — they belong to the struct itself:</p>
+<pre><code class="language-glyph">struct Point {
+  x: i32
+  y: i32
+
+  fn norm(self: &amp;Point) -&gt; i32 {
+    ret self.x * self.x + self.y * self.y
+  }
+}
+
+fn main() -&gt; i32 {
+  let p = Point { x: 3, y: 4 }
+  ret p.norm()
+}
+</code></pre>
+<p>Call methods with dot notation: <code>p.norm()</code>. The compiler auto-borrows the
+receiver, so you pass a value and it becomes <code>&amp;Point</code> automatically.</p>
+<h3 id="self-parameter"><a class="header" href="#self-parameter">Self Parameter</a></h3>
+<p>The <code>self</code> parameter determines how the receiver is passed:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Syntax</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>self: &amp;Point</code></td><td>Immutable borrow — reads fields but cannot mutate</td></tr>
+<tr><td><code>self: &amp;mut Point</code></td><td>Mutable borrow — can read and write fields</td></tr>
+<tr><td><code>self: Point</code></td><td>By value — consumes the struct</td></tr>
+</tbody>
+</table>
+</div>
+<p>The <code>self</code> type must always be written explicitly (no shorthand like <code>&amp;self</code>).</p>
+<h3 id="mutable-methods"><a class="header" href="#mutable-methods">Mutable Methods</a></h3>
+<p>Use <code>&amp;mut</code> when a method needs to modify the receiver:</p>
+<pre><code class="language-glyph">struct Counter {
+  value: i32
+
+  fn increment(self: &amp;mut Counter) {
+    self.value = self.value + 1
+  }
+
+  fn get(self: &amp;Counter) -&gt; i32 {
+    ret self.value
+  }
+}
+</code></pre>
+<h3 id="methods-with-extra-parameters"><a class="header" href="#methods-with-extra-parameters">Methods with Extra Parameters</a></h3>
+<p>Methods can take additional parameters after <code>self</code>:</p>
+<pre><code class="language-glyph">struct Accumulator {
+  total: i32
+
+  fn add(self: &amp;Accumulator, value: i32, weight: i32) -&gt; i32 {
+    ret self.total + value * weight
+  }
+}
+
+fn main() -&gt; i32 {
+  let acc = Accumulator { total: 10 }
+  ret acc.add(2, 3)
+}
+</code></pre>
+<h2 id="interfaces"><a class="header" href="#interfaces">Interfaces</a></h2>
+<p>Interfaces declare a set of method signatures that structs can implement.</p>
+<h3 id="defining-an-interface"><a class="header" href="#defining-an-interface">Defining an Interface</a></h3>
+<pre><code class="language-glyph">interface Drawable {
+  fn draw(self: &amp;Point) -&gt; i32;
+}
+</code></pre>
+<h3 id="implementing-an-interface"><a class="header" href="#implementing-an-interface">Implementing an Interface</a></h3>
+<p>Use an <code>impl</code> block inside the struct to implement the interface methods:</p>
+<pre><code class="language-glyph">interface Drawable {
+  fn draw(self: &amp;Point) -&gt; i32;
+}
+
+struct Point {
+  x: i32
+  y: i32
+
+  impl Drawable {
+    fn draw(self: &amp;Point) -&gt; i32 {
+      ret self.x + self.y
+    }
+  }
+}
+
+fn main() -&gt; i32 {
+  let p = Point { x: 10, y: 20 }
+  ret p.draw()
+}
+</code></pre>
+<h3 id="mixing-inherent-methods-and-interface-impls"><a class="header" href="#mixing-inherent-methods-and-interface-impls">Mixing Inherent Methods and Interface Impls</a></h3>
+<p>A struct can have both inherent methods and interface implementations:</p>
+<pre><code class="language-glyph">interface Drawable {
+  fn draw(self: &amp;Point) -&gt; i32;
+}
+
+struct Point {
+  x: i32
+  y: i32
+
+  fn norm(self: &amp;Point) -&gt; i32 {
+    ret self.x * self.x + self.y * self.y
+  }
+
+  impl Drawable {
+    fn draw(self: &amp;Point) -&gt; i32 {
+      ret self.x + self.y
+    }
+  }
+}
+
+fn main() -&gt; i32 {
+  let p = Point { x: 3, y: 4 }
+  ret p.norm() + p.draw()
+}
+</code></pre>
+<h3 id="multiple-interfaces"><a class="header" href="#multiple-interfaces">Multiple Interfaces</a></h3>
+<p>A struct can implement multiple interfaces with separate <code>impl</code> blocks:</p>
+<pre><code class="language-glyph">interface Drawable {
+  fn draw(self: &amp;Point) -&gt; i32;
+}
+
+interface Serializable {
+  fn serialize(self: &amp;Point) -&gt; i32;
+}
+
+struct Point {
+  x: i32
+  y: i32
+
+  impl Drawable {
+    fn draw(self: &amp;Point) -&gt; i32 {
+      ret self.x + self.y
+    }
+  }
+
+  impl Serializable {
+    fn serialize(self: &amp;Point) -&gt; i32 {
+      ret self.x * 100 + self.y
+    }
+  }
+}
+</code></pre>
 <h2 id="enums"><a class="header" href="#enums">Enums</a></h2>
 <p>Enums can be simple tags or carry payload values:</p>
 <pre><code class="language-glyph">enum OptionI32 {
@@ -304,6 +483,38 @@ fn main() -&gt; i32 {
   ret status
 }
 </code></pre>
+<h2 id="error-propagation"><a class="header" href="#error-propagation">Error Propagation</a></h2>
+<p>The <code>?</code> operator unwraps the success variant or returns early from the enclosing
+function.</p>
+<p>For <code>Result&lt;T, E&gt;</code>, <code>Ok(value)?</code> evaluates to <code>value</code>; <code>Err(error)?</code> returns
+<code>Err(error)</code> from the current function:</p>
+<pre><code class="language-glyph">from std/enums import Result
+
+fn parse_count() -&gt; Result&lt;i32, String&gt; {
+  ret Ok(41)
+}
+
+fn next_count() -&gt; Result&lt;i32, String&gt; {
+  let count = parse_count()?
+  ret Ok(count + 1)
+}
+</code></pre>
+<p>For <code>Option&lt;T&gt;</code>, <code>Some(value)?</code> evaluates to <code>value</code>; <code>None()?</code> returns
+<code>None()</code> from the current function:</p>
+<pre><code class="language-glyph">from std/enums import Option
+
+fn maybe_count(enabled: bool) -&gt; Option&lt;i32&gt; {
+  if enabled { ret Some(41) }
+  ret None()
+}
+
+fn next_count(enabled: bool) -&gt; Option&lt;i32&gt; {
+  let count = maybe_count(enabled)?
+  ret Some(count + 1)
+}
+</code></pre>
+<p>The enclosing function must return the same family: <code>Result</code> for <code>Result?</code>, or
+<code>Option</code> for <code>Option?</code>.</p>
 <h2 id="void-functions"><a class="header" href="#void-functions">Void Functions</a></h2>
 <p>Functions that don’t return a value omit the <code>-&gt; Type</code> annotation:</p>
 <pre><code class="language-glyph">from std import println
@@ -377,6 +588,22 @@ fn main() -&gt; i32 {
         <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
         <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
 
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
 
 
         <script>

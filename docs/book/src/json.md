@@ -8,9 +8,11 @@ Glyph ships a small JSON type model in `std/json`.
 
 ```glyph
 from std/json import JsonValue
+from std/map import Map
+from std/vec import Vec
 
 fn main() -> i32 {
-  let n = JsonValue::Null
+  let n = JsonValue::Null()
   let b = JsonValue::Bool(true)
   let x = JsonValue::Number(42.5)
   let s = JsonValue::String(String::from_str("hello"))
@@ -39,14 +41,24 @@ from std/json/parser import parse
 
 fn main() -> i32 {
   let r: ParseResult<JsonValue> = parse("{\"k\": 1}")
-  // Handle Ok(value) / Err(parse_error)
-  let _keep_alive = r
-  ret 0
+  ret match r {
+    Ok(value) => match value {
+      Object(_obj) => 0,
+      _ => 1,
+    },
+    Err(_err) => 2,
+  }
 }
 ```
 
+The parser handles objects, arrays, strings and escapes, numbers, booleans,
+`null`, nested values, trailing-input rejection, and parse errors with source
+positions.
+
 ## Status
 
-`std/json` always provides the JSON types.
-
-`std/json/parser::parse` is intended to be a real parser, but some builds may ship a minimal stub while the compiler/runtime evolves. If you observe `parse(...)` always returning `Ok(JsonValue::Null)`, you're on a stubbed build.
+`std/json` provides the JSON types, and `std/json/parser::parse` is the shipped
+parser. Current ownership semantics around map-owned `JsonValue` snapshots are
+still being tightened: avoid APIs that keep by-value snapshots from `Map::get`;
+move the owning value, borrow where possible, or clone/deep-copy when that API is
+available.
