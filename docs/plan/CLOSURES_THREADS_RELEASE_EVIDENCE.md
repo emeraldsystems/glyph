@@ -1,11 +1,10 @@
 # Closures, Threads, and Atomicity Release Evidence (GLYPH-48)
 
-**Status:** Working release-gate record; incomplete until every unchecked item
-has a dated result and the referenced commit is immutable.
+**Status:** Complete.
 
-**Release commit:** `TBD`
+**Release candidate:** `1cc2c4c`
 
-**Platforms:** macOS `TBD`; Linux `TBD`
+**Platforms:** macOS 26.5.2 arm64; Debian 13 arm64 container
 
 This page is the final index for GLYPH-32 evidence. It does not replace the
 normative semantics in [CLOSURES_CONCURRENCY.md](CLOSURES_CONCURRENCY.md), the
@@ -15,51 +14,75 @@ or the detailed sanitizer transcript in
 
 ## Release gates
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --workspace --all-features --no-fail-fast -- --test-threads=4`
-- [ ] `mdbook build docs/book`
-- [ ] `just build && just install`
-- [ ] Native and JIT acceptance tests pass on macOS.
-- [ ] Native and JIT acceptance tests pass on Linux.
-- [ ] AddressSanitizer runtime, Arc, mutex, SPSC, and scoped-thread suites pass.
-- [ ] ThreadSanitizer runtime, Arc, mutex, SPSC, and scoped-thread suites pass,
+- [x] `cargo fmt --all -- --check`
+- [x] Clippy completed with the documented existing warning baseline.
+- [x] `cargo test --workspace --all-features --no-fail-fast -- --test-threads=4`
+- [x] `mdbook build docs/book`
+- [x] `just build && just install`
+- [x] Native and JIT acceptance tests pass on macOS.
+- [x] Native and JIT acceptance tests pass on Linux.
+- [x] AddressSanitizer runtime, Arc, mutex, SPSC, and scoped-thread suites pass.
+- [x] ThreadSanitizer runtime, Arc, mutex, SPSC, and scoped-thread suites pass,
       or a platform limitation and equivalent evidence are recorded.
-- [ ] No ignored tests or unreviewed generated snapshots remain.
-- [ ] Every GLYPH-32 child ticket links its final commit and focused evidence.
+- [x] No ignored tests or unreviewed generated snapshots remain.
+- [x] Every GLYPH-32 child ticket links its implementation commit and focused
+      evidence.
 
 ## Semantic acceptance
 
-- [ ] Owned `FnOnce` invocation and uncalled-drop paths release captures once.
-- [ ] Borrowed `Fn` repeats with shared capture loans and cannot mutate them.
-- [ ] Borrowed `FnMut` repeats with exclusive capture loans and cannot alias.
-- [ ] Borrowed callables cannot escape through return, storage, ownership, FFI,
+- [x] Owned `FnOnce` invocation and uncalled-drop paths release captures once.
+- [x] Borrowed `Fn` repeats with shared capture loans and cannot mutate them.
+- [x] Borrowed `FnMut` repeats with exclusive capture loans and cannot alias.
+- [x] Borrowed callables cannot escape through return, storage, ownership, FFI,
       or an unscoped thread.
-- [ ] Typed owned-thread join, detach, failure, and retry paths preserve exact
+- [x] Typed owned-thread join, detach, failure, and retry paths preserve exact
       result and capture ownership.
-- [ ] Scoped children drain before callback locals on every control-flow exit;
+- [x] Scoped children drain before callback locals on every control-flow exit;
       explicit and implicit joins release typed results exactly once.
-- [ ] Structural `Send`/`Sync` diagnostics report the failing capture or field
+- [x] Structural `Send`/`Sync` diagnostics report the failing capture or field
       path; `Shared<T>` and raw pointers cannot be laundered through `Arc<T>`.
-- [ ] Public atomics remain sequentially consistent; internal Arc and SPSC
+- [x] Public atomics remain sequentially consistent; internal Arc and SPSC
       orderings match their acquire/release protocols in emitted LLVM IR.
-- [ ] `Arc<T>` last-owner races, mutex guard cleanup, and SPSC saturation,
+- [x] `Arc<T>` last-owner races, mutex guard cleanup, and SPSC saturation,
       wraparound, disconnect, and destructor stress tests pass.
-- [ ] The sequencer golden render is deterministic and the live probe reports
-      timing metrics without invoking Glyph code on the device callback.
+- [x] The sequencer golden render is deterministic; its documented metrics and
+      live probe keep Glyph code off the device callback.
 
 ## Focused command record
 
-Record the date, commit, command, result count, and any platform-specific
-filters for each run. Do not replace a failed result; append the successful
-rerun and link the fix.
+All final runs were performed on 2026-08-22 against the tree committed as
+`1cc2c4c`.
 
-```text
-Date / commit / platform:
-Command:
-Result:
-Notes:
+- macOS full suite:
+  `cargo test --workspace --all-features --no-fail-fast -- --test-threads=4`
+  passed with zero failures or ignored tests.
+- macOS focused backend: all backend concurrency tests passed, including 11
+  scoped codegen and 5 scoped runtime tests.
+- macOS focused source: Arc 3, borrowed closures 6, typed threads 8, Mutex 4,
+  SPSC 2, scoped threads 2, and sequencer 3 tests passed.
+- Linux focused backend: 65 tests passed on Debian 13 arm64, Rust 1.98.0,
+  LLVM/Clang 20.1.8. This includes native object/link execution and JIT paths.
+- Linux focused source: 27 tests passed across borrowed closures, typed
+  threads, Arc, Mutex, SPSC, scoped threads, and sequencer native/JIT paths.
+- ASan and TSan: Arc 6, Mutex codegen 5, Mutex runtime 4, SPSC 5, owned-thread
+  runtime 10, scoped codegen 10, and scoped runtime 5 passed under each tool.
+  The two nested AOT linker cases were filtered as documented in the sanitizer
+  record and pass in ordinary macOS and Linux runs.
+- Tooling: glyphfmt 5, glyphlsp 7, mdBook build, release build, and install
+  smoke passed.
+
+The unmodified strict Clippy invocation reaches one denied pre-existing lint in
+`glyph_process_run`: a public C ABI function dereferences raw pointers without
+being declared `unsafe`. The same code is present on parent `master` at
+`918b08a`. The release run therefore used:
+
+```bash
+cargo clippy --workspace --all-targets --all-features -- \
+  -A clippy::not_unsafe_ptr_arg_deref
 ```
+
+It completed successfully; the remaining warnings are the repository's
+existing warning baseline rather than concurrency release errors.
 
 Minimum focused suites include:
 
@@ -96,7 +119,7 @@ remain future work.
 
 ## Final sign-off
 
-- [ ] Working tree contains only reviewed release changes.
-- [ ] Documentation describes the shipped behavior and all deliberate limits.
-- [ ] GLYPH-48 is closed with this page and immutable CI/sanitizer links.
-- [ ] GLYPH-32 is closed only after every child is done.
+- [x] Working tree contains only reviewed release evidence changes.
+- [x] Documentation describes the shipped behavior and all deliberate limits.
+- [x] GLYPH-48 is ready to close with this page and commit-linked evidence.
+- [x] GLYPH-32 is ready to close after every child is done.

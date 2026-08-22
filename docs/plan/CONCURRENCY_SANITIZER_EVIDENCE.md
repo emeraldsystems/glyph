@@ -2,9 +2,9 @@
 
 This record covers the sanitizer acceptance evidence for typed thread results
 (GLYPH-43), bounded SPSC channels (GLYPH-45), `Arc<T>` (GLYPH-50), and
-`Mutex<T>` (GLYPH-51). The focused runs below used commit `870c27e` in a
-detached worktree so unrelated in-progress language work could not change the
-result while the checks were running.
+`Mutex<T>` (GLYPH-51), and scoped threads (GLYPH-47). The original owned-thread,
+Arc, mutex, and SPSC runs used commit `870c27e`; the final rerun used release
+candidate `1cc2c4c`, including the complete scoped-thread surface.
 
 ## Environment
 
@@ -32,15 +32,19 @@ env GLYPH_RUNTIME_SANITIZER=address \
   --config 'target.aarch64-apple-darwin.rustflags=["-C","link-arg=-L/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin","-C","link-arg=-lclang_rt.asan_osx_dynamic","-C","link-arg=-Wl,-rpath,/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin"]' \
   test -p glyph-backend --all-features \
   --test thread_runtime --test arc_codegen \
-  --test mutex_codegen --test mutex_runtime --test spsc_codegen -- \
-  --skip aot_linker_resolves_and_executes_native_thread_runtime_symbol
+  --test mutex_codegen --test mutex_runtime --test spsc_codegen \
+  --test scoped_thread_codegen --test scoped_thread_runtime -- \
+  --skip aot_linker_resolves_and_executes_native_thread_runtime_symbol \
+  --skip aot_scope_cleanup_links_and_joins_before_main_returns
 ```
 
 Result: PASS.
 
 - `arc_codegen`: 6 passed
-- `mutex_codegen`: 4 passed
+- `mutex_codegen`: 5 passed
 - `mutex_runtime`: 4 passed
+- `scoped_thread_codegen`: 10 passed, 1 deliberately filtered
+- `scoped_thread_runtime`: 5 passed
 - `spsc_codegen`: 5 passed
 - `thread_runtime`: 10 passed, 1 deliberately filtered
 - No AddressSanitizer report was emitted.
@@ -72,15 +76,19 @@ env GLYPH_RUNTIME_SANITIZER=thread \
   --config 'target.aarch64-apple-darwin.rustflags=["-C","link-arg=-L/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin","-C","link-arg=-lclang_rt.tsan_osx_dynamic","-C","link-arg=-Wl,-rpath,/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin"]' \
   test -p glyph-backend --all-features \
   --test thread_runtime --test arc_codegen \
-  --test mutex_codegen --test mutex_runtime --test spsc_codegen -- \
-  --skip aot_linker_resolves_and_executes_native_thread_runtime_symbol
+  --test mutex_codegen --test mutex_runtime --test spsc_codegen \
+  --test scoped_thread_codegen --test scoped_thread_runtime -- \
+  --skip aot_linker_resolves_and_executes_native_thread_runtime_symbol \
+  --skip aot_scope_cleanup_links_and_joins_before_main_returns
 ```
 
 Result: PASS.
 
 - `arc_codegen`: 6 passed
-- `mutex_codegen`: 4 passed
+- `mutex_codegen`: 5 passed
 - `mutex_runtime`: 4 passed
+- `scoped_thread_codegen`: 10 passed, 1 deliberately filtered
+- `scoped_thread_runtime`: 5 passed
 - `spsc_codegen`: 5 passed
 - `thread_runtime`: 10 passed, 1 deliberately filtered
 - No ThreadSanitizer report was emitted.
@@ -129,3 +137,8 @@ diagnose an uninstrumented JIT load or store by itself.
   try-lock, destroy-while-locked, and typed Arc/Mutex drop tests. A separate
   backend invariant test deliberately emits duplicate guard cleanup and proves
   the guard slot is nulled so the native mutex is unlocked exactly once.
+- GLYPH-47: scoped create, spawn, explicit typed join, implicit drain,
+  unclaimed-result destruction, spawn failure, borrowed-environment ownership,
+  and forged-MIR rejection passed under both sanitizers. The AOT linker case is
+  filtered only because nested linking cannot inherit the sanitizer runtime;
+  it passes in ordinary macOS and Linux runs.
