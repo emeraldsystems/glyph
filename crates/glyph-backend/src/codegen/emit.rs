@@ -226,7 +226,7 @@ impl CodegenContext {
             if LLVMTargetMachineEmitToFile(
                 target_machine,
                 self.module,
-                output_path_c.as_ptr() as *mut i8,
+                output_path_c.as_ptr(),
                 LLVMCodeGenFileType::LLVMObjectFile,
                 &mut error,
             ) != 0

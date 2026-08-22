@@ -39,16 +39,16 @@ impl CodegenContext {
                 }
         }
 
-        fn type_contains_borrowed_storage(ty: &Type) -> bool {
-            matches!(ty, Type::BorrowedFunction { .. } | Type::Ref(..))
+        fn type_contains_borrowed_callable(ty: &Type) -> bool {
+            matches!(ty, Type::BorrowedFunction { .. })
                 || match ty {
                     Type::App { args, .. } | Type::Tuple(args) => {
-                        args.iter().any(type_contains_borrowed_storage)
+                        args.iter().any(type_contains_borrowed_callable)
                     }
                     Type::Array(inner, _)
                     | Type::Own(inner)
                     | Type::RawPtr(inner)
-                    | Type::Shared(inner) => type_contains_borrowed_storage(inner),
+                    | Type::Shared(inner) => type_contains_borrowed_callable(inner),
                     _ => false,
                 }
         }
@@ -57,42 +57,42 @@ impl CodegenContext {
         let mut public_spawn_scopes = HashSet::new();
         for block in &func.blocks {
             for inst in &block.insts {
-                let local_has_borrowed_storage = |local: LocalId| {
+                let local_has_borrowed_callable = |local: LocalId| {
                     func.locals
                         .get(local.0 as usize)
                         .and_then(|local| local.ty.as_ref())
-                        .is_some_and(type_contains_borrowed_storage)
+                        .is_some_and(type_contains_borrowed_callable)
                 };
-                let value_has_borrowed_storage = |value: &MirValue| matches!(value, MirValue::Local(local) if local_has_borrowed_storage(*local));
+                let value_has_borrowed_callable = |value: &MirValue| matches!(value, MirValue::Local(local) if local_has_borrowed_callable(*local));
                 if let MirInst::Assign { value, .. } = inst {
                     let stores_borrowed = match value {
                         Rvalue::StructLit { field_values, .. } => field_values
                             .iter()
-                            .any(|(_, value)| value_has_borrowed_storage(value)),
+                            .any(|(_, value)| value_has_borrowed_callable(value)),
                         Rvalue::ArrayLit { elements, .. } => {
-                            elements.iter().any(value_has_borrowed_storage)
+                            elements.iter().any(value_has_borrowed_callable)
                         }
                         Rvalue::EnumConstruct {
                             payload: Some(value),
                             ..
-                        } => value_has_borrowed_storage(value),
+                        } => value_has_borrowed_callable(value),
                         Rvalue::VecPush { value, .. }
                         | Rvalue::OwnNew { value, .. }
                         | Rvalue::SharedNew { value, .. }
                         | Rvalue::ArcNew { value, .. }
-                        | Rvalue::MutexNew { value, .. } => value_has_borrowed_storage(value),
+                        | Rvalue::MutexNew { value, .. } => value_has_borrowed_callable(value),
                         Rvalue::MapAdd { key, value, .. }
                         | Rvalue::MapUpdate { key, value, .. } => {
-                            value_has_borrowed_storage(key) || value_has_borrowed_storage(value)
+                            value_has_borrowed_callable(key) || value_has_borrowed_callable(value)
                         }
                         Rvalue::MakeClosure { captures, .. } => captures
                             .iter()
-                            .any(|capture| local_has_borrowed_storage(capture.local)),
+                            .any(|capture| local_has_borrowed_callable(capture.local)),
                         _ => false,
                     };
                     if stores_borrowed {
                         bail!(
-                            "borrowed references and callables cannot be stored in aggregates, containers, allocations, or owned closures"
+                            "borrowed callables cannot be stored in aggregates, containers, allocations, or owned closures"
                         );
                     }
                     let task = match value {
@@ -150,9 +150,9 @@ impl CodegenContext {
                     }
                 }
                 if let MirInst::AssignField { value, .. } = inst
-                    && matches!(value, Rvalue::Move(local) if local_has_borrowed_storage(*local))
+                    && matches!(value, Rvalue::Move(local) if local_has_borrowed_callable(*local))
                 {
-                    bail!("borrowed references and callables cannot be stored in struct fields");
+                    bail!("borrowed callables cannot be stored in struct fields");
                 }
                 if let MirInst::Return(Some(MirValue::Local(local))) = inst {
                     if func

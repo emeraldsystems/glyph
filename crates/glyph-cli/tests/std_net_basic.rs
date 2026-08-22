@@ -93,9 +93,10 @@ fn std_net_tcp_listen_close() {
           let result: Result<TcpListener, NetError> = tcp_listen("127.0.0.1", 0, 1)
           ret match result {
             Ok(listener) => {
-              let port = listener.local_port()
+              let mut active_listener: TcpListener = listener
+              let port = active_listener.local_port()
               if port == 0 { ret 10 }
-              let _ = listener.close()
+              let _ = active_listener.close()
               ret 0
             },
             Err(_e) => 1,
@@ -117,9 +118,10 @@ fn std_net_udp_bind_close() {
           let result: Result<UdpSocket, NetError> = udp_bind("127.0.0.1", 0)
           ret match result {
             Ok(sock) => {
-              let port = sock.local_port()
+              let mut active_socket: UdpSocket = sock
+              let port = active_socket.local_port()
               if port == 0 { ret 10 }
-              let _ = sock.close()
+              let _ = active_socket.close()
               ret 0
             },
             Err(_e) => 1,
@@ -158,7 +160,7 @@ fn std_net_tcp_loopback_echo() {
 
         fn main() -> i32 {
           let lr: Result<TcpListener, NetError> = tcp_listen("127.0.0.1", 0, 1)
-          let listener = match lr {
+          let mut listener = match lr {
             Ok(l) => l,
             Err(_e) => { ret 1 },
           }
@@ -166,13 +168,13 @@ fn std_net_tcp_loopback_echo() {
           if port == 0 { ret 2 }
 
           let cr: Result<TcpStream, NetError> = tcp_connect("127.0.0.1", port)
-          let client = match cr {
+          let mut client = match cr {
             Ok(c) => c,
             Err(_e) => { ret 3 },
           }
 
           let ar: Result<TcpStream, NetError> = listener.accept()
-          let server = match ar {
+          let mut server = match ar {
             Ok(s) => s,
             Err(_e) => { ret 4 },
           }
@@ -211,7 +213,7 @@ fn std_net_udp_loopback() {
 
         fn main() -> i32 {
           let br: Result<UdpSocket, NetError> = udp_bind("127.0.0.1", 0)
-          let sock = match br {
+          let mut sock = match br {
             Ok(s) => s,
             Err(_e) => { ret 1 },
           }

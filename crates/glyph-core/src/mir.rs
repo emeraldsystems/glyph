@@ -664,8 +664,8 @@ pub enum MirValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        BorrowKind, CaptureTransfer, LocalId, MirBorrowCapture, MirCapture, MirInst, MirValue,
-        Rvalue,
+        BorrowCaptureSource, BorrowKind, CaptureTransfer, LocalId, MirBorrowCapture, MirCapture,
+        MirInst, MirValue, Rvalue,
     };
     use crate::atomic::{AtomicOrdering, AtomicRmwOp, AtomicScalar};
     use crate::types::Type;

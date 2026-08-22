@@ -269,7 +269,7 @@ fn main() -> i32 {
 }
 
 #[test]
-fn source_dropping_a_typed_handle_detaches_it() {
+fn source_dropping_a_typed_handle_lowers_to_detach_cleanup() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let source = r#"
 import spawn from std/thread
@@ -288,7 +288,14 @@ fn main() -> i32 {
 }
 "#;
 
-    assert_eq!(execute(source, "thread_source_typed_handle_drop"), 42);
+    // Do not execute this case in a short-lived JIT engine: detach is
+    // intentionally nonblocking, so the child may still be executing code
+    // owned by that engine when the test drops it. Runtime detach behavior and
+    // native-process lifetime are covered by thread_runtime and thread_values.
+    let output = compile(source);
+    let mut codegen = CodegenContext::new("thread_source_typed_handle_drop").unwrap();
+    codegen.codegen_module(&output.mir).unwrap();
+    assert!(codegen.dump_ir().contains("@glyph_thread_detach"));
 }
 
 #[test]

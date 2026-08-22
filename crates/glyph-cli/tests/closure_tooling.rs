@@ -81,7 +81,7 @@ fn main() -> i32 {
     assert!(
         diagnostics.iter().any(|message| {
             message.contains("cannot infer type of closure parameter 'value'")
-                && message.contains("type annotation or a FnOnce context")
+                && message.contains("type annotation or a callable context")
         }),
         "diagnostics: {diagnostics:?}"
     );
@@ -145,22 +145,17 @@ fn main() -> i32 {
 }
 
 #[test]
-fn borrowed_callable_kinds_are_explicitly_deferred() {
-    for callable in ["Fn<i32, i32>", "FnMut<i32, i32>"] {
-        let diagnostics = messages(&format!(
-            r#"
-fn main() -> i32 {{
-  let callback: {callable} = value -> value
-  ret 0
-}}
-"#
-        ));
+fn borrowed_callable_kinds_run_repeatedly() {
+    let source = r#"
+fn main() -> i32 {
+  let shared: Fn<i32, i32> = value -> value + 1
+  let mutable: FnMut<i32, i32> = value -> value + 1
+  let first = shared(19)
+  let second = shared(20)
+  let third = mutable(0)
+  ret first + second + third
+}
+"#;
 
-        assert!(
-            diagnostics
-                .iter()
-                .any(|message| { message.contains("not supported") && message.contains("FnOnce") }),
-            "{callable} diagnostics: {diagnostics:?}"
-        );
-    }
+    assert_eq!(compile_and_run(source), 42);
 }
