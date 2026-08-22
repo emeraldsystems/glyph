@@ -71,6 +71,29 @@ All final runs were performed on 2026-08-22 against the tree committed as
 - Tooling: glyphfmt 5, glyphlsp 7, mdBook build, release build, and install
   smoke passed.
 
+## GLYPH-2 ownership compatibility
+
+The concurrency surface preserves GLYPH-2's implemented single-owner rule:
+passing an owned droppable value by value consumes the caller's local, while
+reference parameters borrow it. Closure capture, thread transfer, typed thread
+results, channel send, and synchronization wrappers all reuse the same MIR
+move/drop accounting; they do not introduce a shallow-copy ownership path.
+
+The focused compatibility run used:
+
+```bash
+cargo test -p glyph-cli --all-features \
+  --test redteam_edge_cases \
+  --test view_escape_ownership \
+  --test vec_string_redteam -- --test-threads=4
+```
+
+It passed 42 tests with zero failures or ignored tests. The matrix includes
+droppable structs crossing ordinary calls, if/match branches, fields and map
+views crossing ownership boundaries, nested vectors, returned fields, and
+repeated drop stress. The closure/thread/Arc/Mutex/SPSC suites listed above add
+the corresponding transfer and cleanup coverage for every new carrier.
+
 The unmodified strict Clippy invocation reaches one denied pre-existing lint in
 `glyph_process_run`: a public C ABI function dereferences raw pointers without
 being declared `unsafe`. The same code is present on parent `master` at
