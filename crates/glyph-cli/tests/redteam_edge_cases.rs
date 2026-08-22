@@ -1,11 +1,11 @@
 /// Red-team edge-case tests for ownership, drops, and memory safety.
 ///
-/// These tests target confirmed codegen gaps:
-/// - Enum drop no-op (ownership.rs:322-324)
-/// - Map drop no-op (map.rs:2944-2953)
-/// - Break/continue skip drops (flow.rs:184-201)
-/// - B5 shallow copy (struct pass-by-value double-free)
-/// - B4 Vec growth (stale snapshot after reallocation)
+/// These tests target historical ownership, drop, and memory-safety gaps:
+/// - Enum payload drops
+/// - Map entry drops
+/// - Break/continue scope drops
+/// - Droppable pass-by-value ownership
+/// - Vec growth and element ownership
 ///
 /// Tests that exercise leak bugs pass silently (exit 0) but leak memory.
 /// Tests that exercise crash bugs are #[ignore].
@@ -78,16 +78,6 @@ fn build_and_run_exit_code(source: &str) -> i32 {
     } else {
         -1
     }
-}
-
-#[cfg(all(feature = "codegen", unix))]
-fn assert_crashes_with_known_signal(exit_code: i32, context: &str) {
-    assert!(
-        matches!(exit_code, -6 | -11),
-        "{}: expected crash signal (-6 SIGABRT or -11 SIGSEGV), got {}",
-        context,
-        exit_code
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -377,8 +367,9 @@ fn vec_struct_droppable_fields_recursive_drop() {
 }
 
 // ---------------------------------------------------------------------------
-// T11: Struct with two String fields passed by value → double-free crash.
-// BUG: B5 — shallow copy at call site, both caller and callee drop.
+// T11: Struct with two String fields passed by value.
+// Regression: by-value calls consume the caller's owner so caller/callee do not
+// both drop aliased fields.
 // ---------------------------------------------------------------------------
 #[cfg(all(feature = "codegen", unix))]
 #[test]
@@ -755,13 +746,12 @@ fn nested_if_inside_match_reassign_stress() {
 }
 
 // ---------------------------------------------------------------------------
-// T24: If-split pass-by-value crash probe.
-// BUG: B5 shallow copy may crash when caller/callee both drop aliased fields.
+// T24: If-split pass-by-value regression.
+// By-value calls inside branches consume the caller's owner.
 // ---------------------------------------------------------------------------
 #[cfg(all(feature = "codegen", unix))]
 #[test]
-#[ignore = "known B5 shallow-copy crash probe; enable when validating fixes"]
-fn struct_pass_by_value_double_free_if_branch_crash_probe() {
+fn struct_pass_by_value_if_branch_regression() {
     let source = r#"
         struct TwoStrings { a: String, b: String }
 
@@ -782,18 +772,16 @@ fn struct_pass_by_value_double_free_if_branch_crash_probe() {
         }
     "#;
 
-    let exit_code = build_and_run_exit_code(source);
-    assert_crashes_with_known_signal(exit_code, "if-branch pass-by-value probe");
+    assert_eq!(build_and_run_exit_code(source), 0);
 }
 
 // ---------------------------------------------------------------------------
-// T25: Match-split pass-by-value crash probe.
-// BUG: same B5 shallow-copy issue, triggered from match-arm join context.
+// T25: Match-split pass-by-value regression.
+// By-value calls inside match arms consume the caller's owner.
 // ---------------------------------------------------------------------------
 #[cfg(all(feature = "codegen", unix))]
 #[test]
-#[ignore = "known B5 shallow-copy crash probe; enable when validating fixes"]
-fn struct_pass_by_value_double_free_match_arm_crash_probe() {
+fn struct_pass_by_value_match_arm_regression() {
     let source = r#"
         enum Branch { Run, Skip }
         struct TwoStrings { a: String, b: String }
@@ -815,6 +803,5 @@ fn struct_pass_by_value_double_free_match_arm_crash_probe() {
         }
     "#;
 
-    let exit_code = build_and_run_exit_code(source);
-    assert_crashes_with_known_signal(exit_code, "match-arm pass-by-value probe");
+    assert_eq!(build_and_run_exit_code(source), 0);
 }

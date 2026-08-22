@@ -530,4 +530,132 @@ MirModule {
             ],
         },
     ],
+    extern_functions: [
+        MirExternFunction {
+            name: "glyph_fmt_write_i32",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                I32,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+        MirExternFunction {
+            name: "glyph_fmt_write_u32",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                U32,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+        MirExternFunction {
+            name: "glyph_fmt_write_i64",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                I64,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+        MirExternFunction {
+            name: "glyph_fmt_write_u64",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                U64,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+        MirExternFunction {
+            name: "glyph_fmt_write_bool",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                U32,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+        MirExternFunction {
+            name: "glyph_fmt_write_char",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                U32,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+        MirExternFunction {
+            name: "glyph_fmt_write_str",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                Str,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+        MirExternFunction {
+            name: "glyph_fmt_write_f32",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                F32,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+        MirExternFunction {
+            name: "glyph_fmt_write_f64",
+            ret_type: Some(
+                I32,
+            ),
+            params: [
+                I32,
+                F64,
+            ],
+            abi: Some(
+                "C",
+            ),
+            link_name: None,
+        },
+    ],
 }

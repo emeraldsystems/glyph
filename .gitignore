@@ -8,7 +8,6 @@ docs/*
 !docs/book/
 !docs/plan/
 !docs/todo/
-!docs/issues/
 .opencode
 .env
 video/

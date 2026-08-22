@@ -6,6 +6,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 // Helper to convert i32 to decimal string and write to fd
 // Returns number of bytes written, or -1 on error
@@ -155,6 +157,50 @@ int glyph_fmt_write_str(int fd, const char* str) {
 // Returns number of bytes written, or -1 on error
 int glyph_print(const char* str) {
     return glyph_fmt_write_str(1, str);
+}
+
+// Shortest decimal form that round-trips back to the same value
+// (e.g. 1.5 -> "1.5", 3.0 -> "3", 0.1 -> "0.1", 220.0 -> "220").
+// Scientific notation is only used outside the ~1e-4..1e17 range.
+static int glyph_fmt_float_shortest(char *buf, size_t cap, double value, int is_f32, float fvalue) {
+    double a = value < 0 ? -value : value;
+    int allow_exp = (a != 0.0) && (a < 1e-4 || a >= 1e17);
+    for (int prec = 1; prec <= 17; prec++) {
+        int len = snprintf(buf, cap, "%.*g", prec, value);
+        if (len < 0) {
+            return -1;
+        }
+        if (!allow_exp && strchr(buf, 'e')) {
+            continue;
+        }
+        int ok = is_f32 ? (strtof(buf, NULL) == fvalue) : (strtod(buf, NULL) == value);
+        if (ok) {
+            return len;
+        }
+    }
+    return snprintf(buf, cap, "%.17g", value);
+}
+
+// Write an f64 in its shortest round-tripping decimal form
+// Returns number of bytes written, or -1 on error
+int glyph_fmt_write_f64(int fd, double value) {
+    char buf[40];
+    int len = glyph_fmt_float_shortest(buf, sizeof buf, value, 0, 0.0f);
+    if (len < 0) {
+        return -1;
+    }
+    return write(fd, buf, (size_t)len);
+}
+
+// f32 variant: round-trips against float precision
+// Returns number of bytes written, or -1 on error
+int glyph_fmt_write_f32(int fd, float value) {
+    char buf[40];
+    int len = glyph_fmt_float_shortest(buf, sizeof buf, (double)value, 1, value);
+    if (len < 0) {
+        return -1;
+    }
+    return write(fd, buf, (size_t)len);
 }
 
 // Write a single Unicode scalar value encoded as UTF-8

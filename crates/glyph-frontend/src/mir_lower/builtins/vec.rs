@@ -10,12 +10,16 @@ use super::super::types::vec_elem_type_from_type;
 pub(crate) fn lower_vec_len<'a>(
     ctx: &mut LowerCtx<'a>,
     base: &'a Expr,
-    _span: Span,
+    span: Span,
 ) -> Option<Rvalue> {
     let base_local = match base {
         Expr::Ident(ident, _) => ctx.bindings.get(ident.0.as_str()).copied(),
         _ => None,
     }?;
+
+    if !ctx.check_local_available(base_local, Some(span)) {
+        return None;
+    }
 
     let Some(base_ty) = ctx
         .locals

@@ -1,7 +1,7 @@
 use glyph_core::ast::{BinaryOp, Expr, Ident, UnaryOp};
 use glyph_core::mir::{LocalId, MirInst, MirValue, Rvalue};
 use glyph_core::span::Span;
-use glyph_core::types::{Mutability, Type};
+use glyph_core::types::{EnumType, Mutability, Type};
 
 use crate::resolver::{ConstValue, ResolvedSymbol};
 
@@ -138,13 +138,18 @@ fn lower_field_access_ref<'a>(
 ) -> Option<LocalId> {
     match expr {
         Expr::Ident(ident, ident_span) => {
-            ctx.bindings.get(ident.0.as_str()).copied().or_else(|| {
+            let local = ctx.bindings.get(ident.0.as_str()).copied().or_else(|| {
                 ctx.error(
                     format!("unknown identifier '{}'", ident.0),
                     Some(*ident_span),
                 );
                 None
-            })
+            })?;
+            if ctx.check_local_available(local, Some(*ident_span)) {
+                Some(local)
+            } else {
+                None
+            }
         }
         Expr::FieldAccess { base, field, span } => {
             let base_local = lower_field_access_ref(ctx, base, *span)?;
@@ -195,6 +200,22 @@ pub(crate) fn lower_expr_with_expected<'a>(
                 }
             }
             Some(Rvalue::ConstInt(*i))
+        }
+        Expr::Lit(glyph_core::ast::Literal::Float(fl), _) => {
+            // Bare float literals default to f64; an expected f32 type creates a
+            // typed local so the literal carries its width through MIR to codegen.
+            if let Some(ty) = expected {
+                if ty.is_float() && *ty != Type::F64 {
+                    let tmp = ctx.fresh_local(None);
+                    ctx.locals[tmp.0 as usize].ty = Some(ty.clone());
+                    ctx.push_inst(MirInst::Assign {
+                        local: tmp,
+                        value: Rvalue::ConstFloat(*fl),
+                    });
+                    return Some(Rvalue::Move(tmp));
+                }
+            }
+            Some(Rvalue::ConstFloat(*fl))
         }
         Expr::Lit(glyph_core::ast::Literal::Bool(b), _) => Some(Rvalue::ConstBool(*b)),
         Expr::Lit(glyph_core::ast::Literal::Str(s), _) => Some(Rvalue::StringLit {
@@ -355,12 +376,17 @@ fn lower_unary_neg<'a>(ctx: &mut LowerCtx<'a>, expr: &'a Expr, _span: Span) -> O
     let value = lower_value(ctx, expr)?;
     let tmp = ctx.fresh_local(None);
     let ty = infer_value_type(&value, ctx).unwrap_or(Type::I32);
+    let zero = if ty.is_float() {
+        MirValue::Float(0.0)
+    } else {
+        MirValue::Int(0)
+    };
     ctx.locals[tmp.0 as usize].ty = Some(ty);
     ctx.push_inst(MirInst::Assign {
         local: tmp,
         value: Rvalue::Binary {
             op: BinaryOp::Sub,
-            lhs: MirValue::Int(0),
+            lhs: zero,
             rhs: value,
         },
     });
@@ -378,7 +404,11 @@ fn lower_binary<'a>(
     let lhs_val = lower_value(ctx, lhs)?;
     let lhs_ty = infer_value_type(&lhs_val, ctx);
     let rhs_expected = if let Some(ty) = &lhs_ty {
-        if ty.is_int() { Some(ty.clone()) } else { None }
+        if ty.is_int() || ty.is_float() {
+            Some(ty.clone())
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -542,7 +572,7 @@ pub(crate) fn lower_match<'a>(
     let scrut_val = lower_value(ctx, scrutinee)?;
     let scrut_local = match scrut_val {
         MirValue::Local(id) => id,
-        MirValue::Int(_) | MirValue::Bool(_) | MirValue::Unit => {
+        MirValue::Int(_) | MirValue::Float(_) | MirValue::Bool(_) | MirValue::Unit => {
             let tmp = ctx.fresh_local(None);
             let rv = rvalue_from_value(scrut_val)?;
             ctx.locals[tmp.0 as usize].ty = None;
@@ -782,6 +812,7 @@ pub(crate) fn lower_match<'a>(
                     ctx.locals[res_local.0 as usize].ty = match &val {
                         MirValue::Local(id) => ctx.locals[id.0 as usize].ty.clone(),
                         MirValue::Int(_) => Some(Type::I32),
+                        MirValue::Float(_) => Some(Type::F64),
                         MirValue::Bool(_) => Some(Type::Bool),
                         MirValue::Unit => None,
                     };
@@ -833,12 +864,73 @@ pub(crate) fn lower_match<'a>(
     result_local.map(Rvalue::Move)
 }
 
+fn resolve_try_variant(
+    ctx: &mut LowerCtx<'_>,
+    enum_name: &str,
+    enum_def: &EnumType,
+    variant_name: &str,
+    enum_args: Option<&[Type]>,
+    span: Span,
+) -> Option<(u32, Option<Type>)> {
+    let (index, variant) = enum_def
+        .variants
+        .iter()
+        .enumerate()
+        .find(|(_, variant)| variant.name == variant_name)
+        .or_else(|| {
+            ctx.error(
+                format!(
+                    "enum '{}' is missing '{}' variant required by `?`",
+                    enum_name, variant_name
+                ),
+                Some(span),
+            );
+            None
+        })?;
+
+    let generic_payload = match (enum_name, variant_name, enum_args) {
+        ("Result", "Ok", Some(args)) => args.first().cloned(),
+        ("Result", "Err", Some(args)) => args.get(1).cloned(),
+        ("Option", "Some", Some(args)) => args.first().cloned(),
+        _ => None,
+    };
+
+    Some((
+        index as u32,
+        generic_payload.or_else(|| variant.payload.clone()),
+    ))
+}
+
+fn resolve_try_return_enum(
+    ctx: &mut LowerCtx<'_>,
+    fn_ret: &Option<Type>,
+    expected_enum: &str,
+    span: Span,
+) -> Option<String> {
+    match fn_ret {
+        Some(Type::App { base, .. }) if base == expected_enum => Some(base.clone()),
+        Some(Type::Enum(name)) if name == expected_enum => Some(name.clone()),
+        Some(_) => {
+            ctx.error(
+                format!(
+                    "the `?` operator on '{}' values requires the enclosing function to return '{}'",
+                    expected_enum, expected_enum
+                ),
+                Some(span),
+            );
+            None
+        }
+        None => None,
+    }
+}
+
 // Lower the `?` (try) operator.
 //
 // `expr?` desugars to:
 //   match expr { Ok(v) => v, Err(e) => ret Err(e) }
 //
-// The enclosing function must return Result<_, E> for the early return to be valid.
+// The enclosing function must return Result<_, E> or Option<_> for the early
+// return to be valid.
 fn lower_try<'a>(ctx: &mut LowerCtx<'a>, inner_expr: &'a Expr, span: Span) -> Option<Rvalue> {
     // 1. Lower the inner expression
     let scrut_val = lower_value(ctx, inner_expr)?;
@@ -909,34 +1001,35 @@ fn lower_try<'a>(ctx: &mut LowerCtx<'a>, inner_expr: &'a Expr, span: Span) -> Op
         }
     };
 
-    // 5. Substitute generic parameters for payload types
-    let ok_variant_index: u32;
-    let err_variant_index: u32;
-    let ok_payload_ty: Option<Type>;
-    let err_payload_ty: Option<Type>;
-
-    if is_result {
-        // Result<T, E>: Ok is index 0, Err is index 1
-        ok_variant_index = 0;
-        err_variant_index = 1;
-        ok_payload_ty = enum_args
-            .as_ref()
-            .and_then(|a| a.get(0).cloned())
-            .or_else(|| enum_def.variants.get(0).and_then(|v| v.payload.clone()));
-        err_payload_ty = enum_args
-            .as_ref()
-            .and_then(|a| a.get(1).cloned())
-            .or_else(|| enum_def.variants.get(1).and_then(|v| v.payload.clone()));
+    let (ok_variant_name, err_variant_name) = if is_result {
+        ("Ok", "Err")
     } else {
-        // Option<T>: Some is index 0, None is index 1
-        ok_variant_index = 0;
-        err_variant_index = 1;
-        ok_payload_ty = enum_args
-            .as_ref()
-            .and_then(|a| a.get(0).cloned())
-            .or_else(|| enum_def.variants.get(0).and_then(|v| v.payload.clone()));
-        err_payload_ty = None;
-    }
+        ("Some", "None")
+    };
+    let ret_enum_name = resolve_try_return_enum(
+        ctx,
+        &fn_ret,
+        if is_result { "Result" } else { "Option" },
+        span,
+    )?;
+
+    // 5. Resolve variant indices by name and substitute generic payload types.
+    let (ok_variant_index, ok_payload_ty) = resolve_try_variant(
+        ctx,
+        &enum_name,
+        &enum_def,
+        ok_variant_name,
+        enum_args.as_deref(),
+        span,
+    )?;
+    let (err_variant_index, err_payload_ty) = resolve_try_variant(
+        ctx,
+        &enum_name,
+        &enum_def,
+        err_variant_name,
+        enum_args.as_deref(),
+        span,
+    )?;
 
     // 6. Extract tag
     let tag_local = ctx.fresh_local(None);
@@ -973,6 +1066,8 @@ fn lower_try<'a>(ctx: &mut LowerCtx<'a>, inner_expr: &'a Expr, span: Span) -> Op
     if let Some(ty) = &ok_payload_ty {
         ctx.locals[result_local.0 as usize].ty = Some(ty.clone());
     }
+    let branch_base_len = ctx.local_states.len();
+    let branch_base_states = ctx.local_states.clone();
 
     ctx.switch_to(ok_block);
     if let Some(payload_ty) = &ok_payload_ty {
@@ -986,8 +1081,18 @@ fn lower_try<'a>(ctx: &mut LowerCtx<'a>, inner_expr: &'a Expr, span: Span) -> Op
         });
     }
     ctx.push_inst(MirInst::Goto(join_block));
+    let join_len = ctx.local_states.len();
+    let join_states = ctx.local_states.clone();
 
     // 10. Err block: early return with Err(e) or None
+    for (idx, state) in branch_base_states
+        .iter()
+        .take(branch_base_len)
+        .copied()
+        .enumerate()
+    {
+        ctx.local_states[idx] = state;
+    }
     ctx.switch_to(err_block);
     if is_result {
         // Extract error payload and wrap in Err for the return type
@@ -1004,22 +1109,19 @@ fn lower_try<'a>(ctx: &mut LowerCtx<'a>, inner_expr: &'a Expr, span: Span) -> Op
             });
 
             // Construct the Err variant for the function's return type
-            let ret_enum_name = match &fn_ret {
-                Some(Type::App { base, .. }) if base == "Result" => base.clone(),
-                Some(Type::Enum(name)) => name.clone(),
-                _ => "Result".to_string(),
-            };
-
             let ret_err = ctx.fresh_local(None);
             ctx.locals[ret_err.0 as usize].ty = fn_ret.clone();
             ctx.push_inst(MirInst::Assign {
                 local: ret_err,
                 value: Rvalue::EnumConstruct {
-                    enum_name: ret_enum_name,
-                    variant_index: 1, // Err variant
+                    enum_name: ret_enum_name.clone(),
+                    variant_index: err_variant_index,
                     payload: Some(MirValue::Local(err_payload)),
                 },
             });
+            if let Some(state) = ctx.local_states.get_mut(ret_err.0 as usize) {
+                *state = LocalState::Moved;
+            }
             ctx.drop_all_active_locals();
             ctx.push_inst(MirInst::Return(Some(MirValue::Local(ret_err))));
         } else {
@@ -1028,27 +1130,27 @@ fn lower_try<'a>(ctx: &mut LowerCtx<'a>, inner_expr: &'a Expr, span: Span) -> Op
         }
     } else {
         // Option: return None
-        let ret_enum_name = match &fn_ret {
-            Some(Type::App { base, .. }) if base == "Option" => base.clone(),
-            Some(Type::Enum(name)) => name.clone(),
-            _ => "Option".to_string(),
-        };
-
         let ret_none = ctx.fresh_local(None);
         ctx.locals[ret_none.0 as usize].ty = fn_ret.clone();
         ctx.push_inst(MirInst::Assign {
             local: ret_none,
             value: Rvalue::EnumConstruct {
-                enum_name: ret_enum_name,
-                variant_index: 1, // None variant
+                enum_name: ret_enum_name.clone(),
+                variant_index: err_variant_index,
                 payload: None,
             },
         });
+        if let Some(state) = ctx.local_states.get_mut(ret_none.0 as usize) {
+            *state = LocalState::Moved;
+        }
         ctx.drop_all_active_locals();
         ctx.push_inst(MirInst::Return(Some(MirValue::Local(ret_none))));
     }
 
     // 11. Continue from join block with the unwrapped Ok value
+    for (idx, state) in join_states.iter().take(join_len).copied().enumerate() {
+        ctx.local_states[idx] = state;
+    }
     ctx.switch_to(join_block);
     Some(Rvalue::Move(result_local))
 }
@@ -1153,6 +1255,7 @@ pub(crate) fn lower_tuple_expr<'a>(
         // Infer type from the element expression
         let ty = match &val {
             MirValue::Int(_) => Type::I32,
+            MirValue::Float(_) => Type::F64,
             MirValue::Bool(_) => Type::Bool,
             MirValue::Local(local_id) => ctx
                 .locals
@@ -1264,6 +1367,7 @@ pub(crate) fn lower_array_index<'a>(
                 local: tmp,
                 value: match base_val {
                     MirValue::Int(i) => Rvalue::ConstInt(i),
+                    MirValue::Float(f) => Rvalue::ConstFloat(f),
                     MirValue::Bool(b) => Rvalue::ConstBool(b),
                     MirValue::Local(_) => unreachable!(),
                     MirValue::Unit => unreachable!("unit value cannot be indexed"),
@@ -1437,6 +1541,9 @@ pub(crate) fn lower_ref_expr<'a>(
                 ctx.error(format!("unknown identifier '{}'", ident.0), Some(span));
                 return None;
             };
+            if !ctx.check_local_available(local, Some(span)) {
+                return None;
+            }
             Some(Rvalue::Ref {
                 base: local,
                 mutability,
@@ -1449,6 +1556,9 @@ pub(crate) fn lower_ref_expr<'a>(
                         ctx.error(format!("unknown identifier '{}'", ident.0), Some(span));
                         return None;
                     };
+                    if !ctx.check_local_available(local, Some(span)) {
+                        return None;
+                    }
                     local
                 }
                 _ => {
@@ -1566,6 +1676,22 @@ pub(crate) fn lower_value_with_expected<'a>(
                 }
             }
             Some(MirValue::Int(*i))
+        }
+        Expr::Lit(glyph_core::ast::Literal::Float(fl), _) => {
+            // Bare float literals default to f64; an expected f32 type creates a
+            // typed local so the literal carries its width through MIR to codegen.
+            if let Some(ty) = expected {
+                if ty.is_float() && *ty != Type::F64 {
+                    let tmp = ctx.fresh_local(None);
+                    ctx.locals[tmp.0 as usize].ty = Some(ty.clone());
+                    ctx.push_inst(MirInst::Assign {
+                        local: tmp,
+                        value: Rvalue::ConstFloat(*fl),
+                    });
+                    return Some(MirValue::Local(tmp));
+                }
+            }
+            Some(MirValue::Float(*fl))
         }
         Expr::Lit(glyph_core::ast::Literal::Bool(b), _) => Some(MirValue::Bool(*b)),
         Expr::Lit(glyph_core::ast::Literal::Char(c), _) => {

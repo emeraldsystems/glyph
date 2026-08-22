@@ -45,6 +45,73 @@ impl CodegenContext {
         }
     }
 
+    fn is_float_type_kind(kind: llvm_sys::LLVMTypeKind) -> bool {
+        matches!(
+            kind,
+            llvm_sys::LLVMTypeKind::LLVMFloatTypeKind | llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind
+        )
+    }
+
+    /// Unify operands for a float binary op: int operands are promoted to the
+    /// float side's type (UIToFP for unsigned Glyph types, SIToFP otherwise),
+    /// and f32/f64 mixes are widened to f64.
+    pub(super) fn coerce_float_binop(
+        &mut self,
+        lhs: LLVMValueRef,
+        rhs: LLVMValueRef,
+        lhs_unsigned: bool,
+        rhs_unsigned: bool,
+    ) -> (LLVMValueRef, LLVMValueRef) {
+        unsafe {
+            let name = CString::new("float.coerce").unwrap();
+            let lhs_ty = LLVMTypeOf(lhs);
+            let rhs_ty = LLVMTypeOf(rhs);
+            let lhs_kind = LLVMGetTypeKind(lhs_ty);
+            let rhs_kind = LLVMGetTypeKind(rhs_ty);
+            let lhs_is_float = Self::is_float_type_kind(lhs_kind);
+            let rhs_is_float = Self::is_float_type_kind(rhs_kind);
+
+            let build_int_to_fp = |builder, val, target_ty, unsigned: bool| {
+                if unsigned {
+                    LLVMBuildUIToFP(builder, val, target_ty, name.as_ptr())
+                } else {
+                    LLVMBuildSIToFP(builder, val, target_ty, name.as_ptr())
+                }
+            };
+
+            match (lhs_is_float, rhs_is_float) {
+                (true, false) => {
+                    if rhs_kind != llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind {
+                        return (lhs, rhs);
+                    }
+                    let rhs2 = build_int_to_fp(self.builder, rhs, lhs_ty, rhs_unsigned);
+                    (lhs, rhs2)
+                }
+                (false, true) => {
+                    if lhs_kind != llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind {
+                        return (lhs, rhs);
+                    }
+                    let lhs2 = build_int_to_fp(self.builder, lhs, rhs_ty, lhs_unsigned);
+                    (lhs2, rhs)
+                }
+                (true, true) => {
+                    if lhs_kind == rhs_kind {
+                        return (lhs, rhs);
+                    }
+                    let double_ty = LLVMDoubleTypeInContext(self.context);
+                    if lhs_kind == llvm_sys::LLVMTypeKind::LLVMFloatTypeKind {
+                        let lhs2 = LLVMBuildFPExt(self.builder, lhs, double_ty, name.as_ptr());
+                        (lhs2, rhs)
+                    } else {
+                        let rhs2 = LLVMBuildFPExt(self.builder, rhs, double_ty, name.as_ptr());
+                        (lhs, rhs2)
+                    }
+                }
+                (false, false) => (lhs, rhs),
+            }
+        }
+    }
+
     pub(super) fn coerce_int_value(
         &mut self,
         val: LLVMValueRef,
@@ -81,6 +148,7 @@ impl CodegenContext {
     pub(super) fn rvalue_tag(&self, rvalue: &Rvalue) -> &'static str {
         match rvalue {
             Rvalue::ConstInt(_) => "ConstInt",
+            Rvalue::ConstFloat(_) => "ConstFloat",
             Rvalue::ConstBool(_) => "ConstBool",
             Rvalue::StringLit { .. } => "StringLit",
             Rvalue::Move(_) => "Move",
@@ -137,6 +205,7 @@ impl CodegenContext {
         match value {
             MirValue::Unit => Some(Type::Void),
             MirValue::Int(_) => Some(Type::I32),
+            MirValue::Float(_) => Some(Type::F64),
             MirValue::Bool(_) => Some(Type::Bool),
             MirValue::Local(id) => func
                 .locals
@@ -196,6 +265,21 @@ impl CodegenContext {
                 }
             }
         }
+        // Same for ConstFloat: an f32-typed local gets a float constant, not double
+        if let Rvalue::ConstFloat(fl) = rvalue {
+            if let Some(lid) = target_local {
+                if let Some(local) = func.locals.get(lid.0 as usize) {
+                    if let Some(ty) = local.ty.as_ref() {
+                        if ty.is_float() {
+                            unsafe {
+                                let llvm_ty = self.get_llvm_type(ty)?;
+                                return Ok(LLVMConstReal(llvm_ty, *fl));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.codegen_rvalue(rvalue, func, local_map, functions, mir_module)
     }
 
@@ -212,6 +296,10 @@ impl CodegenContext {
                 Rvalue::ConstInt(i) => {
                     let ty = LLVMInt32TypeInContext(self.context);
                     Ok(LLVMConstInt(ty, *i as u64, 1))
+                }
+                Rvalue::ConstFloat(fl) => {
+                    let ty = LLVMDoubleTypeInContext(self.context);
+                    Ok(LLVMConstReal(ty, *fl))
                 }
                 Rvalue::ConstBool(b) => {
                     let ty = LLVMInt1TypeInContext(self.context);
@@ -287,6 +375,89 @@ impl CodegenContext {
 
                     let lhs_val0 = self.codegen_value(lhs, func, local_map)?;
                     let rhs_val0 = self.codegen_value(rhs, func, local_map)?;
+
+                    // Float operands take the FP instruction path; mixed int/float
+                    // operands promote the int side to the float type.
+                    let is_float_op = Self::is_float_type_kind(LLVMGetTypeKind(LLVMTypeOf(
+                        lhs_val0,
+                    ))) || Self::is_float_type_kind(
+                        LLVMGetTypeKind(LLVMTypeOf(rhs_val0)),
+                    );
+                    if is_float_op {
+                        let is_unsigned = |ty: Option<&Type>| {
+                            matches!(ty, Some(Type::U8 | Type::U32 | Type::U64 | Type::Usize))
+                        };
+                        let (lhs_val, rhs_val) = self.coerce_float_binop(
+                            lhs_val0,
+                            rhs_val0,
+                            is_unsigned(lhs_ty.as_ref()),
+                            is_unsigned(rhs_ty.as_ref()),
+                        );
+                        use llvm_sys::LLVMRealPredicate::*;
+                        let result = match op {
+                            BinaryOp::Add => {
+                                LLVMBuildFAdd(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
+                            BinaryOp::Sub => {
+                                LLVMBuildFSub(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
+                            BinaryOp::Mul => {
+                                LLVMBuildFMul(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
+                            BinaryOp::Div => {
+                                LLVMBuildFDiv(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
+                            BinaryOp::Mod => {
+                                LLVMBuildFRem(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
+                            BinaryOp::Eq => LLVMBuildFCmp(
+                                self.builder,
+                                LLVMRealOEQ,
+                                lhs_val,
+                                rhs_val,
+                                name.as_ptr(),
+                            ),
+                            BinaryOp::Ne => LLVMBuildFCmp(
+                                self.builder,
+                                LLVMRealUNE,
+                                lhs_val,
+                                rhs_val,
+                                name.as_ptr(),
+                            ),
+                            BinaryOp::Lt => LLVMBuildFCmp(
+                                self.builder,
+                                LLVMRealOLT,
+                                lhs_val,
+                                rhs_val,
+                                name.as_ptr(),
+                            ),
+                            BinaryOp::Le => LLVMBuildFCmp(
+                                self.builder,
+                                LLVMRealOLE,
+                                lhs_val,
+                                rhs_val,
+                                name.as_ptr(),
+                            ),
+                            BinaryOp::Gt => LLVMBuildFCmp(
+                                self.builder,
+                                LLVMRealOGT,
+                                lhs_val,
+                                rhs_val,
+                                name.as_ptr(),
+                            ),
+                            BinaryOp::Ge => LLVMBuildFCmp(
+                                self.builder,
+                                LLVMRealOGE,
+                                lhs_val,
+                                rhs_val,
+                                name.as_ptr(),
+                            ),
+                            BinaryOp::And | BinaryOp::Or => {
+                                return Err(anyhow!("logical ops should be lowered in MIR"));
+                            }
+                        };
+                        return Ok(result);
+                    }
 
                     // Integer literals in MIR are currently untyped and codegen as i32.
                     // Coerce integer widths so operations like `usize + 1` work.
@@ -605,6 +776,50 @@ impl CodegenContext {
                             {
                                 let signed = matches!(param_ty, Type::I8 | Type::I32 | Type::I64);
                                 arg_val = self.coerce_int_value(arg_val, expected_ty, signed);
+                            } else if Self::is_float_type_kind(expected_kind)
+                                && Self::is_float_type_kind(arg_kind)
+                                && arg_ty != expected_ty
+                            {
+                                let cast_name = CString::new("arg.fp.cast")?;
+                                arg_val = if matches!(param_ty, Type::F64) {
+                                    LLVMBuildFPExt(
+                                        self.builder,
+                                        arg_val,
+                                        expected_ty,
+                                        cast_name.as_ptr(),
+                                    )
+                                } else {
+                                    LLVMBuildFPTrunc(
+                                        self.builder,
+                                        arg_val,
+                                        expected_ty,
+                                        cast_name.as_ptr(),
+                                    )
+                                };
+                            } else if Self::is_float_type_kind(expected_kind)
+                                && arg_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
+                            {
+                                let arg_glyph_ty = self.mir_value_type(arg, func);
+                                let unsigned = matches!(
+                                    arg_glyph_ty,
+                                    Some(Type::U8 | Type::U32 | Type::U64 | Type::Usize)
+                                );
+                                let cast_name = CString::new("arg.int.to.fp")?;
+                                arg_val = if unsigned {
+                                    LLVMBuildUIToFP(
+                                        self.builder,
+                                        arg_val,
+                                        expected_ty,
+                                        cast_name.as_ptr(),
+                                    )
+                                } else {
+                                    LLVMBuildSIToFP(
+                                        self.builder,
+                                        arg_val,
+                                        expected_ty,
+                                        cast_name.as_ptr(),
+                                    )
+                                };
                             } else if expected_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
                                 && arg_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
                                 && arg_ty != expected_ty
@@ -782,6 +997,10 @@ impl CodegenContext {
                 MirValue::Int(i) => {
                     let ty = LLVMInt32TypeInContext(self.context);
                     Ok(LLVMConstInt(ty, *i as u64, 1))
+                }
+                MirValue::Float(fl) => {
+                    let ty = LLVMDoubleTypeInContext(self.context);
+                    Ok(LLVMConstReal(ty, *fl))
                 }
                 MirValue::Bool(b) => {
                     let ty = LLVMInt1TypeInContext(self.context);

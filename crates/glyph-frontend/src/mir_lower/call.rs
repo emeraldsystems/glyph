@@ -17,24 +17,38 @@ use super::builtins::{
     lower_vec_static_with_capacity,
 };
 use super::context::{LocalState, LowerCtx};
-use super::expr::{lower_array_len, lower_value, lower_value_with_expected};
+use super::expr::{lower_array_len, lower_ref_expr, lower_value, lower_value_with_expected};
 use super::value::infer_value_type;
 
-fn consume_call_local(ctx: &mut LowerCtx<'_>, value: &MirValue, span: Span) {
+fn consume_call_local(
+    ctx: &mut LowerCtx<'_>,
+    value: &MirValue,
+    span: Span,
+    expected: Option<&Type>,
+) -> bool {
     let MirValue::Local(local) = value else {
-        return;
+        return true;
     };
+
     if matches!(
         ctx.local_states.get(local.0 as usize),
         Some(LocalState::Moved)
     ) {
-        return;
+        return true;
     }
-    let _ = ctx.consume_local(*local, Some(span));
-    // consume_local tracks String/Own/Shared but not Named structs or
+
+    if matches!(expected, Some(Type::Ref(_, _))) {
+        return ctx.check_local_available(*local, Some(span));
+    }
+
+    if !ctx.consume_local(*local, Some(span)) {
+        return false;
+    }
+
+    // consume_local tracks String/Own but not Named structs or
     // App types (Vec/Map). At call sites these are passed by value
     // (shallow copy), so the callee will drop its copy. Mark as Moved
-    // to prevent the caller from also dropping → double-free.
+    // to prevent the caller from also dropping and causing a double-free.
     if matches!(
         ctx.local_states.get(local.0 as usize),
         Some(LocalState::Initialized)
@@ -47,6 +61,8 @@ fn consume_call_local(ctx: &mut LowerCtx<'_>, value: &MirValue, span: Span) {
             }
         }
     }
+
+    true
 }
 
 pub(crate) fn lower_call<'a>(
@@ -102,7 +118,9 @@ pub(crate) fn lower_call<'a>(
     for (idx, arg) in args.iter().enumerate() {
         let expected_arg = sig.params.get(idx).and_then(|ty| ty.as_ref());
         let arg_val = lower_value_with_expected(ctx, arg, expected_arg)?;
-        consume_call_local(ctx, &arg_val, span);
+        if !consume_call_local(ctx, &arg_val, span, expected_arg) {
+            return None;
+        }
         lowered_args.push(arg_val);
     }
 
@@ -223,6 +241,27 @@ fn infer_expr_type(ctx: &LowerCtx, expr: &Expr) -> Option<glyph_core::types::Typ
 
         _ => None,
     }
+}
+
+fn lower_borrowed_method_receiver<'a>(
+    ctx: &mut LowerCtx<'a>,
+    receiver: &'a Expr,
+    receiver_ty: &Type,
+    mutability: Mutability,
+    span: Span,
+) -> Option<MirValue> {
+    if matches!(receiver_ty, Type::Ref(_, _)) {
+        return lower_value(ctx, receiver);
+    }
+
+    let rv = lower_ref_expr(ctx, receiver, mutability, span)?;
+    let tmp = ctx.fresh_local(None);
+    ctx.locals[tmp.0 as usize].ty = Some(Type::Ref(Box::new(receiver_ty.clone()), mutability));
+    ctx.push_inst(MirInst::Assign {
+        local: tmp,
+        value: rv,
+    });
+    Some(MirValue::Local(tmp))
 }
 
 pub(crate) fn lower_method_call<'a>(
@@ -391,101 +430,48 @@ pub(crate) fn lower_method_call<'a>(
         return None;
     };
 
-    // 4. Lower receiver value
-    let receiver_val = lower_value(ctx, receiver)?;
-
-    // 5. Auto-borrow if method expects reference
+    // 4. Lower receiver value. Borrowed receivers must not flow through
+    // lower_value first, because identifiers there use move semantics.
     let receiver_arg = match self_kind {
-        SelfKind::ByValue => {
-            // Pass receiver by value (move semantics)
-            receiver_val
-        }
-        SelfKind::Ref => {
-            // Auto-borrow as immutable reference
-            match receiver_val {
-                // Already a reference - use as-is
-                MirValue::Local(local)
-                    if matches!(
-                        ctx.locals.get(local.0 as usize).and_then(|l| l.ty.as_ref()),
-                        Some(glyph_core::types::Type::Ref(_, _))
-                    ) =>
-                {
-                    receiver_val
-                }
-                MirValue::Local(local) => {
-                    // Create immutable reference
-                    let ref_tmp = ctx.fresh_local(None);
-                    ctx.locals[ref_tmp.0 as usize].ty = Some(glyph_core::types::Type::Ref(
-                        Box::new(glyph_core::types::Type::Named(struct_name.clone())),
-                        Mutability::Immutable,
-                    ));
-                    ctx.push_inst(MirInst::Assign {
-                        local: ref_tmp,
-                        value: Rvalue::Ref {
-                            base: local,
-                            mutability: Mutability::Immutable,
-                        },
-                    });
-                    MirValue::Local(ref_tmp)
-                }
-                _ => {
-                    ctx.error("cannot borrow non-local value", Some(span));
-                    return None;
-                }
-            }
-        }
+        SelfKind::ByValue => lower_value(ctx, receiver)?,
+        SelfKind::Ref => lower_borrowed_method_receiver(
+            ctx,
+            receiver,
+            &receiver_ty,
+            Mutability::Immutable,
+            span,
+        )?,
         SelfKind::MutRef => {
-            // Auto-borrow as mutable reference
-            match receiver_val {
-                // Already a mut reference - use as-is
-                MirValue::Local(local)
-                    if matches!(
-                        ctx.locals.get(local.0 as usize).and_then(|l| l.ty.as_ref()),
-                        Some(glyph_core::types::Type::Ref(_, Mutability::Mutable))
-                    ) =>
-                {
-                    receiver_val
-                }
-                MirValue::Local(local) => {
-                    // Create mutable reference
-                    let ref_tmp = ctx.fresh_local(None);
-                    ctx.locals[ref_tmp.0 as usize].ty = Some(glyph_core::types::Type::Ref(
-                        Box::new(glyph_core::types::Type::Named(struct_name)),
-                        Mutability::Mutable,
-                    ));
-                    ctx.push_inst(MirInst::Assign {
-                        local: ref_tmp,
-                        value: Rvalue::Ref {
-                            base: local,
-                            mutability: Mutability::Mutable,
-                        },
-                    });
-                    MirValue::Local(ref_tmp)
-                }
-                _ => {
-                    ctx.error("cannot borrow non-local value", Some(span));
-                    return None;
-                }
-            }
+            lower_borrowed_method_receiver(ctx, receiver, &receiver_ty, Mutability::Mutable, span)?
         }
     };
 
-    // 6. Lower remaining arguments
-    consume_call_local(ctx, &receiver_arg, span);
+    // 5. Lower remaining arguments
+    let sig = ctx.fn_sigs.get(&mangled_name).cloned();
+    let receiver_expected = sig
+        .as_ref()
+        .and_then(|sig| sig.params.first())
+        .and_then(|ty| ty.as_ref())
+        .cloned();
+    if !consume_call_local(ctx, &receiver_arg, span, receiver_expected.as_ref()) {
+        return None;
+    }
     let mut all_args = vec![receiver_arg];
-    let sig = ctx.fn_sigs.get(&mangled_name);
     for (idx, arg) in args.iter().enumerate() {
         let expected_arg = sig
+            .as_ref()
             .and_then(|sig| sig.params.get(idx + 1))
             .and_then(|ty| ty.as_ref());
         let arg_val = lower_value_with_expected(ctx, arg, expected_arg)?;
-        consume_call_local(ctx, &arg_val, span);
+        if !consume_call_local(ctx, &arg_val, span, expected_arg) {
+            return None;
+        }
         all_args.push(arg_val);
     }
 
     // 7. Create call with mangled name (reusing call infrastructure)
     let tmp = ctx.fresh_local(None);
-    if let Some(sig) = sig {
+    if let Some(sig) = &sig {
         if let Some(ret) = &sig.ret {
             ctx.locals[tmp.0 as usize].ty = Some(ret.clone());
         } else {

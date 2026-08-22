@@ -170,3 +170,92 @@ fn early_return_match_arm_runtime() {
 
     assert_eq!(build_and_run_exit_code(source), 0);
 }
+
+#[cfg(all(feature = "codegen", unix))]
+#[test]
+fn try_option_some_and_none_runtime() {
+    let source = r#"
+        from std/enums import Option
+
+        fn some_value() -> Option<i32> {
+          ret Some(41)
+        }
+
+        fn none_value() -> Option<i32> {
+          ret None()
+        }
+
+        fn use_some() -> Option<i32> {
+          let value = some_value()?
+          ret Some(value + 1)
+        }
+
+        fn use_none() -> Option<i32> {
+          let value = none_value()?
+          ret Some(value + 1)
+        }
+
+        fn main() -> i32 {
+          let a = use_some()
+          let first = match a {
+            Some(v) => if v == 42 { 0 } else { 1 },
+            None => 2,
+          }
+          if first != 0 { ret first }
+
+          let b = use_none()
+          ret match b {
+            Some(_v) => 3,
+            None => 0,
+          }
+        }
+    "#;
+
+    assert_eq!(build_and_run_exit_code(source), 0);
+}
+
+#[cfg(all(feature = "codegen", unix))]
+#[test]
+fn try_result_ok_and_err_runtime() {
+    let source = r#"
+        from std/enums import Result
+
+        fn ok_value() -> Result<i32, String> {
+          ret Ok(40)
+        }
+
+        fn err_value() -> Result<i32, String> {
+          ret Err(String::from_str("bad"))
+        }
+
+        fn use_ok() -> Result<i32, String> {
+          let value = ok_value()?
+          ret Ok(value + 2)
+        }
+
+        fn use_err() -> Result<i32, String> {
+          let value = err_value()?
+          ret Ok(value + 2)
+        }
+
+        fn main() -> i32 {
+          let ok_result = use_ok()
+          let ok_code = match ok_result {
+            Ok(v) => if v == 42 { 0 } else { 1 },
+            Err(_e) => 2,
+          }
+          if ok_code != 0 { ret ok_code }
+
+          let err_result = use_err()
+          ret match err_result {
+            Ok(_v) => 3,
+            Err(e) => {
+              let msg: str = e
+              if msg.len() == 3 { 0 } else { 4 }
+            },
+          }
+        }
+    "#;
+
+    assert_eq!(build_and_run_exit_code(source), 0);
+}

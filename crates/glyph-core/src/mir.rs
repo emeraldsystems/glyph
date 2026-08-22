@@ -91,6 +91,7 @@ pub enum MirInst {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Rvalue {
     ConstInt(i64),
+    ConstFloat(f64),
     ConstBool(bool),
     Move(LocalId),
     StringLit {
@@ -308,6 +309,7 @@ pub struct LocalId(pub u32);
 pub enum MirValue {
     Unit,
     Int(i64),
+    Float(f64),
     Bool(bool),
     Local(LocalId),
 }

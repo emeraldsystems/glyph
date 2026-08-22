@@ -1,0 +1,11 @@
+fn scale(x: f64, k: f64) -> f64 {
+  ret x * k
+}
+
+fn main() -> i32 {
+  let a: f64 = 1.5;
+  let b: f32 = 0.25;
+  let c: f64 = scale(a, 2.0);
+  if c > 2.9 { ret 1 }
+  ret 0
+}

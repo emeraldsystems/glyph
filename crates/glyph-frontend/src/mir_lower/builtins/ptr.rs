@@ -103,9 +103,20 @@ pub(crate) fn lower_shared_clone<'a>(
     base: &'a Expr,
     span: Span,
 ) -> Option<Rvalue> {
-    let base_val = lower_value(ctx, base)?;
-    let base_local = match base_val {
-        MirValue::Local(id) => id,
+    let base_local = match base {
+        Expr::Ident(name, ident_span) => {
+            let Some(local) = ctx.bindings.get(name.0.as_str()).copied() else {
+                ctx.error(
+                    format!("unknown identifier '{}'", name.0),
+                    Some(*ident_span),
+                );
+                return None;
+            };
+            if !ctx.check_local_available(local, Some(*ident_span)) {
+                return None;
+            }
+            local
+        }
         _ => {
             ctx.error(".clone() requires a local variable", Some(span));
             return None;

@@ -9,6 +9,7 @@ use super::types::struct_name_from_type;
 pub(crate) fn rvalue_from_value(val: MirValue) -> Option<Rvalue> {
     match val {
         MirValue::Int(i) => Some(Rvalue::ConstInt(i)),
+        MirValue::Float(f) => Some(Rvalue::ConstFloat(f)),
         MirValue::Bool(b) => Some(Rvalue::ConstBool(b)),
         MirValue::Local(id) => Some(Rvalue::Move(id)),
         MirValue::Unit => Some(Rvalue::ConstInt(0)),
@@ -18,6 +19,7 @@ pub(crate) fn rvalue_from_value(val: MirValue) -> Option<Rvalue> {
 pub(crate) fn rvalue_to_value(rv: Rvalue) -> Option<MirValue> {
     match rv {
         Rvalue::ConstInt(v) => Some(MirValue::Int(v)),
+        Rvalue::ConstFloat(v) => Some(MirValue::Float(v)),
         Rvalue::ConstBool(v) => Some(MirValue::Bool(v)),
         Rvalue::Move(local) => Some(MirValue::Local(local)),
         _ => None,
@@ -44,6 +46,7 @@ pub(crate) fn coerce_to_bool(value: MirValue) -> MirValue {
 pub(crate) fn infer_value_type(value: &MirValue, ctx: &LowerCtx) -> Option<Type> {
     match value {
         MirValue::Int(_) => Some(Type::I32),
+        MirValue::Float(_) => Some(Type::F64),
         MirValue::Bool(_) => Some(Type::Bool),
         MirValue::Unit => Some(Type::Void),
         MirValue::Local(local_id) => ctx
@@ -58,14 +61,22 @@ pub(crate) fn infer_numeric_result_type(
     rhs: &MirValue,
     ctx: &LowerCtx,
 ) -> Option<Type> {
-    fn type_for_value(v: &MirValue, ctx: &LowerCtx) -> (Option<Type>, bool) {
+    #[derive(PartialEq)]
+    enum Lit {
+        No,
+        Int,
+        Float,
+    }
+
+    fn type_for_value(v: &MirValue, ctx: &LowerCtx) -> (Option<Type>, Lit) {
         match v {
             MirValue::Local(id) => (
                 ctx.locals.get(id.0 as usize).and_then(|l| l.ty.clone()),
-                false,
+                Lit::No,
             ),
-            MirValue::Int(_) => (None, true), // untyped literal: defer to the other operand
-            MirValue::Bool(_) | MirValue::Unit => (None, false),
+            MirValue::Int(_) => (None, Lit::Int), // untyped literal: defer to the other operand
+            MirValue::Float(_) => (None, Lit::Float), // bare float literal defaults to f64
+            MirValue::Bool(_) | MirValue::Unit => (None, Lit::No),
         }
     }
 
@@ -78,8 +89,22 @@ pub(crate) fn infer_numeric_result_type(
         }
     }
 
-    let (lt, lhs_is_int_lit) = type_for_value(lhs, ctx);
-    let (rt, rhs_is_int_lit) = type_for_value(rhs, ctx);
+    let (lt, lhs_lit) = type_for_value(lhs, ctx);
+    let (rt, rhs_lit) = type_for_value(rhs, ctx);
+
+    // Float operands dominate: mixed int/float arithmetic promotes to the float
+    // side, and f64 wins over f32. A bare float literal counts as f64.
+    let has_f64 = matches!(lt, Some(Type::F64))
+        || matches!(rt, Some(Type::F64))
+        || lhs_lit == Lit::Float
+        || rhs_lit == Lit::Float;
+    let has_f32 = matches!(lt, Some(Type::F32)) || matches!(rt, Some(Type::F32));
+    if has_f64 {
+        return Some(Type::F64);
+    }
+    if has_f32 {
+        return Some(Type::F32);
+    }
 
     match (lt.as_ref(), rt.as_ref()) {
         (Some(l), Some(r)) => {
@@ -95,7 +120,7 @@ pub(crate) fn infer_numeric_result_type(
         (None, Some(r)) => Some(r.clone()),
         _ => {
             // Both are untyped int literals - default to i32
-            if lhs_is_int_lit || rhs_is_int_lit {
+            if lhs_lit == Lit::Int || rhs_lit == Lit::Int {
                 Some(Type::I32)
             } else {
                 None
@@ -147,6 +172,7 @@ pub(crate) fn update_local_type_from_rvalue(ctx: &mut LowerCtx, local: LocalId, 
 
 pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
     match rv {
+        Rvalue::ConstFloat(_) => Some(Type::F64),
         Rvalue::StructLit { struct_name, .. } => Some(Type::Named(struct_name.clone())),
         Rvalue::Move(local) => ctx
             .locals

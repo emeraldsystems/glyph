@@ -95,7 +95,7 @@ impl<'a> LowerCtx<'a> {
                     // Only propagate for types where consume_local doesn't
                     // track moves (Named/App types). For String/Own/Shared,
                     // the Moved state came from consume_local (normal
-                    // ownership transfer) — not a non-owning marker.
+                    // ownership transfer), not a non-owning marker.
                     let src_was_moved = matches!(
                         self.local_states.get(src.0 as usize),
                         Some(LocalState::Moved)
@@ -465,6 +465,34 @@ impl<'a> LowerCtx<'a> {
             .unwrap_or(false)
     }
 
+    pub(crate) fn check_local_available(&mut self, local: LocalId, span: Option<Span>) -> bool {
+        let skip_drop = self
+            .locals
+            .get(local.0 as usize)
+            .map_or(false, |l| l.skip_drop);
+        let tracked = self
+            .local_ty(local)
+            .map(Self::type_has_drop_glue)
+            .unwrap_or(false)
+            || self.local_is_guard(local);
+
+        if !tracked || skip_drop {
+            return true;
+        }
+
+        match self.local_states.get(local.0 as usize) {
+            Some(LocalState::Moved) => {
+                self.emit_use_of_moved_local(local, span);
+                false
+            }
+            Some(LocalState::Uninitialized) => {
+                self.emit_use_of_uninitialized_local(local, span);
+                false
+            }
+            _ => true,
+        }
+    }
+
     /// Mark a MirValue's source local as Moved if it has drop glue.
     fn mark_moved_if_droppable(&mut self, val: &MirValue) {
         if let MirValue::Local(src) = val {
@@ -473,6 +501,12 @@ impl<'a> LowerCtx<'a> {
                     *state = LocalState::Moved;
                 }
             }
+        }
+    }
+
+    fn mark_skip_drop(&mut self, local: LocalId) {
+        if let Some(dest) = self.locals.get_mut(local.0 as usize) {
+            dest.skip_drop = true;
         }
     }
 
@@ -494,12 +528,16 @@ impl<'a> LowerCtx<'a> {
                     self.mark_moved_if_droppable(val);
                 }
             }
-            // NOTE: Function calls are NOT tracked here because without
-            // a borrow checker, we can't distinguish consuming calls from
-            // borrowing calls. Structs passed by value to functions create
-            // shallow copies; both caller and callee may hold aliased
-            // pointers. This is a known limitation (B5) that needs either
-            // deep-copy at call sites or parameter drop suppression.
+            // Enum construction takes ownership of its payload, matching
+            // struct literals and collection insertion.
+            Rvalue::EnumConstruct {
+                payload: Some(val), ..
+            } => {
+                self.mark_moved_if_droppable(val);
+            }
+            // Function call ownership depends on the callee parameter type,
+            // so call lowering handles by-value consumption and by-reference
+            // non-consumption explicitly.
             // Map mutations take ownership of keys/values.
             Rvalue::MapAdd {
                 key, value: val, ..
@@ -512,11 +550,15 @@ impl<'a> LowerCtx<'a> {
             }
             // VecIndex returns a shallow copy of the element. For types
             // with drop glue, the copy aliases the Vec's element data.
-            // Mark as Moved so the copy is not independently dropped.
+            // Mark it non-owning so the copy is not independently dropped.
             Rvalue::VecIndex { elem_type, .. } if Self::type_has_drop_glue(elem_type) => {
-                if let Some(state) = self.local_states.get_mut(dest.0 as usize) {
-                    *state = LocalState::Moved;
-                }
+                self.mark_skip_drop(dest);
+            }
+            // MapGet returns a shallow snapshot of the stored value. For
+            // droppable payloads the map remains the owner, so the returned
+            // Option must not run drop glue on its payload copy.
+            Rvalue::MapGet { value_type, .. } if Self::type_has_drop_glue(value_type) => {
+                self.mark_skip_drop(dest);
             }
             // FieldAccess returns a shallow copy of the field value.
             // For droppable types, the copy aliases the struct's field.
@@ -526,20 +568,27 @@ impl<'a> LowerCtx<'a> {
                     .map(|ty| Self::type_has_drop_glue(ty))
                     .unwrap_or(false)
                 {
-                    if let Some(state) = self.local_states.get_mut(dest.0 as usize) {
-                        *state = LocalState::Moved;
-                    }
+                    self.mark_skip_drop(dest);
                 }
+            }
+            // EnumPayload is also a shallow snapshot. Preserve alias semantics
+            // by suppressing drop glue on the extracted payload local.
+            Rvalue::EnumPayload { base, .. }
+                if self
+                    .locals
+                    .get(base.0 as usize)
+                    .map(|l| l.skip_drop)
+                    .unwrap_or(false) =>
+            {
+                self.mark_skip_drop(dest);
             }
             _ => {}
         }
     }
 
     pub(crate) fn consume_local(&mut self, local: LocalId, span: Option<Span>) -> bool {
-        // Shared pointers are copyable - they don't move
-        let ty = self.local_ty(local);
-        if matches!(ty, Some(Type::Shared(_))) {
-            return true; // Always allow reuse
+        if !self.check_local_available(local, span) {
+            return false;
         }
 
         if !self.local_uses_ownership_tracking(local) {

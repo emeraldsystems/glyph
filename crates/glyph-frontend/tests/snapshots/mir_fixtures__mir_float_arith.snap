@@ -1,0 +1,260 @@
+---
+source: crates/glyph-frontend/tests/mir_fixtures.rs
+expression: out.mir
+---
+MirModule {
+    struct_types: {},
+    functions: [
+        MirFunction {
+            name: "scale",
+            ret_type: Some(
+                F64,
+            ),
+            params: [
+                LocalId(
+                    0,
+                ),
+                LocalId(
+                    1,
+                ),
+            ],
+            locals: [
+                Local {
+                    name: Some(
+                        "x",
+                    ),
+                    ty: Some(
+                        F64,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+                Local {
+                    name: Some(
+                        "k",
+                    ),
+                    ty: Some(
+                        F64,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+                Local {
+                    name: None,
+                    ty: Some(
+                        F64,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+            ],
+            blocks: [
+                MirBlock {
+                    insts: [
+                        Assign {
+                            local: LocalId(
+                                2,
+                            ),
+                            value: Binary {
+                                op: Mul,
+                                lhs: Local(
+                                    LocalId(
+                                        0,
+                                    ),
+                                ),
+                                rhs: Local(
+                                    LocalId(
+                                        1,
+                                    ),
+                                ),
+                            },
+                        },
+                        Return(
+                            Some(
+                                Local(
+                                    LocalId(
+                                        2,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ],
+                },
+            ],
+        },
+        MirFunction {
+            name: "main",
+            ret_type: Some(
+                I32,
+            ),
+            params: [],
+            locals: [
+                Local {
+                    name: Some(
+                        "a",
+                    ),
+                    ty: Some(
+                        F64,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+                Local {
+                    name: Some(
+                        "b",
+                    ),
+                    ty: Some(
+                        F32,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+                Local {
+                    name: None,
+                    ty: Some(
+                        F32,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+                Local {
+                    name: Some(
+                        "c",
+                    ),
+                    ty: Some(
+                        F64,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+                Local {
+                    name: None,
+                    ty: Some(
+                        F64,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+                Local {
+                    name: None,
+                    ty: Some(
+                        Bool,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+            ],
+            blocks: [
+                MirBlock {
+                    insts: [
+                        Assign {
+                            local: LocalId(
+                                0,
+                            ),
+                            value: ConstFloat(
+                                1.5,
+                            ),
+                        },
+                        Assign {
+                            local: LocalId(
+                                2,
+                            ),
+                            value: ConstFloat(
+                                0.25,
+                            ),
+                        },
+                        Assign {
+                            local: LocalId(
+                                1,
+                            ),
+                            value: Move(
+                                LocalId(
+                                    2,
+                                ),
+                            ),
+                        },
+                        Assign {
+                            local: LocalId(
+                                4,
+                            ),
+                            value: Call {
+                                name: "scale",
+                                args: [
+                                    Local(
+                                        LocalId(
+                                            0,
+                                        ),
+                                    ),
+                                    Float(
+                                        2.0,
+                                    ),
+                                ],
+                            },
+                        },
+                        Assign {
+                            local: LocalId(
+                                3,
+                            ),
+                            value: Move(
+                                LocalId(
+                                    4,
+                                ),
+                            ),
+                        },
+                        Assign {
+                            local: LocalId(
+                                5,
+                            ),
+                            value: Binary {
+                                op: Gt,
+                                lhs: Local(
+                                    LocalId(
+                                        3,
+                                    ),
+                                ),
+                                rhs: Float(
+                                    2.9,
+                                ),
+                            },
+                        },
+                        If {
+                            cond: Local(
+                                LocalId(
+                                    5,
+                                ),
+                            ),
+                            then_bb: BlockId(
+                                1,
+                            ),
+                            else_bb: BlockId(
+                                2,
+                            ),
+                        },
+                    ],
+                },
+                MirBlock {
+                    insts: [
+                        Return(
+                            Some(
+                                Int(
+                                    1,
+                                ),
+                            ),
+                        ),
+                    ],
+                },
+                MirBlock {
+                    insts: [
+                        Return(
+                            Some(
+                                Int(
+                                    0,
+                                ),
+                            ),
+                        ),
+                    ],
+                },
+            ],
+        },
+    ],
+}

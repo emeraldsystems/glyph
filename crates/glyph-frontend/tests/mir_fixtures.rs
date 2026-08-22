@@ -622,3 +622,17 @@ fn mir_modulo_ret() {
     );
     assert_debug_snapshot!(out.mir);
 }
+
+#[test]
+fn mir_float_arith() {
+    let src = run_fixture("float_arith.glyph");
+    let out = compile_source(
+        &src,
+        FrontendOptions {
+            emit_mir: true,
+            include_std: false,
+        },
+    );
+    assert!(out.diagnostics.is_empty(), "diagnostics: {:?}", out.diagnostics);
+    assert_debug_snapshot!(out.mir);
+}

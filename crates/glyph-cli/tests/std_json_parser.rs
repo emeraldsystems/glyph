@@ -147,6 +147,55 @@ fn map_string_basic() {
 
 #[cfg(all(feature = "codegen", unix))]
 #[test]
+fn std_json_map_get_nested_value_by_value_no_abort() {
+    let source = r#"
+        from std/json import JsonValue
+        from std/enums import Option
+        from std/map import Map
+
+        fn inspect_meta(value: JsonValue) -> i32 {
+          ret match value {
+            Object(meta) => {
+              let flag = meta.get(String::from_str("flag"))
+              match flag {
+                Some(flag_value) => match flag_value {
+                  Bool(b) => if b { 0 } else { 1 },
+                  _ => 2,
+                },
+                None => 3,
+              }
+            }
+            _ => 4,
+          }
+        }
+
+        fn main() -> i32 {
+          let mut i: i32 = 0
+          while i < 100 {
+            let mut inner: Map<String, JsonValue> = Map::new()
+            let _ = inner.add(String::from_str("flag"), JsonValue::Bool(true))
+
+            let mut outer: Map<String, JsonValue> = Map::new()
+            let _ = outer.add(String::from_str("meta"), JsonValue::Object(inner))
+
+            let got = outer.get(String::from_str("meta"))
+            let code = match got {
+              Some(value) => inspect_meta(value),
+              None => 5,
+            }
+            if code != 0 { ret code }
+
+            i = i + 1
+          }
+          ret 0
+        }
+    "#;
+
+    assert_eq!(build_and_run_exit_code(source), 0);
+}
+
+#[cfg(all(feature = "codegen", unix))]
+#[test]
 fn std_json_parser_nested_and_trailing() {
     let source = r#"
         from std/enums import Option
@@ -1221,4 +1270,3 @@ fn std_json_parser_stringify_roundtrip() {
 
     assert_eq!(build_and_run_exit_code(source), 0);
 }
-

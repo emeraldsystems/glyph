@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use glyph_core::ast::{Item, Module, TypeExpr};
 use glyph_core::diag::Diagnostic;
 use glyph_core::span::Span;
-use glyph_core::types::{Mutability, Type};
+use glyph_core::types::Type;
 
 use crate::resolver::ResolverContext;
 
@@ -384,25 +384,10 @@ pub(crate) fn collect_function_signatures(
                 Some("C".into()),
             );
 
-            let stdout_ref = Type::Ref(Box::new(Type::Named("Stdout".into())), Mutability::Mutable);
-            let fmt_builtins = [
-                ("std::fmt::fmt_i32", Type::I32),
-                ("std::fmt::fmt_u32", Type::U32),
-                ("std::fmt::fmt_i64", Type::I64),
-                ("std::fmt::fmt_u64", Type::U64),
-                ("std::fmt::fmt_bool", Type::Bool),
-                ("std::fmt::fmt_str", Type::Str),
-                ("std::fmt::fmt_char", Type::Char),
-            ];
-
-            for (key, ty) in fmt_builtins {
-                insert_builtin(
-                    key,
-                    vec![Some(ty.clone()), Some(stdout_ref.clone())],
-                    None,
-                    None,
-                );
-            }
+            // Scalar/string print segments lower to direct calls into the C
+            // formatting runtime (glyph_fmt_write_*); those externs are
+            // declared in lower_module, not here. Only struct formatting still
+            // resolves through std::fmt::fmt_<type> signatures.
         }
     }
 

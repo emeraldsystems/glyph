@@ -1599,7 +1599,10 @@ fn has_drop_followed_by_goto(func: &glyph_core::mir::MirFunction, local: LocalId
     })
 }
 
-fn count_drop_in_goto_terminated_blocks(func: &glyph_core::mir::MirFunction, local: LocalId) -> usize {
+fn count_drop_in_goto_terminated_blocks(
+    func: &glyph_core::mir::MirFunction,
+    local: LocalId,
+) -> usize {
     func.blocks
         .iter()
         .filter(|block| {
@@ -1624,6 +1627,253 @@ fn max_drop_count_per_block(func: &glyph_core::mir::MirFunction, local: LocalId)
         })
         .max()
         .unwrap_or(0)
+}
+
+fn function_by_name<'a>(
+    out: &'a crate::FrontendOutput,
+    name: &str,
+) -> &'a glyph_core::mir::MirFunction {
+    out.mir
+        .functions
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| panic!("missing MIR function '{}'", name))
+}
+
+fn has_tag_compare_against(func: &glyph_core::mir::MirFunction, variant_index: i64) -> bool {
+    func.blocks.iter().any(|block| {
+        block.insts.iter().any(|inst| {
+            matches!(
+                inst,
+                MirInst::Assign {
+                    value:
+                        Rvalue::Binary {
+                            op: BinaryOp::Eq,
+                            rhs: MirValue::Int(idx),
+                            ..
+                        },
+                    ..
+                } if *idx == variant_index
+            )
+        })
+    })
+}
+
+fn has_enum_construct(
+    func: &glyph_core::mir::MirFunction,
+    enum_name: &str,
+    variant_index: u32,
+    payload_present: bool,
+) -> bool {
+    let monomorphized_prefix = format!("{}$", enum_name);
+    func.blocks.iter().any(|block| {
+        block.insts.iter().any(|inst| {
+            matches!(
+                inst,
+                MirInst::Assign {
+                    value:
+                        Rvalue::EnumConstruct {
+                            enum_name: actual_enum,
+                            variant_index: actual_index,
+                            payload,
+                        },
+                    ..
+                } if (actual_enum == enum_name || actual_enum.starts_with(&monomorphized_prefix))
+                    && *actual_index == variant_index
+                    && payload.is_some() == payload_present
+            )
+        })
+    })
+}
+
+#[test]
+fn try_option_uses_std_variant_indices() {
+    let src = r#"
+        import std
+
+        fn maybe_some() -> Option<i32> {
+          ret Some(7)
+        }
+
+        fn unwrap_some() -> Option<i32> {
+          let value = maybe_some()?
+          ret Some(value)
+        }
+    "#;
+
+    let out = compile_with_std(src);
+    assert!(
+        out.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        out.diagnostics
+    );
+
+    let func = function_by_name(&out, "unwrap_some");
+    assert!(
+        has_tag_compare_against(func, 1),
+        "Option ? should branch on the Some variant index"
+    );
+    assert!(
+        has_enum_construct(func, "Option", 0, false),
+        "Option ? should synthesize None using the std Option variant index"
+    );
+}
+
+#[test]
+fn try_result_keeps_std_variant_indices() {
+    let src = r#"
+        import std
+
+        fn make_ok() -> Result<i32, i32> {
+          ret Ok(7)
+        }
+
+        fn unwrap_ok() -> Result<i32, i32> {
+          let value = make_ok()?
+          ret Ok(value)
+        }
+    "#;
+
+    let out = compile_with_std(src);
+    assert!(
+        out.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        out.diagnostics
+    );
+
+    let func = function_by_name(&out, "unwrap_ok");
+    assert!(
+        has_tag_compare_against(func, 0),
+        "Result ? should branch on the Ok variant index"
+    );
+    assert!(
+        has_enum_construct(func, "Result", 1, true),
+        "Result ? should synthesize Err using the std Result variant index"
+    );
+}
+
+#[test]
+fn by_value_struct_call_consumes_argument() {
+    let src = r#"
+        struct TwoStrings { a: String, b: String }
+
+        fn consume(_ts: TwoStrings) -> i32 {
+          ret 0
+        }
+
+        fn main() -> i32 {
+          let ts = TwoStrings { a: String::from_str("hello"), b: String::from_str("world") }
+          let _first = consume(ts)
+          let _second = consume(ts)
+          ret 0
+        }
+    "#;
+
+    let out = compile_with_std(src);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.message.contains("use of moved value `ts`")),
+        "expected moved-value diagnostic for consumed struct arg, got: {:?}",
+        out.diagnostics
+    );
+}
+
+#[test]
+fn by_value_vec_call_consumes_argument() {
+    let src = r#"
+        fn consume_vec(v: Vec<String>) -> i32 {
+          ret v.len()
+        }
+
+        fn main() -> i32 {
+          let mut v: Vec<String> = Vec::new()
+          v.push(String::from_str("hello"))
+          let _first = consume_vec(v)
+          let _second = consume_vec(v)
+          ret 0
+        }
+    "#;
+
+    let out = compile_with_std(src);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.message.contains("use of moved value `v`")),
+        "expected moved-value diagnostic for consumed Vec arg, got: {:?}",
+        out.diagnostics
+    );
+}
+
+#[test]
+fn by_value_shared_call_consumes_handle_clone_shares() {
+    let moved_src = r#"
+        fn consume_shared(_s: Shared<i32>) -> i32 {
+          ret 0
+        }
+
+        fn main() -> i32 {
+          let s = Shared::new(7)
+          let _first = consume_shared(s)
+          let _second = consume_shared(s)
+          ret 0
+        }
+    "#;
+
+    let moved = compile_with_std(moved_src);
+    assert!(
+        moved
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("use of moved value `s`")),
+        "expected moved-value diagnostic for consumed Shared handle, got: {:?}",
+        moved.diagnostics
+    );
+
+    let clone_src = r#"
+        fn consume_shared(_s: Shared<i32>) -> i32 {
+          ret 0
+        }
+
+        fn main() -> i32 {
+          let s = Shared::new(7)
+          let s2 = s.clone()
+          let _first = consume_shared(s)
+          let _second = consume_shared(s2)
+          ret 0
+        }
+    "#;
+
+    let cloned = compile_with_std(clone_src);
+    assert!(
+        cloned.diagnostics.is_empty(),
+        "unexpected diagnostics for cloned Shared handles: {:?}",
+        cloned.diagnostics
+    );
+}
+
+#[test]
+fn by_ref_call_does_not_consume_argument() {
+    let src = r#"
+        fn borrow_string(_s: &String) -> i32 {
+          ret 0
+        }
+
+        fn main() -> i32 {
+          let s = String::from_str("hello")
+          let _borrowed = borrow_string(&s)
+          let owned = s
+          let view: str = owned
+          ret view.len()
+        }
+    "#;
+
+    let out = compile_with_std(src);
+    assert!(
+        out.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        out.diagnostics
+    );
 }
 
 #[test]
