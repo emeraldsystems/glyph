@@ -38,6 +38,57 @@ impl CodegenContext {
                     .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
                 self.codegen_drop_string_slot(*slot)
             }
+            ty if ty.is_arc() => {
+                let slot = local_map
+                    .get(&local)
+                    .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
+                self.codegen_drop_arc_slot(
+                    *slot,
+                    ty.arc_inner_type().expect("is_arc validated one argument"),
+                )
+            }
+            ty if ty.is_mutex() => {
+                let slot = local_map
+                    .get(&local)
+                    .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
+                self.codegen_drop_mutex_slot(
+                    *slot,
+                    ty.mutex_inner_type()
+                        .expect("is_mutex validated one argument"),
+                )
+            }
+            ty if ty.is_mutex_guard() => {
+                let slot = local_map
+                    .get(&local)
+                    .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
+                self.codegen_drop_mutex_guard_slot(
+                    *slot,
+                    ty.mutex_guard_inner_type()
+                        .expect("is_mutex_guard validated one argument"),
+                )
+            }
+            ty if ty.is_spsc_sender() => {
+                let slot = local_map
+                    .get(&local)
+                    .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
+                self.codegen_drop_spsc_endpoint_slot(
+                    *slot,
+                    ty.spsc_sender_inner_type()
+                        .expect("SPSC sender validated one argument"),
+                    true,
+                )
+            }
+            ty if ty.is_spsc_receiver() => {
+                let slot = local_map
+                    .get(&local)
+                    .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
+                self.codegen_drop_spsc_endpoint_slot(
+                    *slot,
+                    ty.spsc_receiver_inner_type()
+                        .expect("SPSC receiver validated one argument"),
+                    false,
+                )
+            }
             Type::App { base, args } if base == "Vec" => {
                 let elem = args.get(0).cloned().unwrap_or(Type::I32);
                 self.codegen_drop_vec(local, &elem, func, local_map)
@@ -46,6 +97,12 @@ impl CodegenContext {
                 let key_ty = args.get(0).cloned().unwrap_or(Type::I32);
                 let val_ty = args.get(1).cloned().unwrap_or(Type::I32);
                 self.codegen_drop_map(local, &key_ty, &val_ty, func, local_map)
+            }
+            ty if glyph_core::thread::is_canonical_thread_handle(ty) => {
+                let slot = local_map
+                    .get(&local)
+                    .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
+                self.codegen_drop_thread_handle_slot(*slot)
             }
             Type::Named(name) => {
                 let slot = local_map
@@ -611,6 +668,32 @@ impl CodegenContext {
             Type::Named(name) => self.codegen_drop_named_slot(slot, name),
             Type::Enum(name) => self.codegen_drop_enum_slot(slot, name),
             Type::Function { .. } => self.codegen_drop_callable_slot(slot, elem_type),
+            ty if ty.is_arc() => self.codegen_drop_arc_slot(
+                slot,
+                ty.arc_inner_type().expect("is_arc validated one argument"),
+            ),
+            ty if ty.is_mutex() => self.codegen_drop_mutex_slot(
+                slot,
+                ty.mutex_inner_type()
+                    .expect("is_mutex validated one argument"),
+            ),
+            ty if ty.is_mutex_guard() => self.codegen_drop_mutex_guard_slot(
+                slot,
+                ty.mutex_guard_inner_type()
+                    .expect("is_mutex_guard validated one argument"),
+            ),
+            ty if ty.is_spsc_sender() => self.codegen_drop_spsc_endpoint_slot(
+                slot,
+                ty.spsc_sender_inner_type()
+                    .expect("SPSC sender validated one argument"),
+                true,
+            ),
+            ty if ty.is_spsc_receiver() => self.codegen_drop_spsc_endpoint_slot(
+                slot,
+                ty.spsc_receiver_inner_type()
+                    .expect("SPSC receiver validated one argument"),
+                false,
+            ),
             Type::App { base, args } if base == "Vec" => {
                 let elem = args.first().cloned().unwrap_or(Type::I32);
                 let vec_name = format!("Vec${}", Self::type_display_for_mono(&elem));
@@ -625,6 +708,9 @@ impl CodegenContext {
                     self.type_key(&value_type)
                 );
                 self.codegen_drop_map_from_ptr(slot, &map_name, &key_type, &value_type)
+            }
+            ty if glyph_core::thread::is_canonical_thread_handle(ty) => {
+                self.codegen_drop_thread_handle_slot(slot)
             }
             _ => Ok(()),
         }

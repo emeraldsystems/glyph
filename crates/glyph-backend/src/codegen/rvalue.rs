@@ -242,8 +242,13 @@ impl CodegenContext {
             Rvalue::MakeClosure { .. } => "MakeClosure",
             Rvalue::CallIndirect { .. } => "CallIndirect",
             Rvalue::ThreadSpawnUnit { .. } => "ThreadSpawnUnit",
+            Rvalue::ThreadSpawnResult { .. } => "ThreadSpawnResult",
             Rvalue::ThreadJoinUnit { .. } => "ThreadJoinUnit",
+            Rvalue::ThreadJoinResult { .. } => "ThreadJoinResult",
             Rvalue::ThreadDetachUnit { .. } => "ThreadDetachUnit",
+            Rvalue::ThreadHandleFromRaw { .. } => "ThreadHandleFromRaw",
+            Rvalue::ThreadHandleIntoRaw { .. } => "ThreadHandleIntoRaw",
+            Rvalue::ThreadErrorFromStatus { .. } => "ThreadErrorFromStatus",
             Rvalue::Ref { .. } => "Ref",
             Rvalue::ArrayLit { .. } => "ArrayLit",
             Rvalue::ArrayIndex { .. } => "ArrayIndex",
@@ -270,6 +275,17 @@ impl CodegenContext {
             Rvalue::RawPtrNull { .. } => "RawPtrNull",
             Rvalue::SharedNew { .. } => "SharedNew",
             Rvalue::SharedClone { .. } => "SharedClone",
+            Rvalue::ArcNew { .. } => "ArcNew",
+            Rvalue::ArcClone { .. } => "ArcClone",
+            Rvalue::ArcBorrow { .. } => "ArcBorrow",
+            Rvalue::MutexNew { .. } => "MutexNew",
+            Rvalue::MutexLock { .. } => "MutexLock",
+            Rvalue::MutexTryLock { .. } => "MutexTryLock",
+            Rvalue::MutexGuardIsAcquired { .. } => "MutexGuardIsAcquired",
+            Rvalue::MutexGuardBorrow { .. } => "MutexGuardBorrow",
+            Rvalue::SpscChannelNew { .. } => "SpscChannelNew",
+            Rvalue::SpscTrySend { .. } => "SpscTrySend",
+            Rvalue::SpscTryRecv { .. } => "SpscTryRecv",
             Rvalue::AtomicNew { .. } => "AtomicNew",
             Rvalue::AtomicLoad { .. } => "AtomicLoad",
             Rvalue::AtomicStore { .. } => "AtomicStore",
@@ -993,11 +1009,42 @@ impl CodegenContext {
                 Rvalue::ThreadSpawnUnit { task, out_handle } => {
                     self.codegen_thread_spawn_unit(*task, *out_handle, func, local_map)
                 }
+                Rvalue::ThreadSpawnResult {
+                    task,
+                    out_handle,
+                    result_type,
+                } => self.codegen_thread_spawn_result(
+                    *task,
+                    *out_handle,
+                    result_type,
+                    func,
+                    local_map,
+                ),
                 Rvalue::ThreadJoinUnit { handle } => {
                     self.codegen_thread_join_unit(*handle, func, local_map)
                 }
+                Rvalue::ThreadJoinResult {
+                    handle,
+                    out_result,
+                    result_type,
+                } => self.codegen_thread_join_result(
+                    *handle,
+                    *out_result,
+                    result_type,
+                    func,
+                    local_map,
+                ),
                 Rvalue::ThreadDetachUnit { handle } => {
                     self.codegen_thread_detach_unit(*handle, func, local_map)
+                }
+                Rvalue::ThreadHandleFromRaw { raw } => {
+                    self.codegen_thread_handle_from_raw(*raw, func, local_map)
+                }
+                Rvalue::ThreadHandleIntoRaw { handle } => {
+                    self.codegen_thread_handle_into_raw(*handle, func, local_map)
+                }
+                Rvalue::ThreadErrorFromStatus { status } => {
+                    self.codegen_value(status, func, local_map)
                 }
                 Rvalue::Ref { base, .. } => {
                     let base_ptr = local_map
@@ -1125,6 +1172,59 @@ impl CodegenContext {
                 Rvalue::SharedClone { base, elem_type } => {
                     self.codegen_shared_clone(*base, elem_type, local_map)
                 }
+                Rvalue::ArcNew { value, elem_type } => {
+                    self.codegen_arc_new(value, elem_type, func, local_map)
+                }
+                Rvalue::ArcClone { base, elem_type } => {
+                    self.codegen_arc_clone(*base, elem_type, func, local_map)
+                }
+                Rvalue::ArcBorrow { base, elem_type } => {
+                    self.codegen_arc_borrow(*base, elem_type, func, local_map)
+                }
+                Rvalue::MutexNew { value, elem_type } => {
+                    self.codegen_mutex_new(value, elem_type, func, local_map)
+                }
+                Rvalue::MutexLock { base, elem_type } => {
+                    self.codegen_mutex_lock(*base, elem_type, func, local_map)
+                }
+                Rvalue::MutexTryLock { base, elem_type } => {
+                    self.codegen_mutex_try_lock(*base, elem_type, func, local_map)
+                }
+                Rvalue::MutexGuardIsAcquired { guard, elem_type } => {
+                    self.codegen_mutex_guard_is_acquired(*guard, elem_type, func, local_map)
+                }
+                Rvalue::MutexGuardBorrow { guard, elem_type } => {
+                    self.codegen_mutex_guard_borrow(*guard, elem_type, func, local_map)
+                }
+                Rvalue::SpscChannelNew {
+                    capacity,
+                    out_receiver,
+                    elem_type,
+                } => self.codegen_spsc_channel_new(
+                    capacity,
+                    *out_receiver,
+                    elem_type,
+                    func,
+                    local_map,
+                ),
+                Rvalue::SpscTrySend {
+                    sender,
+                    value,
+                    out_unsent,
+                    elem_type,
+                } => self.codegen_spsc_try_send(
+                    *sender,
+                    *value,
+                    *out_unsent,
+                    elem_type,
+                    func,
+                    local_map,
+                ),
+                Rvalue::SpscTryRecv {
+                    receiver,
+                    out_value,
+                    elem_type,
+                } => self.codegen_spsc_try_recv(*receiver, *out_value, elem_type, func, local_map),
                 Rvalue::AtomicNew { value, scalar } => {
                     self.codegen_atomic_new(value, *scalar, func, local_map)
                 }

@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void glyph_thread_drop_owned(void* env,
                                     GlyphThreadDropUnstarted drop_unstarted) {
@@ -47,8 +48,18 @@ struct GlyphThread {
     // The state owns this start package until the worker claims it. If native
     // creation fails, the creator still owns it and performs unstarted-drop.
     GlyphThreadEntry entry;
+    GlyphThreadResultEntry result_entry;
+    int has_result;
+    void* invoke;
     void* env;
     GlyphThreadDropUnstarted drop_unstarted;
+
+    // The slot is uninitialized until result_entry returns. Once initialized,
+    // it is owned by this state until join moves it or final release drops it.
+    void* result;
+    size_t result_size;
+    int result_initialized;
+    GlyphThreadDropResult drop_result;
 };
 
 static int32_t glyph_thread_error(int error_code) {
@@ -57,14 +68,28 @@ static int32_t glyph_thread_error(int error_code) {
 
 static void glyph_thread_release(GlyphThread* state) {
     int free_state = 0;
+    int drop_result = 0;
+    void* result = NULL;
+    GlyphThreadDropResult drop_result_fn = NULL;
     pthread_mutex_lock(&state->lock);
     if (state->references > 0) {
         state->references--;
     }
     free_state = state->references == 0;
+    if (free_state) {
+        drop_result = state->result_initialized;
+        result = state->result;
+        drop_result_fn = state->drop_result;
+        state->result_initialized = 0;
+        state->result = NULL;
+    }
     pthread_mutex_unlock(&state->lock);
 
     if (free_state) {
+        if (drop_result && drop_result_fn != NULL) {
+            drop_result_fn(result);
+        }
+        free(result);
         pthread_mutex_destroy(&state->lock);
         free(state);
     }
@@ -120,35 +145,56 @@ static int32_t glyph_thread_take_test_failure(int32_t operation) {
 static void* glyph_thread_start(void* raw_state) {
     GlyphThread* state = (GlyphThread*)raw_state;
     GlyphThreadEntry entry;
+    GlyphThreadResultEntry result_entry;
+    void* invoke;
     void* env;
+    void* result;
 
     pthread_mutex_lock(&state->lock);
     state->lifecycle = GLYPH_THREAD_RUNNING;
     entry = state->entry;
+    result_entry = state->result_entry;
+    invoke = state->invoke;
     env = state->env;
+    result = state->result;
     state->entry = NULL;
+    state->result_entry = NULL;
+    state->invoke = NULL;
     state->env = NULL;
     state->drop_unstarted = NULL;
     pthread_mutex_unlock(&state->lock);
 
     // The entry thunk consumes its FnOnce environment, including its drop.
-    entry(env);
+    if (result_entry != NULL) {
+        result_entry(invoke, env, result);
+    } else {
+        entry(env);
+    }
 
     pthread_mutex_lock(&state->lock);
+    if (result_entry != NULL) {
+        state->result_initialized = 1;
+    }
     state->lifecycle = GLYPH_THREAD_FINISHED;
     pthread_mutex_unlock(&state->lock);
     glyph_thread_release(state);
     return NULL;
 }
 
-int32_t glyph_thread_spawn(GlyphThread** out,
-                           GlyphThreadEntry entry,
-                           void* env,
-                           GlyphThreadDropUnstarted drop_unstarted) {
+static int32_t glyph_thread_spawn_impl(
+    GlyphThread** out,
+    GlyphThreadEntry entry,
+    GlyphThreadResultEntry result_entry,
+    void* invoke,
+    void* env,
+    GlyphThreadDropUnstarted drop_unstarted,
+    size_t result_size,
+    GlyphThreadDropResult drop_result) {
     if (out != NULL) {
         *out = NULL;
     }
-    if (out == NULL || entry == NULL) {
+    if (out == NULL || (entry == NULL && result_entry == NULL) ||
+        (entry != NULL && result_entry != NULL)) {
         glyph_thread_drop_owned(env, drop_unstarted);
         return -EINVAL;
     }
@@ -182,8 +228,22 @@ int32_t glyph_thread_spawn(GlyphThread** out,
     state->lifecycle = GLYPH_THREAD_STARTING;
     state->owner_state = GLYPH_THREAD_JOINABLE;
     state->entry = entry;
+    state->result_entry = result_entry;
+    state->has_result = result_entry != NULL;
+    state->invoke = invoke;
     state->env = env;
     state->drop_unstarted = drop_unstarted;
+    state->result_size = result_size;
+    state->drop_result = drop_result;
+    if (result_size != 0) {
+        state->result = malloc(result_size);
+        if (state->result == NULL) {
+            glyph_thread_drop_owned(state->env, state->drop_unstarted);
+            pthread_mutex_destroy(&state->lock);
+            free(state);
+            return -ENOMEM;
+        }
+    }
 
     injected = glyph_thread_take_test_failure(
 #if defined(GLYPH_THREAD_ENABLE_TEST_HOOKS)
@@ -196,6 +256,7 @@ int32_t glyph_thread_spawn(GlyphThread** out,
                        : pthread_create(&state->native, NULL, glyph_thread_start, state);
     if (rc != 0) {
         glyph_thread_drop_owned(state->env, state->drop_unstarted);
+        free(state->result);
         pthread_mutex_destroy(&state->lock);
         free(state);
         return glyph_thread_error(rc);
@@ -203,6 +264,25 @@ int32_t glyph_thread_spawn(GlyphThread** out,
 
     *out = state;
     return 0;
+}
+
+int32_t glyph_thread_spawn(GlyphThread** out,
+                           GlyphThreadEntry entry,
+                           void* env,
+                           GlyphThreadDropUnstarted drop_unstarted) {
+    return glyph_thread_spawn_impl(out, entry, NULL, NULL, env, drop_unstarted,
+                                   0, NULL);
+}
+
+int32_t glyph_thread_spawn_result(GlyphThread** out,
+                                  GlyphThreadResultEntry entry,
+                                  void* invoke,
+                                  void* env,
+                                  GlyphThreadDropUnstarted drop_unstarted,
+                                  size_t result_size,
+                                  GlyphThreadDropResult drop_result) {
+    return glyph_thread_spawn_impl(out, NULL, entry, invoke, env,
+                                   drop_unstarted, result_size, drop_result);
 }
 
 static void glyph_thread_restore_owner_state(GlyphThread* state,
@@ -214,12 +294,7 @@ static void glyph_thread_restore_owner_state(GlyphThread* state,
     pthread_mutex_unlock(&state->lock);
 }
 
-int32_t glyph_thread_join(GlyphThread** handle) {
-    if (handle == NULL || *handle == NULL) {
-        return -EINVAL;
-    }
-    GlyphThread* state = *handle;
-
+static int32_t glyph_thread_join_native(GlyphThread* state) {
     pthread_mutex_lock(&state->lock);
     if (state->owner_state != GLYPH_THREAD_JOINABLE) {
         pthread_mutex_unlock(&state->lock);
@@ -246,9 +321,51 @@ int32_t glyph_thread_join(GlyphThread** handle) {
     pthread_mutex_lock(&state->lock);
     state->owner_state = GLYPH_THREAD_JOINED;
     pthread_mutex_unlock(&state->lock);
+    return 0;
+}
+
+int32_t glyph_thread_join(GlyphThread** handle) {
+    if (handle == NULL || *handle == NULL) {
+        return -EINVAL;
+    }
+    GlyphThread* state = *handle;
+    if (state->has_result) {
+        return -EINVAL;
+    }
+    int32_t status = glyph_thread_join_native(state);
+    if (status != 0) {
+        return status;
+    }
     *handle = NULL;
     glyph_thread_release(state);
     return 0;
+}
+
+int32_t glyph_thread_join_result(GlyphThread** handle, void* out_result) {
+    if (handle == NULL || *handle == NULL) {
+        return -EINVAL;
+    }
+    GlyphThread* state = *handle;
+    if (!state->has_result ||
+        (state->result_size != 0 && out_result == NULL)) {
+        return -EINVAL;
+    }
+    int32_t status = glyph_thread_join_native(state);
+    if (status != 0) {
+        return status;
+    }
+
+    pthread_mutex_lock(&state->lock);
+    int initialized = state->result_initialized;
+    if (initialized && state->result_size != 0) {
+        memcpy(out_result, state->result, state->result_size);
+    }
+    state->result_initialized = 0;
+    pthread_mutex_unlock(&state->lock);
+
+    *handle = NULL;
+    glyph_thread_release(state);
+    return initialized ? 0 : -EIO;
 }
 
 int32_t glyph_thread_detach(GlyphThread** handle) {
@@ -419,8 +536,32 @@ int32_t glyph_thread_spawn(GlyphThread** out,
     return -ENOSYS;
 }
 
+int32_t glyph_thread_spawn_result(GlyphThread** out,
+                                  GlyphThreadResultEntry entry,
+                                  void* invoke,
+                                  void* env,
+                                  GlyphThreadDropUnstarted drop_unstarted,
+                                  size_t result_size,
+                                  GlyphThreadDropResult drop_result) {
+    (void)entry;
+    (void)invoke;
+    (void)result_size;
+    (void)drop_result;
+    if (out != NULL) {
+        *out = NULL;
+    }
+    glyph_thread_drop_owned(env, drop_unstarted);
+    return -ENOSYS;
+}
+
 int32_t glyph_thread_join(GlyphThread** handle) {
     (void)handle;
+    return -ENOSYS;
+}
+
+int32_t glyph_thread_join_result(GlyphThread** handle, void* out_result) {
+    (void)handle;
+    (void)out_result;
     return -ENOSYS;
 }
 

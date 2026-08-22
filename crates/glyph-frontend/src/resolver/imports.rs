@@ -25,6 +25,36 @@ pub fn populate_imported_types(ctx: &mut ResolverContext) {
     let mut visited: HashSet<(String, String)> = HashSet::new();
 
     for (local_name, (source_module, original_name)) in &scope.direct_symbols {
+        if source_module == "std/thread" && original_name == "spawn" {
+            for (dependency_module, dependency_name) in [
+                ("std/thread", "JoinHandle"),
+                ("std/thread", "ThreadError"),
+                ("std/enums", "Result"),
+            ] {
+                import_named_type(
+                    ctx,
+                    &all_modules,
+                    dependency_module,
+                    dependency_name,
+                    None,
+                    &mut visited,
+                );
+            }
+        }
+        if source_module == "std/sync" && original_name == "Mutex" {
+            for (dependency_module, dependency_name) in
+                [("std/sync", "MutexGuard"), ("std/enums", "Option")]
+            {
+                import_named_type(
+                    ctx,
+                    &all_modules,
+                    dependency_module,
+                    dependency_name,
+                    None,
+                    &mut visited,
+                );
+            }
+        }
         if ctx.struct_types.contains_key(local_name) || ctx.enum_types.contains_key(local_name) {
             continue;
         }

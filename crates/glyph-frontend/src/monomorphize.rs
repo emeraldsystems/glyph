@@ -285,12 +285,47 @@ fn rewrite_type(
     worklist: &mut VecDeque<Type>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Type {
+    if let Some(inner) = ty.arc_inner_type() {
+        return Type::arc(rewrite_type(
+            inner,
+            templates,
+            instantiations,
+            worklist,
+            diagnostics,
+        ));
+    }
+    if let Some(inner) = ty.mutex_inner_type() {
+        return Type::mutex(rewrite_type(
+            inner,
+            templates,
+            instantiations,
+            worklist,
+            diagnostics,
+        ));
+    }
+    if let Some(inner) = ty.mutex_guard_inner_type() {
+        return Type::mutex_guard(rewrite_type(
+            inner,
+            templates,
+            instantiations,
+            worklist,
+            diagnostics,
+        ));
+    }
     match ty {
         Type::App { base, args } => {
             let args_rewritten: Vec<Type> = args
                 .iter()
                 .map(|a| rewrite_type(a, templates, instantiations, worklist, diagnostics))
                 .collect();
+
+            let canonical = Type::App {
+                base: base.clone(),
+                args: args_rewritten.clone(),
+            };
+            if glyph_core::thread::is_canonical_thread_handle(&canonical) {
+                return canonical;
+            }
 
             let Some(template) = templates.get(base) else {
                 diagnostics.push(Diagnostic::error(
@@ -413,6 +448,27 @@ fn rewrite_type_with_instantiations(
     templates: &HashMap<String, Template>,
     instantiations: &HashMap<(String, Vec<Type>), String>,
 ) -> Type {
+    if let Some(inner) = ty.arc_inner_type() {
+        return Type::arc(rewrite_type_with_instantiations(
+            inner,
+            templates,
+            instantiations,
+        ));
+    }
+    if let Some(inner) = ty.mutex_inner_type() {
+        return Type::mutex(rewrite_type_with_instantiations(
+            inner,
+            templates,
+            instantiations,
+        ));
+    }
+    if let Some(inner) = ty.mutex_guard_inner_type() {
+        return Type::mutex_guard(rewrite_type_with_instantiations(
+            inner,
+            templates,
+            instantiations,
+        ));
+    }
     match ty {
         Type::App { base, args } => {
             let args_rewritten: Vec<Type> = args
@@ -556,7 +612,15 @@ fn rewrite_rvalue(
         | Rvalue::OwnFromRaw { elem_type, .. }
         | Rvalue::RawPtrNull { elem_type }
         | Rvalue::SharedNew { elem_type, .. }
-        | Rvalue::SharedClone { elem_type, .. } => {
+        | Rvalue::SharedClone { elem_type, .. }
+        | Rvalue::ArcNew { elem_type, .. }
+        | Rvalue::ArcClone { elem_type, .. }
+        | Rvalue::ArcBorrow { elem_type, .. }
+        | Rvalue::MutexNew { elem_type, .. }
+        | Rvalue::MutexLock { elem_type, .. }
+        | Rvalue::MutexTryLock { elem_type, .. }
+        | Rvalue::MutexGuardIsAcquired { elem_type, .. }
+        | Rvalue::MutexGuardBorrow { elem_type, .. } => {
             *elem_type = rewrite_type(elem_type, templates, instantiations, worklist, diagnostics);
         }
         Rvalue::EnumPayload { payload_type, .. } => {
@@ -599,6 +663,9 @@ fn rewrite_rvalue(
                 );
             }
         }
+        Rvalue::ThreadErrorFromStatus { .. }
+        | Rvalue::ThreadHandleFromRaw { .. }
+        | Rvalue::ThreadHandleIntoRaw { .. } => {}
         _ => {}
     }
 }

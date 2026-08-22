@@ -1,18 +1,23 @@
-//! Compiler contract for the first unit-returning native-thread builtin.
+//! Compiler contract for native-thread builtins.
 //!
-//! The surface API is `Result<JoinHandle<()>, ThreadError>`, but MIR keeps the
-//! opaque runtime pointer and status separate. This avoids coupling runtime
-//! retry semantics to the user-visible `Result` layout. Only lowering may
-//! create the private raw handle local.
+//! The surface API specializes `spawn<T>` and `JoinHandle<T>` without requiring
+//! general generic functions. MIR keeps the opaque runtime pointer, status,
+//! and typed output slot separate. This avoids coupling retry semantics to the
+//! user-visible `Result` layout. Only lowering may create raw handle locals.
 
 use crate::thread_safety::{ThreadSafetyError, ThreadSafetyRegistry, ThreadSafetyType};
 use crate::types::Type;
 
 /// The only callable signature accepted by the GLYPH-42 spawn primitive.
 pub fn unit_task_type() -> Type {
+    task_type(Type::Tuple(Vec::new()))
+}
+
+/// Concrete compiler-intrinsic task signature for `spawn<T>`.
+pub fn task_type(result: Type) -> Type {
     Type::Function {
         params: Vec::new(),
-        ret: Box::new(Type::Void),
+        ret: Box::new(result),
     }
 }
 
@@ -20,7 +25,85 @@ pub fn unit_task_type() -> Type {
 ///
 /// This type must never be surfaced through source type resolution.
 pub fn private_unit_handle_type() -> Type {
+    private_thread_handle_type()
+}
+
+/// Private low-level representation shared by every `JoinHandle<T>`.
+pub fn private_thread_handle_type() -> Type {
     Type::RawPtr(Box::new(Type::I8))
+}
+
+/// Resolver-issued public identity for the unit join handle.
+///
+/// The generic-looking type is deliberately not backed by a source-visible
+/// struct. Codegen maps this one canonical application to opaque pointer
+/// storage; a user declaration named `JoinHandle` remains an ordinary type.
+pub fn canonical_unit_handle_type() -> Type {
+    canonical_thread_handle_type(Type::Void)
+}
+
+/// Resolver-issued public identity for a concrete typed join handle.
+pub fn canonical_thread_handle_type(result: Type) -> Type {
+    Type::App {
+        base: "std::thread::JoinHandle".into(),
+        args: vec![result],
+    }
+}
+
+/// Resolver-issued public identity for native thread errors.
+pub fn canonical_thread_error_type() -> Type {
+    Type::Named("std::thread::ThreadError".into())
+}
+
+/// Public result returned by the unit-only spawn primitive.
+pub fn unit_spawn_result_type() -> Type {
+    spawn_result_type(Type::Void)
+}
+
+/// Public result returned by compiler-specialized `spawn<T>`.
+pub fn spawn_result_type(result: Type) -> Type {
+    Type::App {
+        base: "Result".into(),
+        args: vec![
+            canonical_thread_handle_type(result),
+            canonical_thread_error_type(),
+        ],
+    }
+}
+
+/// Public result returned by unit join and detach operations.
+pub fn unit_thread_status_result_type() -> Type {
+    join_result_type(Type::Void)
+}
+
+/// Public result returned by compiler-specialized `JoinHandle<T>::join`.
+pub fn join_result_type(result: Type) -> Type {
+    Type::App {
+        base: "Result".into(),
+        args: vec![result, canonical_thread_error_type()],
+    }
+}
+
+pub fn is_canonical_unit_handle(ty: &Type) -> bool {
+    ty == &canonical_unit_handle_type()
+}
+
+/// Return the concrete result parameter only for the compiler-owned handle.
+pub fn canonical_thread_handle_result(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::App { base, args } if base == "std::thread::JoinHandle" && args.len() == 1 => {
+            args.first()
+        }
+        _ => None,
+    }
+}
+
+pub fn is_canonical_thread_handle(ty: &Type) -> bool {
+    canonical_thread_handle_result(ty).is_some()
+}
+
+pub fn is_canonical_thread_error(ty: &Type) -> bool {
+    ty == &canonical_thread_error_type()
 }
 
 /// Validate the complete thread transfer before emitting spawn MIR.
@@ -82,5 +165,18 @@ mod tests {
     #[test]
     fn low_level_handle_representation_stays_explicitly_private_and_opaque() {
         assert_eq!(private_unit_handle_type(), Type::RawPtr(Box::new(Type::I8)));
+    }
+
+    #[test]
+    fn typed_handle_identity_retains_its_concrete_result() {
+        let result = Type::Tuple(vec![Type::I32, Type::String]);
+        let handle = canonical_thread_handle_type(result.clone());
+
+        assert!(is_canonical_thread_handle(&handle));
+        assert_eq!(canonical_thread_handle_result(&handle), Some(&result));
+        assert!(!is_canonical_thread_handle(&Type::App {
+            base: "user::JoinHandle".into(),
+            args: vec![result],
+        }));
     }
 }

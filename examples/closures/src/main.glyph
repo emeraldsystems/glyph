@@ -1,0 +1,37 @@
+fn add_one(value: i32) -> i32 {
+  ret value + 1
+}
+
+// FnOnce callbacks are useful for one-shot transforms. Repeated iterator
+// callbacks will arrive with the future Fn/FnMut work.
+fn transform_one(callback: FnOnce<i32, i32>, value: i32) -> i32 {
+  ret callback(value)
+}
+
+// A returned closure keeps ownership of its captured offset.
+fn make_offset(offset: i32) -> FnOnce<i32, i32> {
+  ret move value -> offset + value
+}
+
+fn main() -> i32 {
+  // Zero, one, and many parameters; both expression and block bodies.
+  let zero: FnOnce<(), i32> = () -> { 2 }
+  let one: FnOnce<i32, i32> = value -> value + 3
+  let many: FnOnce<(i32, i32), i32> = (left, right) -> {
+    left + right
+  }
+
+  // Named functions coerce to FnOnce, while closures can be returned,
+  // stored in locals, and passed to another function.
+  let returned = make_offset(10)
+  let answer = zero()
+    + one(1)
+    + many(5, 6)
+    + transform_one(add_one, 10)
+    + returned(4)
+
+  if answer != 42 {
+    ret 1
+  }
+  ret 0
+}

@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-33d7d0e9.js";
+            window.path_to_searchindex_js = "searchindex-49ba643b.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-24673502.js"></script>
+        <script src="toc-ee24a55e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -230,6 +230,40 @@ handle to the same allocation.</p>
 </code></pre>
 <p>Dropping each cloned handle decrements the reference count. The allocation is
 freed when the final handle is dropped.</p>
+<p><code>Shared&lt;T&gt;</code> is intentionally single-threaded. It cannot be captured by a task
+passed to <code>spawn</code>, including when it is nested inside another struct.</p>
+<h2 id="arct"><a class="header" href="#arct"><code>Arc&lt;T&gt;</code></a></h2>
+<p><code>Arc&lt;T&gt;</code> provides atomic shared ownership for immutable data that must cross a
+thread boundary. Import it from <code>std/sync</code>, move one clone into each task, and
+keep another clone when the spawning thread still needs access:</p>
+<pre><code class="language-glyph">import Arc from std/sync
+import spawn from std/thread
+
+fn main() -&gt; i32 {
+  let counter = Arc::new(AtomicI32::new(0))
+  let worker_counter = counter.clone()
+  let task: FnOnce&lt;(), ()&gt; = move () -&gt; {
+    let atomic = worker_counter.borrow()
+    let previous = atomic.fetch_add(1)
+  }
+  let outcome = spawn(task)
+  ret 0
+}
+</code></pre>
+<p><code>Arc&lt;T&gt;</code> supports <code>new</code>, explicit <code>clone</code>, and immutable <code>borrow</code>. It is safe to
+transfer only when <code>T</code> and every nested field are both thread-transferable and
+safe to share; references, raw pointers, and <code>Shared&lt;T&gt;</code> therefore cannot be
+smuggled into a worker through an <code>Arc</code>.</p>
+<p>An <code>Arc::borrow()</code> view is tied to the exact owner local for the rest of its
+lexical scope. The owner cannot be moved or reassigned until that scope ends.
+For v1, these views must remain direct local bindings: storing one in an
+aggregate, collection, heap owner, enum, or closure is rejected. Use a smaller
+nested block to end a view before moving its owner, or clone the <code>Arc</code> and move
+the clone when ownership must cross a boundary.</p>
+<p>The v1 API has no weak handles, mutable access, or raw conversions. Reference
+cycles leak by design. Allocation and final destruction are not real-time safe,
+and clone/drop are not promised to be wait-free or safe in an audio callback;
+prepare immutable assets and configuration outside the real-time path.</p>
 <h2 id="rawptrt"><a class="header" href="#rawptrt"><code>RawPtr&lt;T&gt;</code></a></h2>
 <p><code>RawPtr&lt;T&gt;</code> is an unsafe, opaque pointer type primarily used for FFI boundaries.
 You can obtain one from <code>Own&lt;T&gt;::into_raw()</code>.</p>
@@ -270,22 +304,6 @@ You can obtain one from <code>Own&lt;T&gt;::into_raw()</code>.</p>
         <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
         <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
 
-        <!-- Livereload script (if served using the cli tool) -->
-        <script>
-            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
-            const socket = new WebSocket(wsAddress);
-            socket.onmessage = function (event) {
-                if (event.data === "reload") {
-                    socket.close();
-                    location.reload();
-                }
-            };
-
-            window.onbeforeunload = function() {
-                socket.close();
-            }
-        </script>
 
 
         <script>

@@ -242,6 +242,22 @@ pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
         Rvalue::RawPtrNull { elem_type } => Some(Type::RawPtr(Box::new(elem_type.clone()))),
         Rvalue::SharedNew { elem_type, .. } => Some(Type::Shared(Box::new(elem_type.clone()))),
         Rvalue::SharedClone { elem_type, .. } => Some(Type::Shared(Box::new(elem_type.clone()))),
+        Rvalue::ArcNew { elem_type, .. } | Rvalue::ArcClone { elem_type, .. } => {
+            Some(Type::arc(elem_type.clone()))
+        }
+        Rvalue::ArcBorrow { elem_type, .. } => Some(Type::Ref(
+            Box::new(elem_type.clone()),
+            glyph_core::types::Mutability::Immutable,
+        )),
+        Rvalue::MutexNew { elem_type, .. } => Some(Type::mutex(elem_type.clone())),
+        Rvalue::MutexLock { elem_type, .. } | Rvalue::MutexTryLock { elem_type, .. } => {
+            Some(Type::mutex_guard(elem_type.clone()))
+        }
+        Rvalue::MutexGuardIsAcquired { .. } => Some(Type::Bool),
+        Rvalue::MutexGuardBorrow { elem_type, .. } => Some(Type::Ref(
+            Box::new(elem_type.clone()),
+            glyph_core::types::Mutability::Mutable,
+        )),
         Rvalue::AtomicNew { scalar, .. } => Some(Type::Atomic(*scalar)),
         Rvalue::AtomicLoad { scalar, .. }
         | Rvalue::AtomicRmw { scalar, .. }
@@ -257,6 +273,13 @@ pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
         Rvalue::AtomicIsLockFree { .. } => Some(Type::Bool),
         Rvalue::FunctionRef { signature, .. } | Rvalue::MakeClosure { signature, .. } => {
             Some(signature.clone())
+        }
+        Rvalue::ThreadHandleFromRaw { .. } => {
+            Some(glyph_core::thread::canonical_unit_handle_type())
+        }
+        Rvalue::ThreadHandleIntoRaw { .. } => Some(glyph_core::thread::private_unit_handle_type()),
+        Rvalue::ThreadErrorFromStatus { .. } => {
+            Some(glyph_core::thread::canonical_thread_error_type())
         }
         Rvalue::CallIndirect { signature, .. } => {
             signature.function_signature().map(|(_, ret)| ret.clone())

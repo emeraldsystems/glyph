@@ -323,7 +323,7 @@ fn search() -> i32 {
 
 Priorities:
 1. **For-in over collections** — extend `for x in collection` beyond range syntax
-2. **Closures / lambdas** — first-class function values
+2. **Borrowed closures** — owned `FnOnce` is implemented; `Fn`/`FnMut` remains deferred (see [CLOSURES_CONCURRENCY.md](CLOSURES_CONCURRENCY.md))
 3. **Trait / interface improvements** — default methods, generic constraints
 4. **Borrow checker** — lifetime analysis and move checking
 

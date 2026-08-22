@@ -793,15 +793,90 @@ impl<'a> Analyzer<'a> {
                     .iter()
                     .find_map(|(candidate, ty)| (candidate == &field.0).then(|| ty.clone()))
             }
-            Expr::Call { callee, .. } => {
+            Expr::Call { callee, args, .. } => {
                 if let Some(Type::Function { ret, .. }) = self.infer_expr_type(callee, state) {
                     return Some(*ret);
+                }
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    let argument = args
+                        .first()
+                        .and_then(|arg| self.infer_expr_type(arg, state));
+                    match name.0.as_str() {
+                        "Arc::new"
+                            if matches!(
+                                self.resolver.resolve_symbol("Arc"),
+                                Some(crate::resolver::ResolvedSymbol::Struct(module, symbol))
+                                    if module == "std/sync" && symbol == "Arc"
+                            ) =>
+                        {
+                            return argument.map(Type::arc);
+                        }
+                        "Mutex::new"
+                            if matches!(
+                                self.resolver.resolve_symbol("Mutex"),
+                                Some(crate::resolver::ResolvedSymbol::Struct(module, symbol))
+                                    if module == "std/sync" && symbol == "Mutex"
+                            ) =>
+                        {
+                            return argument.map(Type::mutex);
+                        }
+                        "Own::new" => return argument.map(|ty| Type::Own(Box::new(ty))),
+                        "Shared::new" => {
+                            return argument.map(|ty| Type::Shared(Box::new(ty)));
+                        }
+                        atomic if atomic.ends_with("::new") => {
+                            let atomic = atomic.trim_end_matches("::new");
+                            if let Some(ty) = Type::from_name(atomic)
+                                && matches!(ty, Type::Atomic(_))
+                            {
+                                return Some(ty);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 if let Expr::FieldAccess { base, field, .. } = callee.as_ref() {
                     if matches!(base.as_ref(), Expr::Ident(name, _) if name.0 == "String")
                         && matches!(field.0.as_str(), "from_str" | "with_capacity")
                     {
                         return Some(Type::String);
+                    }
+                    if let Expr::Ident(name, _) = base.as_ref() {
+                        let argument = args
+                            .first()
+                            .and_then(|arg| self.infer_expr_type(arg, state));
+                        match (name.0.as_str(), field.0.as_str()) {
+                            ("Arc", "new")
+                                if matches!(
+                                    self.resolver.resolve_symbol("Arc"),
+                                    Some(crate::resolver::ResolvedSymbol::Struct(module, symbol))
+                                        if module == "std/sync" && symbol == "Arc"
+                                ) =>
+                            {
+                                return argument.map(Type::arc);
+                            }
+                            ("Mutex", "new")
+                                if matches!(
+                                    self.resolver.resolve_symbol("Mutex"),
+                                    Some(crate::resolver::ResolvedSymbol::Struct(module, symbol))
+                                        if module == "std/sync" && symbol == "Mutex"
+                                ) =>
+                            {
+                                return argument.map(Type::mutex);
+                            }
+                            ("Own", "new") => return argument.map(|ty| Type::Own(Box::new(ty))),
+                            ("Shared", "new") => {
+                                return argument.map(|ty| Type::Shared(Box::new(ty)));
+                            }
+                            (atomic, "new") => {
+                                if let Some(ty) = Type::from_name(atomic)
+                                    && matches!(ty, Type::Atomic(_))
+                                {
+                                    return Some(ty);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 None
@@ -822,12 +897,53 @@ impl<'a> Analyzer<'a> {
                     ret: Box::new(ret),
                 })
             }
+            Expr::MethodCall {
+                receiver, method, ..
+            } => {
+                let receiver_ty = self.infer_expr_type(receiver, state)?;
+                if let Some(inner) = receiver_ty.arc_inner_type().cloned() {
+                    return match method.0.as_str() {
+                        "clone" => Some(receiver_ty),
+                        "borrow" => Some(Type::Ref(
+                            Box::new(inner),
+                            glyph_core::types::Mutability::Immutable,
+                        )),
+                        _ => None,
+                    };
+                }
+                let mutex_inner = receiver_ty.mutex_inner_type().cloned().or_else(|| {
+                    if let Type::Ref(inner, _) = &receiver_ty {
+                        inner.mutex_inner_type().cloned()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(inner) = mutex_inner {
+                    return match method.0.as_str() {
+                        "lock" => Some(Type::mutex_guard(inner)),
+                        "try_lock" => Some(Type::App {
+                            base: "Option".into(),
+                            args: vec![Type::mutex_guard(inner)],
+                        }),
+                        _ => None,
+                    };
+                }
+                if let Some(inner) = receiver_ty.mutex_guard_inner_type().cloned() {
+                    return match method.0.as_str() {
+                        "borrow" | "borrow_mut" => Some(Type::Ref(
+                            Box::new(inner),
+                            glyph_core::types::Mutability::Mutable,
+                        )),
+                        _ => None,
+                    };
+                }
+                None
+            }
             Expr::If { .. }
             | Expr::Block(_)
             | Expr::While { .. }
             | Expr::For { .. }
             | Expr::ForIn { .. }
-            | Expr::MethodCall { .. }
             | Expr::Match { .. } => None,
         }
     }

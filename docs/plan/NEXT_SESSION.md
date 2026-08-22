@@ -3,13 +3,17 @@
 **Last Updated:** February 17, 2026
 **Current:** Modulo, hex escapes, void calls, case system, for-in, `?` operator, codebase modularization COMPLETE ✅
 
+> Historical handoff note: this page predates the closure implementation.
+> Owned `FnOnce` semantics are now defined authoritatively in
+> [CLOSURES_CONCURRENCY.md](CLOSURES_CONCURRENCY.md).
+
 ---
 
 ## 🎯 IMMEDIATE NEXT STEPS
 
 1) **Consider Next Major Feature:**
    - For-in over collections — extend `for x in collection` beyond range syntax
-   - Closures / lambdas — first-class function values
+   - Extend owned `FnOnce` closures with the deferred borrowed `Fn`/`FnMut` model
    - Trait / interface improvements — default methods, generic constraints
    - Borrow checker & lifetimes (very high complexity)
 
@@ -199,7 +203,7 @@ fn main() -> i32 {
 ## What to Build Next
 
 1) **For-in over collections** — extend `for x in collection` beyond range syntax
-2) **Closures / lambdas** — first-class function values
+2) **Borrowed closures** — extend implemented owned `FnOnce` values with `Fn`/`FnMut`
 3) **Trait / interface improvements** — default methods, generic constraints
 4) **Borrow checker & lifetimes** — lifetime analysis and move checking
 

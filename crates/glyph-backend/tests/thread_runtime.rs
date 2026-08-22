@@ -35,6 +35,8 @@ struct GlyphThreadTestLatch {
 
 type ThreadEntry = unsafe extern "C" fn(*mut c_void);
 type DropUnstarted = unsafe extern "C" fn(*mut c_void);
+type ThreadResultEntry = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+type DropResult = unsafe extern "C" fn(*mut c_void);
 
 #[link(name = "glyph_runtime", kind = "static")]
 unsafe extern "C" {
@@ -44,7 +46,17 @@ unsafe extern "C" {
         env: *mut c_void,
         drop_unstarted: Option<DropUnstarted>,
     ) -> c_int;
+    fn glyph_thread_spawn_result(
+        out: *mut *mut GlyphThread,
+        entry: Option<ThreadResultEntry>,
+        invoke: *mut c_void,
+        env: *mut c_void,
+        drop_unstarted: Option<DropUnstarted>,
+        result_size: usize,
+        drop_result: Option<DropResult>,
+    ) -> c_int;
     fn glyph_thread_join(handle: *mut *mut GlyphThread) -> c_int;
+    fn glyph_thread_join_result(handle: *mut *mut GlyphThread, out_result: *mut c_void) -> c_int;
     fn glyph_thread_detach(handle: *mut *mut GlyphThread) -> c_int;
 
     fn glyph_thread_test_fail_next(operation: c_int, error_code: c_int) -> c_int;
@@ -59,11 +71,18 @@ unsafe extern "C" {
 
 static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static FAILURE_DROPS: AtomicUsize = AtomicUsize::new(0);
+static ENVIRONMENT_DROPS: AtomicUsize = AtomicUsize::new(0);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct WorkerEnv {
     gate: *mut GlyphThreadTestLatch,
     completion: *mut GlyphThreadTestLatch,
+}
+
+impl Drop for WorkerEnv {
+    fn drop(&mut self) {
+        ENVIRONMENT_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 unsafe extern "C" fn count_and_finish(raw: *mut c_void) {
@@ -108,6 +127,7 @@ fn worker_env(
 fn spawn_and_join_transfer_the_environment_once() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     INVOCATIONS.store(0, Ordering::SeqCst);
+    ENVIRONMENT_DROPS.store(0, Ordering::SeqCst);
     let completion = latch(1);
     let mut handle = ptr::null_mut();
 
@@ -130,6 +150,7 @@ fn spawn_and_join_transfer_the_environment_once() {
     assert_eq!(unsafe { glyph_thread_join(&mut handle) }, 0);
     assert!(handle.is_null());
     assert_eq!(INVOCATIONS.load(Ordering::SeqCst), 1);
+    assert_eq!(ENVIRONMENT_DROPS.load(Ordering::SeqCst), 1);
     assert_eq!(unsafe { glyph_thread_join(&mut handle) }, -libc::EINVAL);
 
     destroy_latch(completion);
@@ -139,6 +160,7 @@ fn spawn_and_join_transfer_the_environment_once() {
 fn create_and_allocation_failures_drop_the_unstarted_environment() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     FAILURE_DROPS.store(0, Ordering::SeqCst);
+    ENVIRONMENT_DROPS.store(0, Ordering::SeqCst);
     for (operation, error) in [
         (TEST_FAIL_ALLOC, libc::ENOMEM),
         (TEST_FAIL_CREATE, libc::EAGAIN),
@@ -161,6 +183,7 @@ fn create_and_allocation_failures_drop_the_unstarted_environment() {
         destroy_latch(completion);
     }
     assert_eq!(FAILURE_DROPS.load(Ordering::SeqCst), 2);
+    assert_eq!(ENVIRONMENT_DROPS.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -284,6 +307,236 @@ fn repeated_join_and_detach_lifecycles_complete_with_bounded_waits() {
             destroy_latch(completion);
         }
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LargeResult {
+    words: [u64; 8],
+}
+
+#[repr(C)]
+struct OwnedResult {
+    allocation: *mut u8,
+    dropped: *mut GlyphThreadTestLatch,
+}
+
+struct TypedWorkerEnv {
+    gate: *mut GlyphThreadTestLatch,
+    completed: *mut GlyphThreadTestLatch,
+    dropped: *mut GlyphThreadTestLatch,
+}
+
+unsafe extern "C" fn write_large_result(_invoke: *mut c_void, _env: *mut c_void, out: *mut c_void) {
+    unsafe {
+        out.cast::<LargeResult>().write(LargeResult {
+            words: [3, 5, 8, 13, 21, 34, 55, 89],
+        });
+    }
+}
+
+unsafe extern "C" fn write_owned_result(
+    _invoke: *mut c_void,
+    raw_env: *mut c_void,
+    out: *mut c_void,
+) {
+    let env = unsafe { Box::from_raw(raw_env.cast::<TypedWorkerEnv>()) };
+    if !env.gate.is_null() {
+        let _ = unsafe { glyph_thread_test_latch_wait(env.gate, WAIT_MS) };
+    }
+    unsafe {
+        out.cast::<OwnedResult>().write(OwnedResult {
+            allocation: Box::into_raw(Box::new(42)),
+            dropped: env.dropped,
+        });
+    }
+    let _ = unsafe { glyph_thread_test_latch_count_down(env.completed) };
+}
+
+unsafe extern "C" fn drop_typed_unstarted(raw: *mut c_void) {
+    if !raw.is_null() {
+        drop(unsafe { Box::from_raw(raw.cast::<TypedWorkerEnv>()) });
+    }
+    FAILURE_DROPS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn typed_worker_env(
+    gate: *mut GlyphThreadTestLatch,
+    completed: *mut GlyphThreadTestLatch,
+    dropped: *mut GlyphThreadTestLatch,
+) -> *mut c_void {
+    Box::into_raw(Box::new(TypedWorkerEnv {
+        gate,
+        completed,
+        dropped,
+    }))
+    .cast()
+}
+
+unsafe extern "C" fn drop_owned_result(raw: *mut c_void) {
+    let result = unsafe { raw.cast::<OwnedResult>().read() };
+    if !result.allocation.is_null() {
+        drop(unsafe { Box::from_raw(result.allocation) });
+    }
+    let _ = unsafe { glyph_thread_test_latch_count_down(result.dropped) };
+}
+
+#[test]
+fn typed_join_moves_a_large_result_exactly_once_and_is_retryable() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let mut handle = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            glyph_thread_spawn_result(
+                &mut handle,
+                Some(write_large_result),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                None,
+                std::mem::size_of::<LargeResult>(),
+                None,
+            )
+        },
+        0
+    );
+
+    assert_eq!(
+        unsafe { glyph_thread_test_fail_next(TEST_FAIL_JOIN, libc::EBUSY) },
+        0
+    );
+    let mut result = LargeResult::default();
+    assert_eq!(
+        unsafe { glyph_thread_join_result(&mut handle, (&mut result as *mut LargeResult).cast()) },
+        -libc::EBUSY
+    );
+    assert!(!handle.is_null());
+    assert_eq!(
+        unsafe { glyph_thread_join_result(&mut handle, (&mut result as *mut LargeResult).cast()) },
+        0
+    );
+    assert!(handle.is_null());
+    assert_eq!(result.words, [3, 5, 8, 13, 21, 34, 55, 89]);
+    assert_eq!(
+        unsafe { glyph_thread_join_result(&mut handle, (&mut result as *mut LargeResult).cast()) },
+        -libc::EINVAL
+    );
+}
+
+#[test]
+fn detach_before_or_after_completion_drops_unclaimed_typed_results() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for detach_before_completion in [true, false] {
+        let gate = latch(u32::from(detach_before_completion));
+        let completed = latch(1);
+        let dropped = latch(1);
+        let mut handle = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                glyph_thread_spawn_result(
+                    &mut handle,
+                    Some(write_owned_result),
+                    ptr::null_mut(),
+                    typed_worker_env(gate, completed, dropped),
+                    Some(drop_typed_unstarted),
+                    std::mem::size_of::<OwnedResult>(),
+                    Some(drop_owned_result),
+                )
+            },
+            0
+        );
+        if detach_before_completion {
+            assert_eq!(unsafe { glyph_thread_detach(&mut handle) }, 0);
+            assert_eq!(unsafe { glyph_thread_test_latch_count_down(gate) }, 0);
+        } else {
+            assert_eq!(
+                unsafe { glyph_thread_test_latch_wait(completed, WAIT_MS) },
+                0
+            );
+            assert_eq!(unsafe { glyph_thread_detach(&mut handle) }, 0);
+        }
+        assert_eq!(
+            unsafe { glyph_thread_test_latch_wait(completed, WAIT_MS) },
+            0
+        );
+        assert_eq!(unsafe { glyph_thread_test_latch_wait(dropped, WAIT_MS) }, 0);
+        destroy_latch(gate);
+        destroy_latch(completed);
+        destroy_latch(dropped);
+    }
+}
+
+#[test]
+fn typed_join_transfers_owned_result_cleanup_to_the_joiner() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let completed = latch(1);
+    let dropped = latch(1);
+    let mut handle = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            glyph_thread_spawn_result(
+                &mut handle,
+                Some(write_owned_result),
+                ptr::null_mut(),
+                typed_worker_env(ptr::null_mut(), completed, dropped),
+                Some(drop_typed_unstarted),
+                std::mem::size_of::<OwnedResult>(),
+                Some(drop_owned_result),
+            )
+        },
+        0
+    );
+    let mut result = std::mem::MaybeUninit::<OwnedResult>::uninit();
+    assert_eq!(
+        unsafe { glyph_thread_join_result(&mut handle, result.as_mut_ptr().cast()) },
+        0
+    );
+    let mut result = unsafe { result.assume_init() };
+    assert!(!result.allocation.is_null());
+    assert_eq!(
+        unsafe { glyph_thread_test_latch_wait(dropped, 1) },
+        -libc::ETIMEDOUT,
+        "the runtime must relinquish result ownership after join"
+    );
+    unsafe { drop_owned_result((&mut result as *mut OwnedResult).cast()) };
+    assert_eq!(unsafe { glyph_thread_test_latch_wait(dropped, WAIT_MS) }, 0);
+    destroy_latch(completed);
+    destroy_latch(dropped);
+}
+
+#[test]
+fn typed_spawn_failure_drops_only_the_unstarted_task() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    FAILURE_DROPS.store(0, Ordering::SeqCst);
+    let completed = latch(1);
+    let dropped = latch(1);
+    let mut handle = ptr::null_mut();
+    assert_eq!(
+        unsafe { glyph_thread_test_fail_next(TEST_FAIL_CREATE, libc::EAGAIN) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            glyph_thread_spawn_result(
+                &mut handle,
+                Some(write_owned_result),
+                ptr::null_mut(),
+                typed_worker_env(ptr::null_mut(), completed, dropped),
+                Some(drop_typed_unstarted),
+                std::mem::size_of::<OwnedResult>(),
+                Some(drop_owned_result),
+            )
+        },
+        -libc::EAGAIN
+    );
+    assert!(handle.is_null());
+    assert_eq!(FAILURE_DROPS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        unsafe { glyph_thread_test_latch_wait(dropped, 1) },
+        -libc::ETIMEDOUT,
+        "an uninitialized result must never run result drop glue"
+    );
+    destroy_latch(completed);
+    destroy_latch(dropped);
 }
 
 #[cfg(feature = "codegen")]

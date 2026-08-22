@@ -2,6 +2,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic::AtomicScalar;
 
+/// Canonical compiler identity for the thread-safe reference-counted owner.
+/// Aliases and qualified source paths must resolve to this constructor before
+/// MIR is emitted; arbitrary user structs named `Arc` are not accepted by the
+/// backend through nominal/source-name matching.
+pub const ARC_TYPE_CONSTRUCTOR: &str = "std::sync::Arc";
+/// Canonical compiler identities for exclusive shared mutation and its
+/// lexical, nonescaping lock token.
+pub const MUTEX_TYPE_CONSTRUCTOR: &str = "std::sync::Mutex";
+pub const MUTEX_GUARD_TYPE_CONSTRUCTOR: &str = "std::sync::MutexGuard";
+/// Canonical compiler identities for the two unique endpoints of a bounded
+/// single-producer/single-consumer ring. These are deliberately distinct
+/// nominal applications even though both lower to a pointer to the same
+/// compiler-owned allocation.
+pub const SPSC_SENDER_TYPE_CONSTRUCTOR: &str = "std::sync::spsc::Sender";
+pub const SPSC_RECEIVER_TYPE_CONSTRUCTOR: &str = "std::sync::spsc::Receiver";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Mutability {
     Immutable,
@@ -52,6 +68,108 @@ pub enum Type {
 }
 
 impl Type {
+    pub fn arc(inner: Type) -> Self {
+        Type::App {
+            base: ARC_TYPE_CONSTRUCTOR.to_string(),
+            args: vec![inner],
+        }
+    }
+
+    pub fn arc_inner_type(&self) -> Option<&Type> {
+        match self {
+            Type::App { base, args } if base == ARC_TYPE_CONSTRUCTOR && args.len() == 1 => {
+                args.first()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_arc(&self) -> bool {
+        self.arc_inner_type().is_some()
+    }
+
+    pub fn mutex(inner: Type) -> Self {
+        Type::App {
+            base: MUTEX_TYPE_CONSTRUCTOR.to_string(),
+            args: vec![inner],
+        }
+    }
+
+    pub fn mutex_guard(inner: Type) -> Self {
+        Type::App {
+            base: MUTEX_GUARD_TYPE_CONSTRUCTOR.to_string(),
+            args: vec![inner],
+        }
+    }
+
+    pub fn mutex_inner_type(&self) -> Option<&Type> {
+        match self {
+            Type::App { base, args } if base == MUTEX_TYPE_CONSTRUCTOR && args.len() == 1 => {
+                args.first()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn mutex_guard_inner_type(&self) -> Option<&Type> {
+        match self {
+            Type::App { base, args } if base == MUTEX_GUARD_TYPE_CONSTRUCTOR && args.len() == 1 => {
+                args.first()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_mutex(&self) -> bool {
+        self.mutex_inner_type().is_some()
+    }
+
+    pub fn is_mutex_guard(&self) -> bool {
+        self.mutex_guard_inner_type().is_some()
+    }
+
+    pub fn spsc_sender(inner: Type) -> Self {
+        Type::App {
+            base: SPSC_SENDER_TYPE_CONSTRUCTOR.to_string(),
+            args: vec![inner],
+        }
+    }
+
+    pub fn spsc_receiver(inner: Type) -> Self {
+        Type::App {
+            base: SPSC_RECEIVER_TYPE_CONSTRUCTOR.to_string(),
+            args: vec![inner],
+        }
+    }
+
+    pub fn spsc_sender_inner_type(&self) -> Option<&Type> {
+        match self {
+            Type::App { base, args } if base == SPSC_SENDER_TYPE_CONSTRUCTOR && args.len() == 1 => {
+                args.first()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn spsc_receiver_inner_type(&self) -> Option<&Type> {
+        match self {
+            Type::App { base, args }
+                if base == SPSC_RECEIVER_TYPE_CONSTRUCTOR && args.len() == 1 =>
+            {
+                args.first()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_spsc_sender(&self) -> bool {
+        self.spsc_sender_inner_type().is_some()
+    }
+
+    pub fn is_spsc_receiver(&self) -> bool {
+        self.spsc_receiver_inner_type().is_some()
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "i8" => Some(Type::I8),
@@ -181,6 +299,78 @@ impl Type {
             Type::Function { params, ret } => Some((params, ret)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arc_uses_one_canonical_type_application() {
+        let arc = Type::arc(Type::String);
+        assert!(arc.is_arc());
+        assert_eq!(arc.arc_inner_type(), Some(&Type::String));
+        assert!(
+            !Type::App {
+                base: "Arc".into(),
+                args: vec![Type::String],
+            }
+            .is_arc()
+        );
+        assert!(
+            !Type::App {
+                base: "user::Arc".into(),
+                args: vec![Type::String],
+            }
+            .is_arc()
+        );
+        assert!(
+            !Type::App {
+                base: ARC_TYPE_CONSTRUCTOR.into(),
+                args: vec![Type::I32, Type::I32],
+            }
+            .is_arc()
+        );
+    }
+
+    #[test]
+    fn mutex_and_guard_require_canonical_single_argument_applications() {
+        let mutex = Type::mutex(Type::I32);
+        let guard = Type::mutex_guard(Type::I32);
+        assert_eq!(mutex.mutex_inner_type(), Some(&Type::I32));
+        assert_eq!(guard.mutex_guard_inner_type(), Some(&Type::I32));
+        assert!(
+            !Type::App {
+                base: "Mutex".into(),
+                args: vec![Type::I32]
+            }
+            .is_mutex()
+        );
+        assert!(
+            !Type::App {
+                base: MUTEX_GUARD_TYPE_CONSTRUCTOR.into(),
+                args: vec![Type::I32, Type::I32],
+            }
+            .is_mutex_guard()
+        );
+    }
+
+    #[test]
+    fn spsc_endpoints_are_distinct_canonical_single_argument_applications() {
+        let sender = Type::spsc_sender(Type::String);
+        let receiver = Type::spsc_receiver(Type::String);
+        assert_eq!(sender.spsc_sender_inner_type(), Some(&Type::String));
+        assert_eq!(receiver.spsc_receiver_inner_type(), Some(&Type::String));
+        assert!(!sender.is_spsc_receiver());
+        assert!(!receiver.is_spsc_sender());
+        assert!(
+            !Type::App {
+                base: "Sender".into(),
+                args: vec![Type::String],
+            }
+            .is_spsc_sender()
+        );
     }
 }
 

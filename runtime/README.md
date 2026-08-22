@@ -2,6 +2,55 @@
 
 This directory contains the C runtime library that provides low-level formatting and I/O support for Glyph programs.
 
+## Callable ABI Boundary
+
+Owned `FnOnce` values use a compiler-internal three-pointer representation:
+an opaque environment pointer, an invoke-thunk pointer, and a drop-thunk
+pointer. Capturing closures may allocate their environment; compiler-generated
+invoke/drop thunks own its destruction. This is not a C ABI, and callable
+values must not be passed directly through `extern "C"`.
+
+Closure construction, invocation, and destruction may allocate, free, or run
+arbitrary capture drop glue. None of those operations is guaranteed safe in a
+hard real-time audio callback. The existing C device callback remains the
+real-time boundary; construct and use Glyph closures on control/worker threads.
+
+The authoritative representation, ownership, thread-safety, and audio-boundary
+contract is documented in
+[`docs/plan/CLOSURES_CONCURRENCY.md`](../docs/plan/CLOSURES_CONCURRENCY.md).
+
+## Native Thread Result Ownership
+
+`glyph_thread_spawn_result` stores a concrete return value in opaque runtime
+state. Compiler-generated adapters normalize scalar and sret call ABIs; a
+successful `glyph_thread_join_result` moves the bytes into caller-owned
+uninitialized storage exactly once. Detach, including implicit handle-drop,
+keeps the result runtime-owned and runs its compiler-generated drop thunk when
+the worker and handle references are both gone. A failed OS join leaves the
+handle and result intact for retry.
+
+Normal language-level destruction is not guaranteed after process shutdown
+begins. Programs that depend on result destructors for flushing or other
+observable effects must join their workers before returning from `main`.
+Detached workers must also finish before a JIT execution engine is destroyed,
+because their generated entry and drop thunks belong to that engine.
+
+## Mutex Runtime Boundary
+
+`glyph_mutex_create`, `glyph_mutex_lock`, `glyph_mutex_try_lock`,
+`glyph_mutex_unlock`, and `glyph_mutex_destroy` own an opaque, heap-stable
+native mutex. The compiler separately owns the typed payload and emits its drop
+glue, so `pthread_mutex_t` layout never becomes part of Glyph ABI.
+
+`try_lock` returns `1` for ordinary contention, `0` for acquisition, and a
+negative errno-style value for actual failures. Destroying a locked mutex
+fails without consuming its pointer. Compiler-generated guard drop clears its
+owned slot before unlocking, guaranteeing at most one unlock.
+
+These calls are worker/control synchronization. They may block or enter the OS
+and are prohibited on the hard real-time audio callback path. `Arc<Mutex<T>>`
+has the same restriction; final release may also destroy `T` and free memory.
+
 ## Overview
 
 The Glyph compiler generates LLVM IR that references external C functions for certain operations. This runtime library provides implementations of those functions.

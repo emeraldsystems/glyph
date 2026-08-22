@@ -21,6 +21,57 @@ fn is_void_type(ty: &Type) -> bool {
     matches!(ty, Type::Void) || matches!(ty, Type::Tuple(elem_types) if elem_types.is_empty())
 }
 
+fn type_contains_borrow(
+    ty: &Type,
+    resolver: &ResolverContext,
+    visiting: &mut std::collections::HashSet<String>,
+) -> bool {
+    match ty {
+        Type::Ref(_, _) => true,
+        Type::Array(inner, _) | Type::Own(inner) | Type::RawPtr(inner) | Type::Shared(inner) => {
+            type_contains_borrow(inner, resolver, visiting)
+        }
+        Type::App { args, .. } | Type::Tuple(args) => args
+            .iter()
+            .any(|arg| type_contains_borrow(arg, resolver, visiting)),
+        Type::Function { params, ret } => {
+            params
+                .iter()
+                .any(|param| type_contains_borrow(param, resolver, visiting))
+                || type_contains_borrow(ret, resolver, visiting)
+        }
+        Type::Named(name) => {
+            if !visiting.insert(name.clone()) {
+                return false;
+            }
+            let borrowed = resolver.struct_types.get(name).is_some_and(|layout| {
+                layout
+                    .fields
+                    .iter()
+                    .any(|(_, field)| type_contains_borrow(field, resolver, visiting))
+            });
+            visiting.remove(name);
+            borrowed
+        }
+        Type::Enum(name) => {
+            if !visiting.insert(name.clone()) {
+                return false;
+            }
+            let borrowed = resolver.enum_types.get(name).is_some_and(|layout| {
+                layout.variants.iter().any(|variant| {
+                    variant
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| type_contains_borrow(payload, resolver, visiting))
+                })
+            });
+            visiting.remove(name);
+            borrowed
+        }
+        _ => false,
+    }
+}
+
 /// Lowering failures must never be silent: if an expression failed to lower
 /// and nothing was reported along the way, emit a diagnostic instead of
 /// letting the statement quietly become a Nop (the pattern that let float
@@ -82,6 +133,24 @@ pub(crate) fn lower_function(
 
     let mut ctx = LowerCtx::new(resolver, module, fn_sigs, func.name.0.clone());
     ctx.fn_ret_type = ret_type.clone();
+    if ret_type
+        .as_ref()
+        .is_some_and(|ty| type_contains_borrow(ty, resolver, &mut std::collections::HashSet::new()))
+    {
+        ctx.error(
+            "borrowed references cannot escape through return; return owned data instead",
+            func.ret_type.as_ref().map(|ret| ret.span()),
+        );
+    }
+    if ret_type
+        .as_ref()
+        .is_some_and(LowerCtx::type_contains_mutex_guard)
+    {
+        ctx.error(
+            "MutexGuard cannot escape through a function return type",
+            func.ret_type.as_ref().map(|ret| ret.span()),
+        );
+    }
     let closure_analysis = analyze_function_closure_ownership(func, resolver);
     let closure_analysis_failed = closure_analysis
         .diagnostics
@@ -552,6 +621,7 @@ pub(crate) fn lower_block_with_expected<'a>(
                         );
                     }
                 }
+                ctx.reject_mutex_guard_return(value.as_ref(), *ret_span);
                 if let Some(MirValue::Local(local)) = value.as_ref() {
                     if let Some(state) = ctx.local_states.get_mut(local.0 as usize) {
                         *state = LocalState::Moved;
@@ -756,6 +826,8 @@ pub(crate) fn lower_block_with_expected<'a>(
 
     if move_returned_local {
         if let Some(MirValue::Local(local)) = last_value {
+            ctx.reject_arc_loan_scope_escape(local);
+            ctx.reject_mutex_guard_return(Some(&MirValue::Local(local)), block.span);
             if let Some(state) = ctx.local_states.get_mut(local.0 as usize) {
                 *state = LocalState::Moved;
             }

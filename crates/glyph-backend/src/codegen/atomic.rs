@@ -178,10 +178,20 @@ impl CodegenContext {
         func: &MirFunction,
         local_map: &HashMap<LocalId, LLVMValueRef>,
     ) -> Result<LLVMValueRef> {
+        let ptr = self.atomic_pointer(atomic, scalar, func, local_map)?;
+        self.build_atomic_load_value(ptr, scalar, ordering)
+    }
+
+    /// Shared load primitive for compiler-owned synchronization structures.
+    pub(super) fn build_atomic_load_value(
+        &mut self,
+        ptr: LLVMValueRef,
+        scalar: AtomicScalar,
+        ordering: AtomicOrdering,
+    ) -> Result<LLVMValueRef> {
         if !ordering.valid_for_load() {
             bail!("invalid {:?} ordering for atomic load", ordering);
         }
-        let ptr = self.atomic_pointer(atomic, scalar, func, local_map)?;
         let storage_ty = self.atomic_storage_type(scalar)?;
         let load = unsafe {
             LLVMBuildLoad2(
@@ -207,17 +217,31 @@ impl CodegenContext {
         func: &MirFunction,
         local_map: &HashMap<LocalId, LLVMValueRef>,
     ) -> Result<LLVMValueRef> {
+        let ptr = self.atomic_pointer(atomic, scalar, func, local_map)?;
+        let value = self.atomic_operand(value, scalar, func, local_map)?;
+        self.build_atomic_store_value(ptr, value, scalar, ordering)?;
+        Ok(unsafe { LLVMConstInt(LLVMInt32TypeInContext(self.context), 0, 0) })
+    }
+
+    /// Shared store primitive for compiler-owned synchronization structures.
+    pub(super) fn build_atomic_store_value(
+        &mut self,
+        ptr: LLVMValueRef,
+        value: LLVMValueRef,
+        scalar: AtomicScalar,
+        ordering: AtomicOrdering,
+    ) -> Result<()> {
         if !ordering.valid_for_store() {
             bail!("invalid {:?} ordering for atomic store", ordering);
         }
-        let ptr = self.atomic_pointer(atomic, scalar, func, local_map)?;
-        let value = self.atomic_operand(value, scalar, func, local_map)?;
+        let storage_ty = self.atomic_storage_type(scalar)?;
+        let value = self.coerce_int_value(value, storage_ty, Self::scalar_is_signed(scalar));
         let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
         unsafe {
             LLVMSetOrdering(store, Self::llvm_atomic_ordering(ordering));
             LLVMSetAlignment(store, self.atomic_alignment(scalar)?);
         }
-        Ok(unsafe { LLVMConstInt(LLVMInt32TypeInContext(self.context), 0, 0) })
+        Ok(())
     }
 
     pub(super) fn codegen_atomic_rmw(
@@ -230,11 +254,32 @@ impl CodegenContext {
         func: &MirFunction,
         local_map: &HashMap<LocalId, LLVMValueRef>,
     ) -> Result<LLVMValueRef> {
+        let ptr = self.atomic_pointer(atomic, scalar, func, local_map)?;
+        let value = self.atomic_operand(value, scalar, func, local_map)?;
+        self.build_atomic_rmw_value(ptr, value, scalar, op, ordering)
+    }
+
+    /// Shared primitive for compiler-owned synchronization structures.
+    ///
+    /// Public atomic operations, `Arc<T>`, and future lock/channel glue must
+    /// all pass through this target validation and alignment path. Keeping the
+    /// primitive here prevents a compiler-owned refcount from silently using
+    /// weaker target guarantees than source-level atomics.
+    pub(super) fn build_atomic_rmw_value(
+        &mut self,
+        ptr: LLVMValueRef,
+        value: LLVMValueRef,
+        scalar: AtomicScalar,
+        op: AtomicRmwOp,
+        ordering: AtomicOrdering,
+    ) -> Result<LLVMValueRef> {
         if matches!(scalar, AtomicScalar::Bool) && !matches!(op, AtomicRmwOp::Swap) {
             bail!("AtomicBool only supports atomic swap RMW");
         }
-        let ptr = self.atomic_pointer(atomic, scalar, func, local_map)?;
-        let value = self.atomic_operand(value, scalar, func, local_map)?;
+        // Validate the target and coerce compiler-generated constants to the
+        // exact storage width before constructing the instruction.
+        let storage_ty = self.atomic_storage_type(scalar)?;
+        let value = self.coerce_int_value(value, storage_ty, Self::scalar_is_signed(scalar));
         let result = unsafe {
             LLVMBuildAtomicRMW(
                 self.builder,
@@ -292,6 +337,11 @@ impl CodegenContext {
         &mut self,
         ordering: AtomicOrdering,
     ) -> Result<LLVMValueRef> {
+        self.build_atomic_fence_value(ordering)?;
+        Ok(unsafe { LLVMConstInt(LLVMInt32TypeInContext(self.context), 0, 0) })
+    }
+
+    pub(super) fn build_atomic_fence_value(&mut self, ordering: AtomicOrdering) -> Result<()> {
         if matches!(ordering, AtomicOrdering::Relaxed) {
             bail!("an atomic fence cannot use Relaxed ordering");
         }
@@ -300,10 +350,12 @@ impl CodegenContext {
                 self.builder,
                 Self::llvm_atomic_ordering(ordering),
                 0,
-                CString::new("atomic.fence")?.as_ptr(),
+                // Fence instructions have void type and therefore cannot
+                // carry an SSA result name.
+                CString::new("")?.as_ptr(),
             );
-            Ok(LLVMConstInt(LLVMInt32TypeInContext(self.context), 0, 0))
         }
+        Ok(())
     }
 
     pub(super) fn codegen_atomic_is_lock_free(&self, scalar: AtomicScalar) -> Result<LLVMValueRef> {

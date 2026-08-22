@@ -1,0 +1,12 @@
+// Canonical compiler-owned synchronization identities.
+//
+// Arc<T> has no source-visible fields: construction, cloning, immutable
+// borrowing, and destruction are compiler intrinsics backed by one atomic
+// strong-count allocation. A same-named user struct never receives this ABI.
+
+struct Arc<T> {}
+
+// Mutex<T> and MutexGuard<T> are also fieldless source identities. Their
+// storage, locking, and destruction are compiler/runtime intrinsics.
+struct Mutex<T> {}
+struct MutexGuard<T> {}

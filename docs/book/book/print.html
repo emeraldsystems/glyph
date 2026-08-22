@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-33d7d0e9.js";
+            window.path_to_searchindex_js = "searchindex-49ba643b.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-24673502.js"></script>
+        <script src="toc-ee24a55e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -567,6 +567,164 @@ fn main() -&gt; i32 {
 }
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="owned-closures-and-callable-values"><a class="header" href="#owned-closures-and-callable-values">Owned Closures and Callable Values</a></h1>
+<p>Glyph’s first callable-value model is deliberately small: every closure is an
+owned, move-only <code>FnOnce</code> value. It can be stored, passed, or returned, and it
+can be invoked exactly once.</p>
+<p>The normative language and ABI contract is
+<a href="https://github.com/emeraldsystems/glyph/blob/master/docs/plan/CLOSURES_CONCURRENCY.md">Closures and Concurrency v0</a>.
+This chapter is the user guide; if another historical planning page disagrees,
+the v0 contract is authoritative.</p>
+<h2 id="arrow-syntax"><a class="header" href="#arrow-syntax">Arrow Syntax</a></h2>
+<p>Closure parameters appear to the left of <code>-&gt;</code>. Zero and multiple parameters
+require parentheses; a single parameter does not.</p>
+<pre><code class="language-glyph">let zero: FnOnce&lt;(), i32&gt; = () -&gt; 42
+let one: FnOnce&lt;i32, i32&gt; = value -&gt; value + 1
+let many: FnOnce&lt;(i32, i32), i32&gt; = (left, right) -&gt; left + right
+</code></pre>
+<p>The body can be an expression or a value-producing block:</p>
+<pre><code class="language-glyph">let add: FnOnce&lt;(i32, i32), i32&gt; = (left, right) -&gt; {
+  left + right
+}
+</code></pre>
+<p>Parameter annotations are optional when an expected <code>FnOnce</code> type supplies
+them. Otherwise, annotate the parameter:</p>
+<pre><code class="language-glyph">let contextual: FnOnce&lt;i32, i32&gt; = value -&gt; value + 1
+let explicit = (value: i32) -&gt; value + 1
+</code></pre>
+<p><code>-&gt;</code> is right-associative, so a nested callback can be written as follows:</p>
+<pre><code class="language-glyph">let nested: FnOnce&lt;i32, FnOnce&lt;i32, i32&gt;&gt; =
+  (left: i32) -&gt; (right: i32) -&gt; left + right
+</code></pre>
+<p>For this release, bind a closure before calling it. Immediate invocation such
+as <code>((value: i32) -&gt; value + 1)(41)</code> is not yet supported.</p>
+<h2 id="the-fnonce-type"><a class="header" href="#the-fnonce-type">The <code>FnOnce</code> Type</a></h2>
+<p><code>FnOnce&lt;Args, Return&gt;</code> always has exactly two type arguments. <code>Args</code> encodes
+arity:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameters</th><th>Callable type</th></tr>
+</thead>
+<tbody>
+<tr><td>none</td><td><code>FnOnce&lt;(), R&gt;</code></td></tr>
+<tr><td>one <code>i32</code></td><td><code>FnOnce&lt;i32, R&gt;</code></td></tr>
+<tr><td>two <code>i32</code>s</td><td><code>FnOnce&lt;(i32, i32), R&gt;</code></td></tr>
+<tr><td>one tuple</td><td><code>FnOnce&lt;((i32, i32),), R&gt;</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The extra one-element tuple in the last row distinguishes one tuple parameter
+from two scalar parameters.</p>
+<p>Calling a callable consumes it:</p>
+<pre><code class="language-glyph">let answer: FnOnce&lt;(), i32&gt; = () -&gt; 42
+let first = answer()
+// answer()  // error: use of moved value `answer`
+</code></pre>
+<p>Named functions coerce to compatible <code>FnOnce</code> values. Each reference to the
+function creates a fresh environment-free callable, so the function itself is
+still reusable.</p>
+<pre><code class="language-glyph">fn increment(value: i32) -&gt; i32 { ret value + 1 }
+
+fn apply(callback: FnOnce&lt;i32, i32&gt;, value: i32) -&gt; i32 {
+  ret callback(value)
+}
+
+fn main() -&gt; i32 {
+  ret apply(increment, 41)
+}
+</code></pre>
+<p>One-shot callbacks fit operations that invoke the callback once. A conventional
+iterator that repeatedly invokes the same callback requires the deferred
+borrowed <code>Fn</code> or <code>FnMut</code> capabilities.</p>
+<h2 id="captures-and-move"><a class="header" href="#captures-and-move">Captures and <code>move</code></a></h2>
+<p>A closure owns a self-contained environment. Copy values are copied; owned
+values such as <code>String</code> move into it. The <code>move</code> keyword makes that transfer
+explicit and is the recommended spelling when returning a closure or sending
+one to another thread.</p>
+<pre><code class="language-glyph">fn make_adder(offset: i32) -&gt; FnOnce&lt;i32, i32&gt; {
+  ret move value -&gt; offset + value
+}
+</code></pre>
+<p>After an owned capture moves into a closure, its old binding cannot be used:</p>
+<pre><code class="language-glyph">let message: String = String::from_str("hello")
+let length: FnOnce&lt;(), usize&gt; = move () -&gt; message.len()
+// message.len()  // error: `message` moved into the closure
+</code></pre>
+<p>Nested closures carry transitive captures, and an uncalled closure drops its
+owned captures when the closure itself leaves scope.</p>
+<p>Borrowed captures (<code>&amp;T</code>, <code>&amp;mut T</code>, and runtime <code>str</code> views) cannot escape in
+this release. Convert data to an owned value before returning, storing, or
+passing the closure. Recursive closure cycles are also rejected. These rules
+keep the environment valid without a general lifetime/loan system.</p>
+<h2 id="storing-passing-and-returning"><a class="header" href="#storing-passing-and-returning">Storing, Passing, and Returning</a></h2>
+<p>Callable values use ordinary move semantics:</p>
+<pre><code class="language-glyph">fn apply(callback: FnOnce&lt;i32, i32&gt;, value: i32) -&gt; i32 {
+  ret callback(value)
+}
+
+fn make_offset(offset: i32) -&gt; FnOnce&lt;i32, i32&gt; {
+  ret move value -&gt; offset + value
+}
+
+fn main() -&gt; i32 {
+  let stored = make_offset(40)
+  ret apply(stored, 2)
+}
+</code></pre>
+<p>Moving <code>stored</code> into <code>apply</code> consumes the local. A callable’s argument count
+and types must exactly match its <code>FnOnce</code> signature. Calling a scalar or other
+non-callable value is a compile error.</p>
+<h2 id="allocation-ffi-and-audio-code"><a class="header" href="#allocation-ffi-and-audio-code">Allocation, FFI, and Audio Code</a></h2>
+<p>A capturing closure may allocate its environment on the heap. Invocation and
+drop may release that storage and run capture destructors. Callable values are
+therefore not safe to create, invoke, or destroy in a hard real-time audio
+callback.</p>
+<p>Construct callbacks on a control or worker thread and keep Glyph code outside
+the device callback. <code>FnOnce</code> values use a Glyph-internal ABI and cannot be
+passed directly through <code>extern "C"</code>; use a purpose-built C trampoline and
+state protocol at an FFI boundary.</p>
+<p>See the runnable
+<a href="https://github.com/emeraldsystems/glyph/tree/master/examples/closures">owned closure example</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="threads-and-shared-state"><a class="header" href="#threads-and-shared-state">Threads and Shared State</a></h1>
+<p>Glyph’s first concurrency surface uses owned <code>FnOnce</code> tasks, native join
+handles, atomic scalars, <code>Arc&lt;T&gt;</code>, and <code>Mutex&lt;T&gt;</code>. These are intended for
+control and worker threads.</p>
+<pre><code class="language-glyph">import Arc from std/sync
+import Mutex from std/sync
+import spawn from std/thread
+
+let state = Arc::new(Mutex::new(AtomicI32::new(0)))
+let worker_state = state.clone()
+let task: FnOnce&lt;(), ()&gt; = move () -&gt; {
+  let mutex = worker_state.borrow()
+  let guard = mutex.lock()
+  let value = guard.borrow_mut()
+  let previous = value.fetch_add(1)
+}
+let outcome = spawn(task)
+</code></pre>
+<p><code>Arc&lt;T&gt;</code> provides atomic shared ownership but only immutable access.
+<code>Arc&lt;Mutex&lt;T&gt;&gt;</code> is the standard way to share mutable worker state. <code>Mutex&lt;T&gt;</code>
+is <code>Send + Sync</code> only when <code>T</code> is <code>Send</code>.</p>
+<p><code>lock()</code> blocks and returns a move-only <code>MutexGuard&lt;T&gt;</code>. <code>try_lock()</code> returns
+<code>Option&lt;MutexGuard&lt;T&gt;&gt;</code> without blocking. A guard supplies exclusive mutable
+access through <code>borrow_mut()</code> and unlocks exactly once when its lexical scope
+ends, including <code>ret</code>, <code>?</code>, <code>break</code>, and <code>cont</code> exits.</p>
+<p>The initial loan checker is intentionally conservative. A guard cannot be
+returned, captured, sent to another thread, or stored in a struct, tuple,
+array, enum, or collection. The locked <code>Mutex</code> cannot move or be dropped while
+the guard is live. Use a nested block to make the unlock point explicit.</p>
+<p>Mutexes are non-reentrant and fairness is unspecified. Glyph does not poison a
+mutex because it has no catchable unwind model.</p>
+<h2 id="hard-real-time-boundary"><a class="header" href="#hard-real-time-boundary">Hard real-time boundary</a></h2>
+<p>Do not use <code>Mutex</code>, <code>Arc</code>, thread creation/join, or closure allocation and drop
+on an audio render/device callback. Mutex operations may block in the kernel;
+Arc destruction and callable cleanup may free memory or run arbitrary drop
+glue. Prepare immutable state on a control thread and communicate with the
+callback through the sequencer’s dedicated bounded real-time protocol.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="imports-1"><a class="header" href="#imports-1">Imports</a></h1>
 <p>Glyph uses file-based modules. Each <code>.glyph</code> file is a module, and you import
 modules by their path relative to the entry file’s directory.</p>
@@ -782,6 +940,40 @@ handle to the same allocation.</p>
 </code></pre>
 <p>Dropping each cloned handle decrements the reference count. The allocation is
 freed when the final handle is dropped.</p>
+<p><code>Shared&lt;T&gt;</code> is intentionally single-threaded. It cannot be captured by a task
+passed to <code>spawn</code>, including when it is nested inside another struct.</p>
+<h2 id="arct"><a class="header" href="#arct"><code>Arc&lt;T&gt;</code></a></h2>
+<p><code>Arc&lt;T&gt;</code> provides atomic shared ownership for immutable data that must cross a
+thread boundary. Import it from <code>std/sync</code>, move one clone into each task, and
+keep another clone when the spawning thread still needs access:</p>
+<pre><code class="language-glyph">import Arc from std/sync
+import spawn from std/thread
+
+fn main() -&gt; i32 {
+  let counter = Arc::new(AtomicI32::new(0))
+  let worker_counter = counter.clone()
+  let task: FnOnce&lt;(), ()&gt; = move () -&gt; {
+    let atomic = worker_counter.borrow()
+    let previous = atomic.fetch_add(1)
+  }
+  let outcome = spawn(task)
+  ret 0
+}
+</code></pre>
+<p><code>Arc&lt;T&gt;</code> supports <code>new</code>, explicit <code>clone</code>, and immutable <code>borrow</code>. It is safe to
+transfer only when <code>T</code> and every nested field are both thread-transferable and
+safe to share; references, raw pointers, and <code>Shared&lt;T&gt;</code> therefore cannot be
+smuggled into a worker through an <code>Arc</code>.</p>
+<p>An <code>Arc::borrow()</code> view is tied to the exact owner local for the rest of its
+lexical scope. The owner cannot be moved or reassigned until that scope ends.
+For v1, these views must remain direct local bindings: storing one in an
+aggregate, collection, heap owner, enum, or closure is rejected. Use a smaller
+nested block to end a view before moving its owner, or clone the <code>Arc</code> and move
+the clone when ownership must cross a boundary.</p>
+<p>The v1 API has no weak handles, mutable access, or raw conversions. Reference
+cycles leak by design. Allocation and final destruction are not real-time safe,
+and clone/drop are not promised to be wait-free or safe in an audio callback;
+prepare immutable assets and configuration outside the real-time path.</p>
 <h2 id="rawptrt"><a class="header" href="#rawptrt"><code>RawPtr&lt;T&gt;</code></a></h2>
 <p><code>RawPtr&lt;T&gt;</code> is an unsafe, opaque pointer type primarily used for FFI boundaries.
 You can obtain one from <code>Own&lt;T&gt;::into_raw()</code>.</p>
@@ -918,22 +1110,6 @@ fn main() -&gt; i32 {
         <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
         <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
 
-        <!-- Livereload script (if served using the cli tool) -->
-        <script>
-            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
-            const socket = new WebSocket(wsAddress);
-            socket.onmessage = function (event) {
-                if (event.data === "reload") {
-                    socket.close();
-                    location.reload();
-                }
-            };
-
-            window.onbeforeunload = function() {
-                socket.close();
-            }
-        </script>
 
 
         <script>

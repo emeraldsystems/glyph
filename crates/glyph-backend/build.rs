@@ -13,6 +13,7 @@ const RUNTIME_SOURCES: &[&str] = &[
     "glyph_net",
     "glyph_audio",
     "glyph_thread",
+    "glyph_mutex",
 ];
 
 fn main() {
@@ -38,10 +39,12 @@ fn main() {
             "-fPIC", // Position-independent code for shared libraries
             "-Wall", // Enable warnings
         ]);
-        if name == &"glyph_thread" {
+        if matches!(*name, "glyph_thread" | "glyph_mutex") {
             if matches!(target_os.as_str(), "macos" | "linux") {
                 cc.arg("-pthread");
             }
+        }
+        if name == &"glyph_thread" {
             if profile != "release" {
                 cc.arg("-DGLYPH_THREAD_ENABLE_TEST_HOOKS=1");
             }
@@ -63,6 +66,8 @@ fn main() {
         println!("cargo:rerun-if-changed=../../runtime/{}.c", name);
         if name == &"glyph_thread" {
             println!("cargo:rerun-if-changed=../../runtime/glyph_thread.h");
+        } else if name == &"glyph_mutex" {
+            println!("cargo:rerun-if-changed=../../runtime/glyph_mutex.h");
         }
         objects.push(obj);
     }

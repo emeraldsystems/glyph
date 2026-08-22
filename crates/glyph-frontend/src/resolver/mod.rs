@@ -126,6 +126,23 @@ pub fn resolve_type_expr_to_type(ty: &TypeExpr, ctx: &ResolverContext) -> Option
                 return Some(Type::Enum(ty_str));
             }
             if ctx.struct_types.contains_key(&ty_str) {
+                if let Some(ResolvedSymbol::Struct(module, symbol)) = ctx.resolve_symbol(&ty_str) {
+                    let audited_runtime_type = matches!(
+                        (module.as_str(), symbol.as_str()),
+                        ("std/thread", "JoinHandle" | "ThreadError")
+                            | ("std/sync", "Arc" | "Mutex" | "MutexGuard")
+                            | ("std/io", "Stdout" | "File")
+                            | ("std/net", "TcpStream" | "TcpListener" | "UdpSocket")
+                            | ("std/term", "Terminal" | "UiSessionGuard")
+                            | ("std/audio", "WavWriter" | "AudioOut")
+                    );
+                    if audited_runtime_type {
+                        return Some(Type::Named(format!(
+                            "{}::{symbol}",
+                            module.replace('/', "::")
+                        )));
+                    }
+                }
                 return Some(Type::Named(ty_str));
             }
             Some(Type::Named(ty_str))
@@ -143,6 +160,17 @@ pub fn resolve_type_expr_to_type(ty: &TypeExpr, ctx: &ResolverContext) -> Option
             }
 
             if let Type::Named(name) = &base_ty {
+                if name == glyph_core::types::ARC_TYPE_CONSTRUCTOR && rendered_args.len() == 1 {
+                    return Some(Type::arc(rendered_args[0].clone()));
+                }
+                if name == glyph_core::types::MUTEX_TYPE_CONSTRUCTOR && rendered_args.len() == 1 {
+                    return Some(Type::mutex(rendered_args[0].clone()));
+                }
+                if name == glyph_core::types::MUTEX_GUARD_TYPE_CONSTRUCTOR
+                    && rendered_args.len() == 1
+                {
+                    return Some(Type::mutex_guard(rendered_args[0].clone()));
+                }
                 if name == "RawPtr" && rendered_args.len() == 1 {
                     return Some(Type::RawPtr(Box::new(rendered_args[0].clone())));
                 }
@@ -715,7 +743,9 @@ pub(super) fn resolve_ffi_type(name: &str) -> Option<Type> {
 impl ResolverContext {
     /// Look up a struct type by name
     pub fn get_struct(&self, name: &str) -> Option<&StructType> {
-        self.struct_types.get(name)
+        canonical_runtime_struct_leaf(name)
+            .and_then(|leaf| self.struct_types.get(leaf))
+            .or_else(|| self.struct_types.get(name))
     }
 
     pub fn get_enum(&self, name: &str) -> Option<&EnumType> {
@@ -750,7 +780,10 @@ impl ResolverContext {
     /// Look up inherent method by struct type and method name
     /// Returns mangled function name and method info
     pub fn get_inherent_method(&self, struct_name: &str, method_name: &str) -> Option<&MethodInfo> {
-        self.inherent_methods.get(struct_name)?.get(method_name)
+        canonical_runtime_struct_leaf(struct_name)
+            .and_then(|leaf| self.inherent_methods.get(leaf))
+            .or_else(|| self.inherent_methods.get(struct_name))?
+            .get(method_name)
     }
 
     /// Resolve a symbol name (handles qualified names and imports)
@@ -869,6 +902,22 @@ impl ResolverContext {
     }
 }
 
+fn canonical_runtime_struct_leaf(name: &str) -> Option<&str> {
+    matches!(
+        name,
+        "std::io::Stdout"
+            | "std::io::File"
+            | "std::net::TcpStream"
+            | "std::net::TcpListener"
+            | "std::net::UdpSocket"
+            | "std::term::Terminal"
+            | "std::term::UiSessionGuard"
+            | "std::audio::WavWriter"
+            | "std::audio::AudioOut"
+    )
+    .then(|| name.rsplit("::").next().expect("canonical name has a leaf"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +938,45 @@ mod tests {
             segments: vec![name.to_string()],
             span: make_span(),
         }
+    }
+
+    #[test]
+    fn canonical_runtime_struct_uses_populated_leaf_layout_and_methods() {
+        let mut ctx = ResolverContext::default();
+        ctx.struct_types.insert(
+            "WavWriter".into(),
+            StructType {
+                name: "WavWriter".into(),
+                fields: vec![("fd".into(), Type::I32)],
+            },
+        );
+        ctx.struct_types.insert(
+            "std::audio::WavWriter".into(),
+            StructType {
+                name: "std::audio::WavWriter".into(),
+                fields: Vec::new(),
+            },
+        );
+        ctx.inherent_methods.insert(
+            "WavWriter".into(),
+            HashMap::from([(
+                "write".into(),
+                MethodInfo {
+                    function_name: "WavWriter__write".into(),
+                    self_kind: SelfKind::MutRef,
+                },
+            )]),
+        );
+
+        assert_eq!(
+            ctx.get_field("std::audio::WavWriter", "fd"),
+            Some((Type::I32, 0))
+        );
+        assert_eq!(
+            ctx.get_inherent_method("std::audio::WavWriter", "write")
+                .map(|method| method.function_name.as_str()),
+            Some("WavWriter__write")
+        );
     }
 
     #[test]

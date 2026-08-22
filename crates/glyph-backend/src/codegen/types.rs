@@ -13,6 +13,30 @@ impl CodegenContext {
             self.struct_layouts.insert(name.clone(), layout.clone());
         }
 
+        // Audited runtime resources retain resolver-issued canonical names in
+        // locals while their source declarations keep historical short layout
+        // keys. Alias only the fixed compiler-owned set; a user type with the
+        // same leaf name never acquires a canonical Type and cannot select it.
+        for (canonical, leaf) in [
+            ("std::io::Stdout", "Stdout"),
+            ("std::io::File", "File"),
+            ("std::net::TcpStream", "TcpStream"),
+            ("std::net::TcpListener", "TcpListener"),
+            ("std::net::UdpSocket", "UdpSocket"),
+            ("std::term::Terminal", "Terminal"),
+            ("std::term::UiSessionGuard", "UiSessionGuard"),
+            ("std::audio::WavWriter", "WavWriter"),
+            ("std::audio::AudioOut", "AudioOut"),
+        ] {
+            if let (Some(llvm_ty), Some(layout)) = (
+                self.struct_types.get(leaf).copied(),
+                self.struct_layouts.get(leaf).cloned(),
+            ) {
+                self.struct_types.insert(canonical.into(), llvm_ty);
+                self.struct_layouts.insert(canonical.into(), layout);
+            }
+        }
+
         for (name, layout) in &mir_module.enum_types {
             let name_c = CString::new(name.as_str())?;
             let llvm_ty = unsafe { LLVMStructCreateNamed(self.context, name_c.as_ptr()) };
@@ -244,14 +268,18 @@ impl CodegenContext {
                 Type::String => LLVMPointerType(LLVMInt8TypeInContext(self.context), 0),
                 Type::Void => LLVMVoidTypeInContext(self.context),
                 Type::Named(name) => {
-                    // Check enum_types first, then struct_types
-                    self.enum_types
-                        .get(&name)
-                        .copied()
-                        .or_else(|| self.struct_types.get(&name).copied())
-                        .ok_or_else(|| {
-                            anyhow!("unknown type {} (not found in enum or struct types)", name)
-                        })?
+                    if glyph_core::thread::is_canonical_thread_error(&Type::Named(name.clone())) {
+                        LLVMInt32TypeInContext(self.context)
+                    } else {
+                        // Check enum_types first, then struct_types
+                        self.enum_types
+                            .get(&name)
+                            .copied()
+                            .or_else(|| self.struct_types.get(&name).copied())
+                            .ok_or_else(|| {
+                                anyhow!("unknown type {} (not found in enum or struct types)", name)
+                            })?
+                    }
                 }
                 Type::Enum(name) => self.get_enum_type(&name)?,
                 Type::Ref(inner, _) => {
@@ -299,11 +327,43 @@ impl CodegenContext {
                     )
                 }
                 Type::App { base, args } => {
-                    anyhow::bail!(
-                        "generic types must be monomorphized before codegen (app: {}<{:?}>)",
-                        base,
-                        args
-                    )
+                    let application = Type::App {
+                        base: base.clone(),
+                        args: args.clone(),
+                    };
+                    if application.is_arc() {
+                        self.arc_pointer_type(
+                            application
+                                .arc_inner_type()
+                                .expect("is_arc validated one argument"),
+                        )?
+                    } else if application.is_mutex() {
+                        self.mutex_pointer_type(
+                            application
+                                .mutex_inner_type()
+                                .expect("is_mutex validated one argument"),
+                        )?
+                    } else if application.is_mutex_guard() {
+                        self.mutex_pointer_type(
+                            application
+                                .mutex_guard_inner_type()
+                                .expect("is_mutex_guard validated one argument"),
+                        )?
+                    } else if glyph_core::thread::is_canonical_thread_handle(&application) {
+                        LLVMPointerType(LLVMInt8TypeInContext(self.context), 0)
+                    } else if application.is_spsc_sender() || application.is_spsc_receiver() {
+                        let elem = application
+                            .spsc_sender_inner_type()
+                            .or_else(|| application.spsc_receiver_inner_type())
+                            .expect("SPSC endpoint validated one argument");
+                        self.spsc_pointer_type(elem)?
+                    } else {
+                        anyhow::bail!(
+                            "generic types must be monomorphized before codegen (app: {}<{:?}>)",
+                            base,
+                            args
+                        )
+                    }
                 }
             })
         }

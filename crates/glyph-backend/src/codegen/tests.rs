@@ -4,7 +4,9 @@ use glyph_core::mir::{
     MirModule, MirValue, Rvalue,
 };
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn creates_empty_module() {
@@ -498,6 +500,13 @@ fn typed_local(ty: Type) -> Local {
     }
 }
 
+static CLOSURE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn counting_closure_free(pointer: *mut c_void) {
+    CLOSURE_FREE_COUNT.fetch_add(1, Ordering::SeqCst);
+    unsafe { libc::free(pointer) };
+}
+
 #[test]
 fn jit_calls_non_capturing_function_value_with_scalar_result() {
     let signature = Type::Function {
@@ -909,7 +918,20 @@ fn jit_drops_uncalled_closure_owned_capture_exactly_once() {
     };
 
     ctx.codegen_module(&mir).unwrap();
-    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 9);
+    CLOSURE_FREE_COUNT.store(0, Ordering::SeqCst);
+    let symbols = HashMap::from([(
+        "free".to_string(),
+        counting_closure_free as *const () as u64,
+    )]);
+    assert_eq!(
+        ctx.jit_execute_i32_with_symbols("main", &symbols).unwrap(),
+        9
+    );
+    assert_eq!(
+        CLOSURE_FREE_COUNT.load(Ordering::SeqCst),
+        2,
+        "owned payload and closure environment must each be freed exactly once"
+    );
     let ir = ctx.dump_ir();
     assert!(ir.contains("closure.drop.capture.0"));
     assert!(ir.contains("callable.drop.call"));

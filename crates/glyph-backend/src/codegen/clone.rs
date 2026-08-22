@@ -175,6 +175,17 @@ impl CodegenContext {
             Type::Own(inner) => self.emit_clone_own(dst, src, inner),
             Type::Shared(inner) => self.emit_clone_shared(dst, src, inner),
             Type::Enum(name) => self.emit_clone_enum(dst, src, name),
+            ty if ty.is_mutex() || ty.is_mutex_guard() => {
+                bail!("Mutex and MutexGuard values cannot be cloned")
+            }
+            ty if ty.is_spsc_sender() || ty.is_spsc_receiver() => {
+                bail!("SPSC endpoints are unique and cannot be cloned")
+            }
+            ty if ty.is_arc() => self.emit_clone_arc(
+                dst,
+                src,
+                ty.arc_inner_type().expect("is_arc validated one argument"),
+            ),
             Type::App { base, args } if base == "Vec" => {
                 let elem = args.first().cloned().unwrap_or(Type::I32);
                 let vec_name = format!("Vec${}", Self::type_display_for_mono(&elem));

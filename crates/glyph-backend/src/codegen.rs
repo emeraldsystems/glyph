@@ -48,6 +48,7 @@ struct ClosureArtifacts {
 }
 
 mod aggregate;
+mod arc;
 mod array;
 mod atomic;
 mod callable;
@@ -63,8 +64,10 @@ mod map;
 mod map_debug;
 mod map_hash;
 mod map_layout;
+mod mutex;
 mod ownership;
 mod rvalue;
+mod spsc;
 mod string;
 mod string_ops;
 mod thread;

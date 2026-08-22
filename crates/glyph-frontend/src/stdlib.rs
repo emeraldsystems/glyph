@@ -474,6 +474,22 @@ pub fn std_modules() -> HashMap<String, Module> {
                 },
                 span,
             },
+            Import {
+                kind: ImportKind::Wildcard,
+                path: ImportPath {
+                    segments: vec!["std/thread".into()],
+                    span,
+                },
+                span,
+            },
+            Import {
+                kind: ImportKind::Wildcard,
+                path: ImportPath {
+                    segments: vec!["std/sync".into()],
+                    span,
+                },
+                span,
+            },
         ],
         items: vec![glyph_core::ast::Item::ExternFunction(std_println_extern)],
     };
@@ -576,6 +592,13 @@ pub fn std_modules() -> HashMap<String, Module> {
         ],
     };
     modules.insert("std/enums".into(), std_enums);
+
+    // std/thread contains resolver-only canonical declarations. Its callable
+    // and opaque result types are lowered by compiler intrinsics.
+    let std_thread_module = parse_std_source("std/thread", include_str!("stdlib/thread.glyph"));
+    modules.insert("std/thread".into(), std_thread_module);
+    let std_sync_module = parse_std_source("std/sync", include_str!("stdlib/sync.glyph"));
+    modules.insert("std/sync".into(), std_sync_module);
 
     // std/string
     let strdup_extern = ExternFunctionDecl {

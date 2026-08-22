@@ -236,6 +236,14 @@ fn validate_map_type_expr(
                         Some(*span),
                     ));
                 }
+                if matches!(base_name.as_str(), "Fn" | "FnMut") {
+                    diagnostics.push(Diagnostic::error(
+                        format!(
+                            "{base_name} closures are not supported in v0; use owned FnOnce<Args, Return>"
+                        ),
+                        Some(*span),
+                    ));
+                }
             }
             for arg in args {
                 validate_map_type_expr(arg, ctx, generics, module, diagnostics);

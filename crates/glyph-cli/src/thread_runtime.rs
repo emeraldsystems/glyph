@@ -6,8 +6,15 @@ struct GlyphThread {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct GlyphMutex {
+    _private: [u8; 0],
+}
+
 type GlyphThreadEntry = unsafe extern "C" fn(*mut c_void);
 type GlyphThreadDropUnstarted = unsafe extern "C" fn(*mut c_void);
+type GlyphThreadResultEntry = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+type GlyphThreadDropResult = unsafe extern "C" fn(*mut c_void);
 
 unsafe extern "C" {
     fn glyph_thread_spawn(
@@ -16,8 +23,23 @@ unsafe extern "C" {
         env: *mut c_void,
         drop_unstarted: Option<GlyphThreadDropUnstarted>,
     ) -> i32;
+    fn glyph_thread_spawn_result(
+        out: *mut *mut GlyphThread,
+        entry: Option<GlyphThreadResultEntry>,
+        invoke: *mut c_void,
+        env: *mut c_void,
+        drop_unstarted: Option<GlyphThreadDropUnstarted>,
+        result_size: usize,
+        drop_result: Option<GlyphThreadDropResult>,
+    ) -> i32;
     fn glyph_thread_join(handle: *mut *mut GlyphThread) -> i32;
+    fn glyph_thread_join_result(handle: *mut *mut GlyphThread, out_result: *mut c_void) -> i32;
     fn glyph_thread_detach(handle: *mut *mut GlyphThread) -> i32;
+    fn glyph_mutex_create(out: *mut *mut GlyphMutex) -> i32;
+    fn glyph_mutex_lock(mutex: *mut GlyphMutex) -> i32;
+    fn glyph_mutex_try_lock(mutex: *mut GlyphMutex) -> i32;
+    fn glyph_mutex_unlock(mutex: *mut GlyphMutex) -> i32;
+    fn glyph_mutex_destroy(mutex: *mut *mut GlyphMutex) -> i32;
 }
 
 /// Register the native runtime functions needed by JIT-lowered std/thread.
@@ -33,8 +55,36 @@ pub(super) fn register_symbols(symbols: &mut HashMap<String, u64>) {
         glyph_thread_join as *const () as usize as u64,
     );
     symbols.insert(
+        "glyph_thread_spawn_result".to_string(),
+        glyph_thread_spawn_result as *const () as usize as u64,
+    );
+    symbols.insert(
+        "glyph_thread_join_result".to_string(),
+        glyph_thread_join_result as *const () as usize as u64,
+    );
+    symbols.insert(
         "glyph_thread_detach".to_string(),
         glyph_thread_detach as *const () as usize as u64,
+    );
+    symbols.insert(
+        "glyph_mutex_create".to_string(),
+        glyph_mutex_create as *const () as usize as u64,
+    );
+    symbols.insert(
+        "glyph_mutex_lock".to_string(),
+        glyph_mutex_lock as *const () as usize as u64,
+    );
+    symbols.insert(
+        "glyph_mutex_try_lock".to_string(),
+        glyph_mutex_try_lock as *const () as usize as u64,
+    );
+    symbols.insert(
+        "glyph_mutex_unlock".to_string(),
+        glyph_mutex_unlock as *const () as usize as u64,
+    );
+    symbols.insert(
+        "glyph_mutex_destroy".to_string(),
+        glyph_mutex_destroy as *const () as usize as u64,
     );
 }
 
@@ -52,11 +102,18 @@ mod tests {
     fn registers_complete_public_thread_runtime_surface() {
         let mut symbols = HashMap::new();
         register_symbols(&mut symbols);
-        assert_eq!(symbols.len(), 3);
+        assert_eq!(symbols.len(), 10);
         for name in [
             "glyph_thread_spawn",
             "glyph_thread_join",
+            "glyph_thread_spawn_result",
+            "glyph_thread_join_result",
             "glyph_thread_detach",
+            "glyph_mutex_create",
+            "glyph_mutex_lock",
+            "glyph_mutex_try_lock",
+            "glyph_mutex_unlock",
+            "glyph_mutex_destroy",
         ] {
             assert!(symbols.get(name).is_some_and(|address| *address != 0));
         }

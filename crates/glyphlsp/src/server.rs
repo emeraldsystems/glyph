@@ -10,6 +10,27 @@ use glyph_frontend::{FrontendOptions, compile_source};
 
 use crate::diagnostics::glyph_diagnostic_to_lsp;
 use crate::document::DocumentState;
+#[cfg(test)]
+use crate::document::build_line_starts;
+
+fn compile_diagnostics(source: &str, line_starts: &[u32]) -> Vec<Diagnostic> {
+    let output = compile_source(
+        source,
+        FrontendOptions {
+            include_std: true,
+            ..Default::default()
+        },
+    );
+
+    output
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.module_id.as_deref() == Some("main") || diagnostic.module_id.is_none()
+        })
+        .map(|diagnostic| glyph_diagnostic_to_lsp(diagnostic, source, line_starts))
+        .collect()
+}
 
 pub struct GlyphLanguageServer {
     pub client: Client,
@@ -35,24 +56,10 @@ impl GlyphLanguageServer {
             (doc.source.clone(), doc.line_starts.clone())
         };
 
-        let lsp_diags = tokio::task::spawn_blocking(move || {
-            let output = compile_source(
-                &source,
-                FrontendOptions {
-                    include_std: true,
-                    ..Default::default()
-                },
-            );
-
-            output
-                .diagnostics
-                .iter()
-                .filter(|d| d.module_id.as_deref() == Some("main") || d.module_id.is_none())
-                .map(|d| glyph_diagnostic_to_lsp(d, &source, &line_starts))
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
+        let lsp_diags =
+            tokio::task::spawn_blocking(move || compile_diagnostics(&source, &line_starts))
+                .await
+                .unwrap_or_default();
 
         self.client.publish_diagnostics(uri, lsp_diags, None).await;
     }
@@ -72,6 +79,48 @@ impl GlyphLanguageServer {
         }
 
         self.compile_and_publish(uri).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_owned_closure_has_no_lsp_diagnostics() {
+        let source = r#"
+fn main() -> i32 {
+  let offset: i32 = 40
+  let add: FnOnce<i32, i32> = value -> offset + value
+  ret add(2)
+}
+"#;
+        let diagnostics = compile_diagnostics(source, &build_line_starts(source));
+
+        assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
+    }
+
+    #[test]
+    fn closure_error_is_published_with_a_source_range() {
+        let source = r#"fn main() -> i32 {
+  let add: FnOnce<(i32, i32), i32> = x, y -> x + y
+  ret 0
+}
+"#;
+        let diagnostics = compile_diagnostics(source, &build_line_starts(source));
+
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("multiple closure parameters require parentheses")
+            })
+            .expect("expected the closure punctuation diagnostic");
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diagnostic.source.as_deref(), Some("glyph"));
+        assert_eq!(diagnostic.range.start.line, 1);
+        assert!(diagnostic.range.end.character > diagnostic.range.start.character);
     }
 }
 

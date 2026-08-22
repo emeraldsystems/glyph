@@ -5,12 +5,15 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use glyph_backend::codegen::CodegenContext;
+use glyph_backend::{
+    codegen::CodegenContext,
+    linker::{Linker, LinkerOptions},
+};
 use glyph_core::mir::{
     Local, LocalId, MirBlock, MirExternFunction, MirFunction, MirInst, MirModule, MirValue, Rvalue,
 };
-use glyph_core::thread::{private_unit_handle_type, unit_task_type};
-use glyph_core::types::Type;
+use glyph_core::thread::{private_unit_handle_type, task_type, unit_task_type};
+use glyph_core::types::{StructType, Type};
 
 #[repr(C)]
 struct GlyphThread {
@@ -19,6 +22,8 @@ struct GlyphThread {
 
 type ThreadEntry = unsafe extern "C" fn(*mut c_void);
 type DropUnstarted = unsafe extern "C" fn(*mut c_void);
+type ThreadResultEntry = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+type DropResult = unsafe extern "C" fn(*mut c_void);
 
 #[link(name = "glyph_runtime", kind = "static")]
 unsafe extern "C" {
@@ -28,7 +33,17 @@ unsafe extern "C" {
         env: *mut c_void,
         drop_unstarted: Option<DropUnstarted>,
     ) -> i32;
+    fn glyph_thread_spawn_result(
+        out: *mut *mut GlyphThread,
+        entry: Option<ThreadResultEntry>,
+        invoke: *mut c_void,
+        env: *mut c_void,
+        drop_unstarted: Option<DropUnstarted>,
+        result_size: usize,
+        drop_result: Option<DropResult>,
+    ) -> i32;
     fn glyph_thread_join(handle: *mut *mut GlyphThread) -> i32;
+    fn glyph_thread_join_result(handle: *mut *mut GlyphThread, out_result: *mut c_void) -> i32;
     fn glyph_thread_detach(handle: *mut *mut GlyphThread) -> i32;
     fn glyph_thread_test_fail_next(operation: i32, error_code: i32) -> i32;
 }
@@ -37,6 +52,7 @@ const TEST_FAIL_CREATE: i32 = 2;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static DETACH_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+static RESULT_FREES: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn record_invocation() {
     INVOCATIONS.fetch_add(1, Ordering::SeqCst);
@@ -57,6 +73,11 @@ unsafe extern "C" fn transient_fake_detach(handle: *mut *mut c_void) -> i32 {
     }
 }
 
+unsafe extern "C" fn counting_result_free(pointer: *mut c_void) {
+    RESULT_FREES.fetch_add(1, Ordering::SeqCst);
+    unsafe { libc::free(pointer) };
+}
+
 fn runtime_symbols() -> HashMap<String, u64> {
     HashMap::from([
         (
@@ -66,6 +87,14 @@ fn runtime_symbols() -> HashMap<String, u64> {
         (
             "glyph_thread_join".into(),
             glyph_thread_join as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_spawn_result".into(),
+            glyph_thread_spawn_result as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_join_result".into(),
+            glyph_thread_join_result as *const () as usize as u64,
         ),
         (
             "glyph_thread_detach".into(),
@@ -430,6 +459,352 @@ fn backend_rejects_non_unit_tasks_and_forged_handle_storage() {
             ..MirModule::default()
         };
         let mut context = CodegenContext::new("thread_bad_contract").unwrap();
+        let error = context.codegen_module(&module).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected diagnostic: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn typed_scalar_task_spawns_joins_and_moves_its_result() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let signature = task_type(Type::I32);
+    let module = MirModule {
+        functions: vec![
+            MirFunction {
+                name: "answer".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Return(Some(MirValue::Int(42)))],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    local(signature.clone(), "task"),
+                    local(private_unit_handle_type(), "handle"),
+                    local(Type::I32, "status"),
+                    local(Type::I32, "result"),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::FunctionRef {
+                                name: "answer".into(),
+                                signature: signature.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::ThreadSpawnResult {
+                                task: LocalId(0),
+                                out_handle: LocalId(1),
+                                result_type: Type::I32,
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::ThreadJoinResult {
+                                handle: LocalId(1),
+                                out_result: LocalId(3),
+                                result_type: Type::I32,
+                            },
+                        },
+                        MirInst::DropThreadHandle(LocalId(1)),
+                        MirInst::Return(Some(MirValue::Local(LocalId(3)))),
+                    ],
+                }],
+            },
+        ],
+        ..MirModule::default()
+    };
+    let mut context = CodegenContext::new("thread_typed_scalar").unwrap();
+    context.codegen_module(&module).unwrap();
+
+    assert_eq!(
+        context
+            .jit_execute_i32_with_symbols("main", &runtime_symbols())
+            .unwrap(),
+        42
+    );
+    let ir = context.dump_ir();
+    assert!(ir.contains("@glyph_thread_spawn_result"));
+    assert!(ir.contains("@glyph_thread_join_result"));
+    assert!(ir.contains("__glyph_thread_result_entry_i32"));
+    assert!(ir.contains("__glyph_thread_result_drop_i32"));
+
+    let unique = format!("glyph_thread_typed_aot_{}", std::process::id());
+    let object = std::env::temp_dir().join(format!("{unique}.o"));
+    let executable = std::env::temp_dir().join(unique);
+    context.emit_object_file(&object).unwrap();
+    Linker::new()
+        .link(&LinkerOptions {
+            output_path: executable.clone(),
+            object_files: vec![object.clone()],
+            link_libs: vec![],
+            link_search_paths: vec![],
+            runtime_lib_path: Linker::get_runtime_lib_path(),
+        })
+        .unwrap();
+    let status = std::process::Command::new(&executable).status().unwrap();
+    assert_eq!(status.code(), Some(42));
+    let _ = std::fs::remove_file(object);
+    let _ = std::fs::remove_file(executable);
+}
+
+#[test]
+fn typed_large_result_uses_callable_sret_and_preserves_layout() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let big = Type::Named("BigThreadResult".into());
+    let signature = task_type(big.clone());
+    let mut struct_types = HashMap::new();
+    struct_types.insert(
+        "BigThreadResult".into(),
+        StructType {
+            name: "BigThreadResult".into(),
+            fields: (0..8)
+                .map(|index| (format!("f{index}"), Type::I32))
+                .collect(),
+        },
+    );
+    let module = MirModule {
+        struct_types,
+        functions: vec![
+            MirFunction {
+                name: "large_answer".into(),
+                ret_type: Some(big.clone()),
+                params: vec![],
+                locals: vec![local(big.clone(), "result")],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::StructLit {
+                                struct_name: "BigThreadResult".into(),
+                                field_values: (0..8)
+                                    .map(|index| (format!("f{index}"), MirValue::Int(index + 40)))
+                                    .collect(),
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(0)))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    local(signature.clone(), "task"),
+                    local(private_unit_handle_type(), "handle"),
+                    local(Type::I32, "status"),
+                    local(big.clone(), "result"),
+                    local(Type::I32, "field"),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::FunctionRef {
+                                name: "large_answer".into(),
+                                signature: signature.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::ThreadSpawnResult {
+                                task: LocalId(0),
+                                out_handle: LocalId(1),
+                                result_type: big.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::ThreadJoinResult {
+                                handle: LocalId(1),
+                                out_result: LocalId(3),
+                                result_type: big.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(4),
+                            value: Rvalue::FieldAccess {
+                                base: LocalId(3),
+                                field_name: "f7".into(),
+                                field_index: 7,
+                            },
+                        },
+                        MirInst::DropThreadHandle(LocalId(1)),
+                        MirInst::Return(Some(MirValue::Local(LocalId(4)))),
+                    ],
+                }],
+            },
+        ],
+        ..MirModule::default()
+    };
+    let mut context = CodegenContext::new("thread_typed_sret").unwrap();
+    context.codegen_module(&module).unwrap();
+
+    assert_eq!(
+        context
+            .jit_execute_i32_with_symbols("main", &runtime_symbols())
+            .unwrap(),
+        47
+    );
+    let ir = context.dump_ir();
+    assert!(ir.contains("sret(%BigThreadResult)"));
+    assert!(ir.contains("__glyph_thread_result_entry_BigThreadResult"));
+}
+
+#[test]
+fn joined_owned_result_is_destroyed_once_by_the_joiner() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    RESULT_FREES.store(0, Ordering::SeqCst);
+    let owned = Type::Own(Box::new(Type::I32));
+    let signature = task_type(owned.clone());
+    let module = MirModule {
+        functions: vec![
+            MirFunction {
+                name: "owned_answer".into(),
+                ret_type: Some(owned.clone()),
+                params: vec![],
+                locals: vec![local(owned.clone(), "result")],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::OwnNew {
+                                value: MirValue::Int(77),
+                                elem_type: Type::I32,
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(0)))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    local(signature.clone(), "task"),
+                    local(private_unit_handle_type(), "handle"),
+                    local(Type::I32, "status"),
+                    local(owned.clone(), "result"),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::FunctionRef {
+                                name: "owned_answer".into(),
+                                signature: signature.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::ThreadSpawnResult {
+                                task: LocalId(0),
+                                out_handle: LocalId(1),
+                                result_type: owned.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::ThreadJoinResult {
+                                handle: LocalId(1),
+                                out_result: LocalId(3),
+                                result_type: owned,
+                            },
+                        },
+                        MirInst::Drop(LocalId(3)),
+                        MirInst::DropThreadHandle(LocalId(1)),
+                        MirInst::Return(Some(MirValue::Local(LocalId(2)))),
+                    ],
+                }],
+            },
+        ],
+        ..MirModule::default()
+    };
+    let mut context = CodegenContext::new("thread_typed_owned").unwrap();
+    context.codegen_module(&module).unwrap();
+    let mut symbols = runtime_symbols();
+    symbols.insert(
+        "free".into(),
+        counting_result_free as *const () as usize as u64,
+    );
+
+    assert_eq!(
+        context
+            .jit_execute_i32_with_symbols("main", &symbols)
+            .unwrap(),
+        0
+    );
+    assert_eq!(RESULT_FREES.load(Ordering::SeqCst), 1);
+    assert!(
+        context
+            .dump_ir()
+            .contains("__glyph_thread_result_drop_own_i32")
+    );
+}
+
+#[test]
+fn backend_rejects_typed_task_and_result_slot_mismatches() {
+    for (task_ty, out_ty, expected) in [
+        (
+            task_type(Type::I64),
+            Type::I32,
+            "task must be FnOnce() -> I32",
+        ),
+        (
+            task_type(Type::I32),
+            Type::I64,
+            "result local has type I64, expected I32",
+        ),
+    ] {
+        let module = MirModule {
+            functions: vec![MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    local(task_ty, "task"),
+                    local(private_unit_handle_type(), "handle"),
+                    local(Type::I32, "status"),
+                    local(out_ty, "result"),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::ThreadSpawnResult {
+                                task: LocalId(0),
+                                out_handle: LocalId(1),
+                                result_type: Type::I32,
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::ThreadJoinResult {
+                                handle: LocalId(1),
+                                out_result: LocalId(3),
+                                result_type: Type::I32,
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(2)))),
+                    ],
+                }],
+            }],
+            ..MirModule::default()
+        };
+        let mut context = CodegenContext::new("thread_typed_bad_contract").unwrap();
         let error = context.codegen_module(&module).unwrap_err();
         assert!(
             error.to_string().contains(expected),

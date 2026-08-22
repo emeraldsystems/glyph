@@ -155,6 +155,8 @@ This is not the final language spec, but these features are working now (see `ex
 **Advanced Features**
 - Multi-file projects with module discovery
 - C FFI via `extern "C"` declarations
+- Owned, first-class `FnOnce` closures and named-function values
+- Native threads, atomic scalars, `Arc<T>`, and worker-only `Mutex<T>` shared state
 - Error propagation with `?` operator
 - Arrays with bounds checking
 - LSP server with real-time diagnostics
@@ -349,7 +351,7 @@ The repo contains a complete working compiler pipeline:
 
 **Tooling**
 - `glyphlsp` — Language server providing real-time diagnostics
-- `glyphfmt` — Code formatter (placeholder)
+- `glyphfmt` — Syntax-preserving formatter frontend
 
 ---
 
@@ -378,7 +380,7 @@ crates/
   glyph-core/       # Shared AST/MIR/types and diagnostics
   glyph-cli/        # CLI binaries (glyph, glyph-cli)
   glyphlsp/         # Language server (real-time diagnostics)
-  glyphfmt/         # Formatter (placeholder)
+  glyphfmt/         # Syntax-preserving formatter frontend
 
 runtime/            # Minimal C runtime for I/O
 examples/           # Working end-to-end programs

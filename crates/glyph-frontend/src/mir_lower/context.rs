@@ -1,13 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use glyph_core::ast::Module;
+use glyph_core::ast::{Item, Module};
 use glyph_core::diag::Diagnostic;
 use glyph_core::mir::{BlockId, Local, LocalId, MirBlock, MirInst, MirValue, Rvalue};
 use glyph_core::span::Span;
+use glyph_core::thread_safety::{
+    CallableCaptureProvenance, CallableProvenanceTable, CallableSendProvenance,
+    CanonicalApplicationPolicy, CanonicalConstructorId, CanonicalNominalId,
+    NominalThreadSafetyPolicy, ThreadSafetyRegistry, ThreadSafetyType,
+};
 use glyph_core::types::Type;
 
-use crate::closure_analysis::ClosureInfo;
-use crate::resolver::ResolverContext;
+use crate::closure_analysis::{ClosureEscapeKind, ClosureInfo, analyze_function_closure_ownership};
+use crate::resolver::{ResolvedSymbol, ResolverContext};
 
 use super::signatures::FnSig;
 
@@ -25,6 +30,31 @@ pub(crate) enum LocalState {
     Uninitialized,
     Initialized,
     Moved,
+}
+
+/// A source-level immutable reference produced by `Arc::borrow()` remains
+/// tied to the exact owner local that created it. Glyph does not yet have a
+/// general lifetime solver, so v1 keeps these loans lexical and refuses to
+/// store them in longer-lived aggregates or containers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArcLoan {
+    owner: LocalId,
+    creation_scope: usize,
+    origin: Span,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MutexLoan {
+    owner: LocalId,
+    creation_scope: usize,
+    origin: Span,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MutexGuardBorrow {
+    guard: LocalId,
+    creation_scope: usize,
+    origin: Span,
 }
 
 pub(crate) struct LowerCtx<'a> {
@@ -46,6 +76,11 @@ pub(crate) struct LowerCtx<'a> {
     /// still obey block shadowing.
     binding_undo: Vec<Vec<(String, Option<LocalId>)>>,
     pub(crate) local_states: Vec<LocalState>,
+    local_scope_depths: Vec<usize>,
+    arc_loans: HashMap<LocalId, ArcLoan>,
+    mutex_loans: HashMap<LocalId, MutexLoan>,
+    mutex_guard_borrows: HashMap<LocalId, MutexGuardBorrow>,
+    mutex_try_option_locals: HashSet<LocalId>,
     pub(crate) string_counter: u32,
     /// Source declaration identities are stable across closure analysis and
     /// MIR lowering even when the same spelling is shadowed.
@@ -53,6 +88,18 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) closure_infos: Vec<ClosureInfo>,
     pub(crate) lifted_functions: Vec<glyph_core::mir::MirFunction>,
     pub(crate) closure_name_root: String,
+    pub(crate) callable_provenance: CallableProvenanceTable<LocalId>,
+    pub(crate) callable_return_provenance: HashMap<String, CallableSendProvenance>,
+    pub(crate) thread_safety_registry: ThreadSafetyRegistry<'a>,
+    runtime_nominals: HashMap<String, CanonicalNominalId>,
+    structural_nominals: HashMap<String, CanonicalNominalId>,
+    join_handle_constructor: CanonicalConstructorId,
+    arc_constructor: CanonicalConstructorId,
+    mutex_constructor: CanonicalConstructorId,
+    mutex_guard_constructor: CanonicalConstructorId,
+    /// Private raw thread slots need nonblocking detach cleanup even though
+    /// ordinary RawPtr values have no drop glue.
+    thread_handle_locals: std::collections::HashSet<LocalId>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -64,7 +111,96 @@ impl<'a> LowerCtx<'a> {
     ) -> Self {
         let mut blocks = Vec::new();
         blocks.push(MirBlock::default());
-        Self {
+        let mut thread_safety_registry =
+            ThreadSafetyRegistry::new(&resolver.struct_types, &resolver.enum_types);
+        let join_handle_constructor = thread_safety_registry.register_constructor(
+            "std::thread::JoinHandle",
+            CanonicalApplicationPolicy::JoinHandle,
+        );
+        let arc_constructor = thread_safety_registry.register_constructor(
+            glyph_core::types::ARC_TYPE_CONSTRUCTOR,
+            CanonicalApplicationPolicy::Arc,
+        );
+        let mutex_constructor = thread_safety_registry.register_constructor(
+            glyph_core::types::MUTEX_TYPE_CONSTRUCTOR,
+            CanonicalApplicationPolicy::Mutex,
+        );
+        let mutex_guard_constructor = thread_safety_registry.register_constructor(
+            glyph_core::types::MUTEX_GUARD_TYPE_CONSTRUCTOR,
+            CanonicalApplicationPolicy::Deny {
+                arity: 1,
+                reason: "mutex guards are lexical, thread-affine lock tokens".into(),
+            },
+        );
+        let mut runtime_nominals = HashMap::new();
+        for (name, send, sync, reason) in [
+            (
+                "std::io::Stdout",
+                true,
+                true,
+                "stdout formatting is reentrant",
+            ),
+            (
+                "std::io::File",
+                true,
+                false,
+                "file streams require exclusive ownership",
+            ),
+            (
+                "std::net::TcpStream",
+                true,
+                false,
+                "socket state requires exclusive ownership",
+            ),
+            (
+                "std::net::TcpListener",
+                true,
+                false,
+                "listener state requires exclusive ownership",
+            ),
+            (
+                "std::net::UdpSocket",
+                true,
+                false,
+                "socket state requires exclusive ownership",
+            ),
+            (
+                "std::term::Terminal",
+                false,
+                false,
+                "terminal sessions are thread-affine",
+            ),
+            (
+                "std::term::UiSessionGuard",
+                false,
+                false,
+                "terminal guards are thread-affine",
+            ),
+            (
+                "std::audio::WavWriter",
+                true,
+                false,
+                "WAV writers require exclusive ownership",
+            ),
+            (
+                "std::audio::AudioOut",
+                false,
+                false,
+                "live audio devices are engine-thread-affine",
+            ),
+        ] {
+            let id = thread_safety_registry.register_nominal(
+                name,
+                NominalThreadSafetyPolicy::Audited {
+                    send,
+                    sync,
+                    reason: reason.into(),
+                },
+            );
+            runtime_nominals.insert(name.into(), id);
+        }
+
+        let mut context = Self {
             resolver,
             module,
             fn_sigs,
@@ -80,12 +216,284 @@ impl<'a> LowerCtx<'a> {
             scope_stack: vec![Vec::new()],
             binding_undo: vec![Vec::new()],
             local_states: Vec::new(),
+            local_scope_depths: Vec::new(),
+            arc_loans: HashMap::new(),
+            mutex_loans: HashMap::new(),
+            mutex_guard_borrows: HashMap::new(),
+            mutex_try_option_locals: HashSet::new(),
             string_counter: 0,
             source_binding_locals: HashMap::new(),
             closure_infos: Vec::new(),
             lifted_functions: Vec::new(),
             closure_name_root: function_name,
+            callable_provenance: CallableProvenanceTable::default(),
+            callable_return_provenance: HashMap::new(),
+            thread_safety_registry,
+            runtime_nominals,
+            structural_nominals: HashMap::new(),
+            join_handle_constructor,
+            arc_constructor,
+            mutex_constructor,
+            mutex_guard_constructor,
+            thread_handle_locals: std::collections::HashSet::new(),
+        };
+
+        // Preserve a certificate across ordinary calls returning one known
+        // closure. Multiple alternative returned closures and unknown capture
+        // layouts remain fail-closed rather than guessing.
+        for item in &module.items {
+            let Item::Function(function) = item else {
+                continue;
+            };
+            let analysis = analyze_function_closure_ownership(function, resolver);
+            let returned = analysis
+                .closures
+                .iter()
+                .filter(|closure| {
+                    closure
+                        .escapes
+                        .iter()
+                        .any(|escape| escape.kind == ClosureEscapeKind::Return)
+                })
+                .collect::<Vec<_>>();
+            if returned.len() != 1 {
+                continue;
+            }
+            let closure = returned[0];
+            let provenance = if closure
+                .captures
+                .iter()
+                .all(|capture| capture.resolved_type.is_some())
+            {
+                CallableSendProvenance::OwnedClosure {
+                    origin: format!(
+                        "{}::__glyph_closure_{}",
+                        function.name.0, closure.closure_id
+                    ),
+                    captures: closure
+                        .captures
+                        .iter()
+                        .map(|capture| {
+                            CallableCaptureProvenance::new(
+                                capture.name.clone(),
+                                context.thread_safety_type(
+                                    capture.resolved_type.as_ref().expect("checked above"),
+                                ),
+                            )
+                        })
+                        .collect(),
+                }
+            } else {
+                CallableSendProvenance::Unknown {
+                    reason: format!(
+                        "returned closure from '{}' has an unresolved capture layout",
+                        function.name.0
+                    ),
+                }
+            };
+            context
+                .callable_return_provenance
+                .insert(function.name.0.clone(), provenance);
         }
+        context
+    }
+
+    pub(crate) fn thread_safety_type(&mut self, ty: &Type) -> ThreadSafetyType {
+        self.thread_safety_type_inner(ty, &mut HashSet::new())
+    }
+
+    fn thread_safety_type_inner(
+        &mut self,
+        ty: &Type,
+        visiting: &mut HashSet<String>,
+    ) -> ThreadSafetyType {
+        match ty {
+            Type::Own(inner) => {
+                ThreadSafetyType::own(self.thread_safety_type_inner(inner, visiting))
+            }
+            Type::Array(inner, len) => {
+                ThreadSafetyType::array(self.thread_safety_type_inner(inner, visiting), *len)
+            }
+            Type::Tuple(elements) => ThreadSafetyType::tuple(
+                elements
+                    .iter()
+                    .map(|element| self.thread_safety_type_inner(element, visiting))
+                    .collect(),
+            ),
+            Type::Named(name) => {
+                if let Some(identity) = self.runtime_nominal_identity(name) {
+                    return ThreadSafetyType::nominal(identity);
+                }
+                if let Some(identity) = self.structural_nominals.get(name).copied() {
+                    return ThreadSafetyType::nominal(identity);
+                }
+                if !visiting.insert(name.clone()) {
+                    return ThreadSafetyType::plain(ty.clone());
+                }
+                let fields = self
+                    .resolver
+                    .get_struct(name)
+                    .map(|definition| definition.fields.clone());
+                let converted = fields.map(|fields| {
+                    fields
+                        .into_iter()
+                        .map(|(field, field_ty)| {
+                            (field, self.thread_safety_type_inner(&field_ty, visiting))
+                        })
+                        .collect()
+                });
+                visiting.remove(name);
+                if let Some(fields) = converted {
+                    let identity = self.thread_safety_registry.register_nominal(
+                        name.clone(),
+                        NominalThreadSafetyPolicy::MonomorphicStruct { fields },
+                    );
+                    self.structural_nominals.insert(name.clone(), identity);
+                    ThreadSafetyType::nominal(identity)
+                } else {
+                    ThreadSafetyType::plain(ty.clone())
+                }
+            }
+            Type::Enum(name) => {
+                if let Some(identity) = self.structural_nominals.get(name).copied() {
+                    return ThreadSafetyType::nominal(identity);
+                }
+                if !visiting.insert(name.clone()) {
+                    return ThreadSafetyType::plain(ty.clone());
+                }
+                let variants = self.resolver.get_enum(name).map(|definition| {
+                    definition
+                        .variants
+                        .iter()
+                        .map(|variant| (variant.name.clone(), variant.payload.clone()))
+                        .collect::<Vec<_>>()
+                });
+                let converted = variants.map(|variants| {
+                    variants
+                        .into_iter()
+                        .map(|(variant, payload)| {
+                            (
+                                variant,
+                                payload.map(|payload| {
+                                    self.thread_safety_type_inner(&payload, visiting)
+                                }),
+                            )
+                        })
+                        .collect()
+                });
+                visiting.remove(name);
+                if let Some(variants) = converted {
+                    let identity = self.thread_safety_registry.register_nominal(
+                        name.clone(),
+                        NominalThreadSafetyPolicy::MonomorphicEnum { variants },
+                    );
+                    self.structural_nominals.insert(name.clone(), identity);
+                    ThreadSafetyType::nominal(identity)
+                } else {
+                    ThreadSafetyType::plain(ty.clone())
+                }
+            }
+            Type::App { base, args }
+                if args.len() == 1 && self.resolves_to_struct(base, "std/sync", "Arc") =>
+            {
+                ThreadSafetyType::application(
+                    self.arc_constructor,
+                    vec![self.thread_safety_type_inner(&args[0], visiting)],
+                )
+            }
+            Type::App { base, args }
+                if args.len() == 1 && self.resolves_to_struct(base, "std/sync", "Mutex") =>
+            {
+                ThreadSafetyType::application(
+                    self.mutex_constructor,
+                    vec![self.thread_safety_type_inner(&args[0], visiting)],
+                )
+            }
+            Type::App { base, args }
+                if args.len() == 1 && self.resolves_to_struct(base, "std/sync", "MutexGuard") =>
+            {
+                ThreadSafetyType::application(
+                    self.mutex_guard_constructor,
+                    vec![self.thread_safety_type_inner(&args[0], visiting)],
+                )
+            }
+            Type::App { base, args }
+                if args.len() == 1 && self.resolves_to_struct(base, "std/thread", "JoinHandle") =>
+            {
+                ThreadSafetyType::application(
+                    self.join_handle_constructor,
+                    vec![self.thread_safety_type_inner(&args[0], visiting)],
+                )
+            }
+            ty if ty.is_arc() => ThreadSafetyType::application(
+                self.arc_constructor,
+                vec![self.thread_safety_type_inner(
+                    ty.arc_inner_type().expect("is_arc validated one argument"),
+                    visiting,
+                )],
+            ),
+            ty if ty.is_mutex() => ThreadSafetyType::application(
+                self.mutex_constructor,
+                vec![
+                    self.thread_safety_type_inner(
+                        ty.mutex_inner_type()
+                            .expect("is_mutex validated one argument"),
+                        visiting,
+                    ),
+                ],
+            ),
+            ty if ty.is_mutex_guard() => ThreadSafetyType::application(
+                self.mutex_guard_constructor,
+                vec![
+                    self.thread_safety_type_inner(
+                        ty.mutex_guard_inner_type()
+                            .expect("is_mutex_guard validated one argument"),
+                        visiting,
+                    ),
+                ],
+            ),
+            ty if glyph_core::thread::is_canonical_thread_handle(ty) => {
+                ThreadSafetyType::application(
+                    self.join_handle_constructor,
+                    vec![
+                        self.thread_safety_type_inner(
+                            glyph_core::thread::canonical_thread_handle_result(ty)
+                                .expect("canonical handle has one result argument"),
+                            visiting,
+                        ),
+                    ],
+                )
+            }
+            _ => ThreadSafetyType::plain(ty.clone()),
+        }
+    }
+
+    fn runtime_nominal_identity(&self, name: &str) -> Option<CanonicalNominalId> {
+        self.runtime_nominals.get(name).copied().or_else(|| {
+            let ResolvedSymbol::Struct(module, symbol) = self.resolver.resolve_symbol(name)? else {
+                return None;
+            };
+            let canonical = format!("{}::{symbol}", module.replace('/', "::"));
+            self.runtime_nominals.get(&canonical).copied()
+        })
+    }
+
+    fn resolves_to_struct(&self, name: &str, module: &str, symbol: &str) -> bool {
+        if name == format!("{}::{symbol}", module.replace('/', "::")) {
+            return true;
+        }
+        matches!(
+            self.resolver.resolve_symbol(name),
+            Some(ResolvedSymbol::Struct(resolved_module, resolved_symbol))
+                if resolved_module == module && resolved_symbol == symbol
+        )
+    }
+
+    pub(crate) fn fresh_thread_handle_local(&mut self) -> LocalId {
+        let local = self.fresh_local(None);
+        self.locals[local.0 as usize].ty = Some(glyph_core::thread::private_unit_handle_type());
+        self.thread_handle_locals.insert(local);
+        local
     }
 
     pub(crate) fn bind_name(&mut self, name: &str, local: LocalId) {
@@ -137,7 +545,68 @@ impl<'a> LowerCtx<'a> {
     pub(crate) fn push_inst(&mut self, inst: MirInst) {
         match &inst {
             MirInst::Assign { local, value } => {
+                self.reject_arc_loan_storage(value);
+                self.reject_mutex_guard_storage(*local, value);
+                self.arc_loans.remove(local);
+                match value {
+                    Rvalue::FunctionRef { name, .. } => self.callable_provenance.insert(
+                        *local,
+                        CallableSendProvenance::FunctionItem {
+                            symbol: name.clone(),
+                        },
+                    ),
+                    Rvalue::MakeClosure {
+                        function, captures, ..
+                    } => {
+                        let captures = captures
+                            .iter()
+                            .map(|capture| {
+                                CallableCaptureProvenance::new(
+                                    capture.name.clone(),
+                                    self.thread_safety_type(&capture.ty),
+                                )
+                            })
+                            .collect();
+                        self.callable_provenance.insert(
+                            *local,
+                            CallableSendProvenance::OwnedClosure {
+                                origin: function.clone(),
+                                captures,
+                            },
+                        );
+                    }
+                    Rvalue::Move(source) => {
+                        self.callable_provenance.move_to(source, *local);
+                        if let Some(loan) = self.arc_loans.get(source).copied() {
+                            let destination_scope = self
+                                .local_scope_depths
+                                .get(local.0 as usize)
+                                .copied()
+                                .unwrap_or(loan.creation_scope);
+                            if destination_scope < loan.creation_scope {
+                                self.error(
+                                    "an Arc::borrow() reference cannot escape the lexical scope where it was created",
+                                    Some(loan.origin),
+                                );
+                            }
+                            // Keep propagating after a diagnostic so the
+                            // owner's later drop is also rejected and the
+                            // invalid MIR cannot accidentally look safe.
+                            self.arc_loans.insert(*local, loan);
+                        }
+                    }
+                    _ => {}
+                }
                 self.handle_reassign(*local);
+                match value {
+                    Rvalue::Move(source) => self.transfer_mutex_provenance(*source, *local),
+                    Rvalue::EnumPayload {
+                        base, payload_type, ..
+                    } if payload_type.is_mutex_guard() => {
+                        self.transfer_mutex_provenance(*base, *local);
+                    }
+                    _ => {}
+                }
                 if let Some(state) = self.local_states.get_mut(local.0 as usize) {
                     *state = LocalState::Initialized;
                 }
@@ -182,6 +651,15 @@ impl<'a> LowerCtx<'a> {
                 self.track_rvalue_ownership(value, *local);
             }
             MirInst::AssignField { value, .. } => {
+                self.reject_mutex_guard_field_storage(value);
+                if let Rvalue::Move(source) = value
+                    && let Some(loan) = self.arc_loans.get(source).copied()
+                {
+                    self.error(
+                        "an Arc::borrow() reference cannot be stored in a struct field; keep it in a direct lexical binding",
+                        Some(loan.origin),
+                    );
+                }
                 if let Rvalue::Move(src) = value {
                     if let Some(state) = self.local_states.get_mut(src.0 as usize) {
                         *state = LocalState::Moved;
@@ -216,6 +694,8 @@ impl<'a> LowerCtx<'a> {
             skip_drop: false,
         });
         self.local_states.push(LocalState::Uninitialized);
+        self.local_scope_depths
+            .push(self.scope_stack.len().saturating_sub(1));
         if let Some(scope) = self.scope_stack.last_mut() {
             scope.push(id);
         }
@@ -260,9 +740,13 @@ impl<'a> LowerCtx<'a> {
             return;
         }
         let scopes = self.scope_stack.clone();
+        for scope in scopes.iter().skip(depth) {
+            self.release_arc_loans_for_locals(scope);
+        }
         for scope in scopes.iter().skip(depth).rev() {
             for &local in scope.iter().rev() {
                 self.drop_local_if_needed(local);
+                self.release_mutex_provenance_for_local(local);
             }
         }
     }
@@ -283,6 +767,12 @@ impl<'a> LowerCtx<'a> {
             return;
         }
         if let Some(LocalState::Initialized) = self.local_states.get(local.0 as usize) {
+            if !self.validate_arc_owner_invalidation(local, "reassign", None)
+                || !self.validate_mutex_owner_invalidation(local, "reassign", None)
+                || !self.validate_mutex_guard_invalidation(local, "reassign", None)
+            {
+                return;
+            }
             self.emit_drop(local);
         }
     }
@@ -297,8 +787,10 @@ impl<'a> LowerCtx<'a> {
             return;
         }
         if let Some(locals) = self.scope_stack.pop() {
+            self.release_arc_loans_for_locals(&locals);
             for local in locals.into_iter().rev() {
                 self.drop_local_if_needed(local);
+                self.release_mutex_provenance_for_local(local);
             }
         }
         if let Some(bindings) = self.binding_undo.pop() {
@@ -320,6 +812,20 @@ impl<'a> LowerCtx<'a> {
         {
             return;
         }
+        if self.thread_handle_locals.contains(&local)
+            && matches!(
+                self.local_states.get(local.0 as usize),
+                Some(LocalState::Initialized)
+            )
+        {
+            self.current_block_mut()
+                .insts
+                .push(MirInst::DropThreadHandle(local));
+            if let Some(state) = self.local_states.get_mut(local.0 as usize) {
+                *state = LocalState::Moved;
+            }
+            return;
+        }
         let dominated = self
             .local_ty(local)
             .map(|ty| Self::type_has_drop_glue(ty))
@@ -335,14 +841,24 @@ impl<'a> LowerCtx<'a> {
 
     pub(crate) fn drop_all_active_locals(&mut self) {
         let scopes: Vec<Vec<LocalId>> = self.scope_stack.clone();
+        for scope in &scopes {
+            self.release_arc_loans_for_locals(scope);
+        }
         for scope in scopes.iter().rev() {
             for &local in scope.iter().rev() {
                 self.drop_local_if_needed(local);
+                self.release_mutex_provenance_for_local(local);
             }
         }
     }
 
     pub(crate) fn emit_drop(&mut self, local: LocalId) {
+        if !self.validate_arc_owner_invalidation(local, "drop", None)
+            || !self.validate_mutex_owner_invalidation(local, "drop", None)
+            || !self.validate_mutex_guard_invalidation(local, "drop", None)
+        {
+            return;
+        }
         let insert_before_terminator = self
             .current_block_mut()
             .insts
@@ -365,6 +881,7 @@ impl<'a> LowerCtx<'a> {
         if let Some(state) = self.local_states.get_mut(local.0 as usize) {
             *state = LocalState::Moved;
         }
+        self.release_mutex_provenance_for_local(local);
     }
 
     pub(crate) fn local_ty(&self, local: LocalId) -> Option<&Type> {
@@ -452,7 +969,13 @@ impl<'a> LowerCtx<'a> {
             | Type::String
             | Type::Enum(_)
             | Type::Function { .. } => true,
-            Type::App { base, .. } => base == "Vec" || base == "Map",
+            Type::App { base, .. } => {
+                matches!(base.as_str(), "Vec" | "Map" | "Result" | "Option")
+                    || ty.is_arc()
+                    || ty.is_mutex()
+                    || ty.is_mutex_guard()
+                    || glyph_core::thread::is_canonical_thread_handle(ty)
+            }
             Type::Named(_) => true,
             _ => false,
         }
@@ -469,11 +992,21 @@ impl<'a> LowerCtx<'a> {
             | Type::String
             | Type::Enum(_)
             | Type::Function { .. } => true,
+            Type::App { base, .. } => {
+                matches!(base.as_str(), "Result" | "Option")
+                    || ty.is_arc()
+                    || ty.is_mutex()
+                    || ty.is_mutex_guard()
+                    || glyph_core::thread::is_canonical_thread_handle(ty)
+            }
             _ => false,
         }
     }
 
     fn type_is_guard(ty: &Type) -> bool {
+        if ty.is_mutex_guard() {
+            return true;
+        }
         match ty {
             Type::Named(name) => {
                 let leaf = name.rsplit("::").next().unwrap_or(name);
@@ -641,6 +1174,17 @@ impl<'a> LowerCtx<'a> {
                     *state = LocalState::Moved;
                 }
             }
+            Rvalue::ThreadHandleIntoRaw { handle } => {
+                if let Some(state) = self.local_states.get_mut(handle.0 as usize) {
+                    *state = LocalState::Moved;
+                }
+            }
+            // Arc allocation transfers its payload into the stable heap
+            // allocation. Cloning and immutable borrowing leave the source
+            // Arc owner live.
+            Rvalue::ArcNew { value, .. } | Rvalue::MutexNew { value, .. } => {
+                self.mark_moved_if_droppable(value);
+            }
             // Closure construction immediately transfers every non-Copy
             // capture into its owned environment.
             Rvalue::MakeClosure { captures, .. } => {
@@ -705,6 +1249,15 @@ impl<'a> LowerCtx<'a> {
             return false;
         }
 
+        if !self.validate_arc_owner_invalidation(local, "move", span) {
+            return false;
+        }
+        if !self.validate_mutex_owner_invalidation(local, "move", span)
+            || !self.validate_mutex_guard_invalidation(local, "move", span)
+        {
+            return false;
+        }
+
         if !self.local_uses_ownership_tracking(local) {
             return true;
         }
@@ -727,6 +1280,384 @@ impl<'a> LowerCtx<'a> {
                 }
                 false
             }
+        }
+    }
+
+    pub(crate) fn register_arc_borrow(&mut self, reference: LocalId, owner: LocalId, origin: Span) {
+        self.arc_loans.insert(
+            reference,
+            ArcLoan {
+                owner,
+                creation_scope: self
+                    .local_scope_depths
+                    .get(reference.0 as usize)
+                    .copied()
+                    .unwrap_or(0),
+                origin,
+            },
+        );
+    }
+
+    pub(crate) fn reject_arc_loan_scope_escape(&mut self, local: LocalId) {
+        let Some(loan) = self.arc_loans.get(&local).copied() else {
+            return;
+        };
+        let current_scope = self.scope_stack.len().saturating_sub(1);
+        if loan.creation_scope == current_scope {
+            self.error(
+                "an Arc::borrow() reference cannot escape the lexical scope where it was created",
+                Some(loan.origin),
+            );
+        }
+    }
+
+    fn validate_arc_owner_invalidation(
+        &mut self,
+        owner: LocalId,
+        action: &str,
+        span: Option<Span>,
+    ) -> bool {
+        if !self.local_ty(owner).is_some_and(Type::is_arc) {
+            return true;
+        }
+        let Some(loan) = self
+            .arc_loans
+            .values()
+            .find(|loan| loan.owner == owner)
+            .copied()
+        else {
+            return true;
+        };
+        let owner = self.local_name(owner).unwrap_or("<temporary>");
+        self.error(
+            format!(
+                "cannot {action} Arc owner `{owner}` while an Arc::borrow() reference is active; the loan lasts until its binding's lexical scope ends"
+            ),
+            span.or(Some(loan.origin)),
+        );
+        false
+    }
+
+    fn release_arc_loans_for_locals(&mut self, locals: &[LocalId]) {
+        for local in locals {
+            self.arc_loans.remove(local);
+        }
+    }
+
+    fn arc_loan_for_value(&self, value: &MirValue) -> Option<ArcLoan> {
+        let MirValue::Local(local) = value else {
+            return None;
+        };
+        self.arc_loans.get(local).copied()
+    }
+
+    fn reject_arc_loan_value_storage(&mut self, value: &MirValue, destination: &str) {
+        let Some(loan) = self.arc_loan_for_value(value) else {
+            return;
+        };
+        self.error(
+            format!(
+                "an Arc::borrow() reference cannot be stored in {destination}; keep it in a direct lexical binding"
+            ),
+            Some(loan.origin),
+        );
+    }
+
+    fn reject_arc_loan_storage(&mut self, value: &Rvalue) {
+        match value {
+            Rvalue::StructLit { field_values, .. } => {
+                for (_, value) in field_values {
+                    self.reject_arc_loan_value_storage(value, "an aggregate");
+                }
+            }
+            Rvalue::ArrayLit { elements, .. } => {
+                for value in elements {
+                    self.reject_arc_loan_value_storage(value, "an array");
+                }
+            }
+            Rvalue::EnumConstruct {
+                payload: Some(value),
+                ..
+            } => self.reject_arc_loan_value_storage(value, "an enum payload"),
+            Rvalue::VecPush { value, .. } => {
+                self.reject_arc_loan_value_storage(value, "a Vec");
+            }
+            Rvalue::MapAdd { key, value, .. } | Rvalue::MapUpdate { key, value, .. } => {
+                self.reject_arc_loan_value_storage(key, "a Map");
+                self.reject_arc_loan_value_storage(value, "a Map");
+            }
+            Rvalue::OwnNew { value, .. } => {
+                self.reject_arc_loan_value_storage(value, "an Own allocation");
+            }
+            Rvalue::SharedNew { value, .. } => {
+                self.reject_arc_loan_value_storage(value, "a Shared allocation");
+            }
+            Rvalue::MakeClosure { captures, .. } => {
+                for capture in captures {
+                    if let Some(loan) = self.arc_loans.get(&capture.local).copied() {
+                        self.error(
+                            "an Arc::borrow() reference cannot be captured by a closure; borrow inside the closure from an owned Arc clone instead",
+                            Some(loan.origin),
+                        );
+                    }
+                    if capture.transfer == glyph_core::mir::CaptureTransfer::Move {
+                        self.validate_arc_owner_invalidation(
+                            capture.local,
+                            "move into a closure",
+                            None,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn mark_mutex_try_option(&mut self, local: LocalId) {
+        self.mutex_try_option_locals.insert(local);
+    }
+
+    pub(crate) fn register_mutex_guard(&mut self, holder: LocalId, owner: LocalId, origin: Span) {
+        let creation_scope = self
+            .local_scope_depths
+            .get(holder.0 as usize)
+            .copied()
+            .unwrap_or(0);
+        let owner_scope = self
+            .local_scope_depths
+            .get(owner.0 as usize)
+            .copied()
+            .unwrap_or(0);
+        if owner_scope > creation_scope {
+            self.error(
+                "a MutexGuard cannot outlive the Mutex binding it locks",
+                Some(origin),
+            );
+        }
+        self.mutex_loans.insert(
+            holder,
+            MutexLoan {
+                owner,
+                creation_scope,
+                origin,
+            },
+        );
+    }
+
+    pub(crate) fn register_mutex_guard_borrow(
+        &mut self,
+        reference: LocalId,
+        guard: LocalId,
+        origin: Span,
+    ) {
+        self.mutex_guard_borrows.insert(
+            reference,
+            MutexGuardBorrow {
+                guard,
+                creation_scope: self
+                    .local_scope_depths
+                    .get(reference.0 as usize)
+                    .copied()
+                    .unwrap_or(0),
+                origin,
+            },
+        );
+    }
+
+    fn transfer_mutex_provenance(&mut self, source: LocalId, destination: LocalId) {
+        if let Some(mut loan) = self.mutex_loans.remove(&source) {
+            let destination_scope = self
+                .local_scope_depths
+                .get(destination.0 as usize)
+                .copied()
+                .unwrap_or(loan.creation_scope);
+            if destination_scope < loan.creation_scope {
+                self.error(
+                    "a MutexGuard cannot escape the lexical scope where it was acquired",
+                    Some(loan.origin),
+                );
+            }
+            loan.creation_scope = destination_scope;
+            self.mutex_loans.insert(destination, loan);
+        }
+        if let Some(mut borrow) = self.mutex_guard_borrows.remove(&source) {
+            let destination_scope = self
+                .local_scope_depths
+                .get(destination.0 as usize)
+                .copied()
+                .unwrap_or(borrow.creation_scope);
+            if destination_scope < borrow.creation_scope {
+                self.error(
+                    "a reference borrowed from MutexGuard cannot escape its lexical scope",
+                    Some(borrow.origin),
+                );
+            }
+            borrow.creation_scope = destination_scope;
+            self.mutex_guard_borrows.insert(destination, borrow);
+        }
+    }
+
+    fn release_mutex_provenance_for_local(&mut self, local: LocalId) {
+        self.mutex_loans.remove(&local);
+        self.mutex_guard_borrows.remove(&local);
+        self.mutex_try_option_locals.remove(&local);
+    }
+
+    fn validate_mutex_owner_invalidation(
+        &mut self,
+        owner: LocalId,
+        action: &str,
+        span: Option<Span>,
+    ) -> bool {
+        let Some((holder, loan)) = self
+            .mutex_loans
+            .iter()
+            .find(|(_, loan)| loan.owner == owner)
+            .map(|(holder, loan)| (*holder, *loan))
+        else {
+            return true;
+        };
+        let owner_name = self.local_name(owner).unwrap_or("<temporary>");
+        let guard_name = self.local_name(holder).unwrap_or("<temporary>");
+        self.error(
+            format!(
+                "cannot {action} Mutex owner `{owner_name}` while guard `{guard_name}` is live"
+            ),
+            span.or(Some(loan.origin)),
+        );
+        self.diagnostics.push(Diagnostic::note(
+            "the exclusive Mutex loan begins at this lock operation and lasts until the guard's lexical scope ends",
+            Some(loan.origin),
+        ));
+        self.diagnostics.push(Diagnostic::help(
+            "put the guard in a nested block so it unlocks before moving or dropping the Mutex",
+            span.or(Some(loan.origin)),
+        ));
+        false
+    }
+
+    fn validate_mutex_guard_invalidation(
+        &mut self,
+        guard: LocalId,
+        action: &str,
+        span: Option<Span>,
+    ) -> bool {
+        let Some(borrow) = self
+            .mutex_guard_borrows
+            .values()
+            .find(|borrow| borrow.guard == guard)
+            .copied()
+        else {
+            return true;
+        };
+        let guard_name = self.local_name(guard).unwrap_or("<temporary>");
+        self.error(
+            format!(
+                "cannot {action} MutexGuard `{guard_name}` while a reference borrowed from it is live"
+            ),
+            span.or(Some(borrow.origin)),
+        );
+        false
+    }
+
+    pub(crate) fn type_contains_mutex_guard(ty: &Type) -> bool {
+        if ty.is_mutex_guard() {
+            return true;
+        }
+        match ty {
+            Type::App { args, .. } | Type::Tuple(args) | Type::Function { params: args, .. } => {
+                args.iter().any(Self::type_contains_mutex_guard)
+                    || matches!(ty, Type::Function { ret, .. } if Self::type_contains_mutex_guard(ret))
+            }
+            Type::Array(inner, _)
+            | Type::Own(inner)
+            | Type::RawPtr(inner)
+            | Type::Shared(inner)
+            | Type::Ref(inner, _) => Self::type_contains_mutex_guard(inner),
+            _ => false,
+        }
+    }
+
+    fn value_contains_mutex_guard(&self, value: &MirValue) -> bool {
+        let MirValue::Local(local) = value else {
+            return false;
+        };
+        self.mutex_loans.contains_key(local)
+            || self.mutex_guard_borrows.contains_key(local)
+            || self
+                .local_ty(*local)
+                .is_some_and(Self::type_contains_mutex_guard)
+    }
+
+    pub(crate) fn reject_mutex_guard_return(&mut self, value: Option<&MirValue>, span: Span) {
+        if value.is_some_and(|value| self.value_contains_mutex_guard(value)) {
+            self.error(
+                "MutexGuard and references borrowed from it cannot escape through return",
+                Some(span),
+            );
+        }
+    }
+
+    fn reject_mutex_guard_field_storage(&mut self, value: &Rvalue) {
+        if let Rvalue::Move(source) = value
+            && self.value_contains_mutex_guard(&MirValue::Local(*source))
+        {
+            self.error(
+                "MutexGuard cannot be stored in a struct field; keep it in a direct lexical binding",
+                None,
+            );
+        }
+    }
+
+    fn reject_mutex_guard_storage(&mut self, destination: LocalId, value: &Rvalue) {
+        let reject_value = |this: &mut Self, value: &MirValue, destination_name: &str| {
+            if this.value_contains_mutex_guard(value) {
+                this.error(
+                    format!(
+                        "MutexGuard cannot be stored in {destination_name}; keep it in a direct lexical binding"
+                    ),
+                    None,
+                );
+            }
+        };
+        match value {
+            Rvalue::StructLit { field_values, .. } => {
+                for (_, value) in field_values {
+                    reject_value(self, value, "an aggregate");
+                }
+            }
+            Rvalue::ArrayLit { elements, .. } => {
+                for value in elements {
+                    reject_value(self, value, "an array");
+                }
+            }
+            Rvalue::EnumConstruct {
+                payload: Some(value),
+                ..
+            } if !self.mutex_try_option_locals.contains(&destination) => {
+                reject_value(self, value, "an enum payload");
+            }
+            Rvalue::VecPush { value, .. } => reject_value(self, value, "a Vec"),
+            Rvalue::MapAdd { key, value, .. } | Rvalue::MapUpdate { key, value, .. } => {
+                reject_value(self, key, "a Map");
+                reject_value(self, value, "a Map");
+            }
+            Rvalue::OwnNew { value, .. } => reject_value(self, value, "an Own allocation"),
+            Rvalue::SharedNew { value, .. } => reject_value(self, value, "a Shared allocation"),
+            Rvalue::ArcNew { value, .. } => reject_value(self, value, "an Arc allocation"),
+            Rvalue::MutexNew { value, .. } => reject_value(self, value, "a Mutex allocation"),
+            Rvalue::MakeClosure { captures, .. } => {
+                for capture in captures {
+                    if self.mutex_loans.contains_key(&capture.local)
+                        || self
+                            .local_ty(capture.local)
+                            .is_some_and(Self::type_contains_mutex_guard)
+                    {
+                        self.error("MutexGuard cannot be captured by a closure", None);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

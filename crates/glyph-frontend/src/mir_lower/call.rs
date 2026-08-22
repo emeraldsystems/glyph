@@ -6,14 +6,16 @@ use glyph_core::types::{Mutability, Type};
 use crate::resolver::SelfKind;
 
 use super::builtins::{
-    lower_atomic_constructor, lower_atomic_method, lower_file_close, lower_file_open,
-    lower_file_read_to_string, lower_file_write_string, lower_map_add, lower_map_del,
-    lower_map_get, lower_map_has, lower_map_keys, lower_map_static_new,
-    lower_map_static_with_capacity, lower_map_update, lower_map_vals, lower_own_from_raw,
-    lower_own_into_raw, lower_own_new, lower_print_builtin, lower_shared_clone, lower_shared_new,
-    lower_string_as_str, lower_string_clone, lower_string_concat, lower_string_ends_with,
-    lower_string_from, lower_string_len, lower_string_slice, lower_string_split,
-    lower_string_starts_with, lower_string_trim, lower_term_stdout, lower_vec_get, lower_vec_len,
+    is_canonical_arc_new, is_canonical_mutex_new, is_canonical_spawn, lower_arc_method,
+    lower_arc_new, lower_atomic_constructor, lower_atomic_method, lower_file_close,
+    lower_file_open, lower_file_read_to_string, lower_file_write_string, lower_map_add,
+    lower_map_del, lower_map_get, lower_map_has, lower_map_keys, lower_map_static_new,
+    lower_map_static_with_capacity, lower_map_update, lower_map_vals, lower_mutex_method,
+    lower_mutex_new, lower_own_from_raw, lower_own_into_raw, lower_own_new, lower_print_builtin,
+    lower_shared_clone, lower_shared_new, lower_string_as_str, lower_string_clone,
+    lower_string_concat, lower_string_ends_with, lower_string_from, lower_string_len,
+    lower_string_slice, lower_string_split, lower_string_starts_with, lower_string_trim,
+    lower_term_stdout, lower_thread_method, lower_thread_spawn, lower_vec_get, lower_vec_len,
     lower_vec_pop, lower_vec_push, lower_vec_static_new, lower_vec_static_with_capacity,
 };
 use super::context::{LocalState, LowerCtx};
@@ -40,6 +42,23 @@ pub(crate) fn call_types_compatible(actual: &Type, expected: &Type) -> bool {
         return true;
     }
     match (actual, expected) {
+        (
+            Type::Function {
+                params: actual_params,
+                ret: actual_ret,
+            },
+            Type::Function {
+                params: expected_params,
+                ret: expected_ret,
+            },
+        ) => {
+            actual_params.len() == expected_params.len()
+                && actual_params
+                    .iter()
+                    .zip(expected_params)
+                    .all(|(actual, expected)| call_types_compatible(actual, expected))
+                && call_types_compatible(actual_ret, expected_ret)
+        }
         (Type::Ref(inner, _), expected) => inner.as_ref() == expected,
         (actual, Type::Ref(inner, _)) => actual == inner.as_ref(),
         _ => false,
@@ -344,17 +363,22 @@ pub(crate) fn lower_call<'a>(
         ctx.push_inst(MirInst::Assign {
             local: tmp,
             value: Rvalue::Call {
-                name: call_target,
+                name: call_target.clone(),
                 args: lowered_args,
             },
         });
+        if matches!(ctx.local_ty(tmp), Some(Type::Function { .. })) {
+            if let Some(provenance) = ctx.callable_return_provenance.get(&call_target).cloned() {
+                ctx.callable_provenance.insert(tmp, provenance);
+            }
+        }
     }
 
     Some(Rvalue::Move(tmp))
 }
 
 /// Infer the type of an expression for method call resolution
-fn infer_expr_type(ctx: &LowerCtx, expr: &Expr) -> Option<glyph_core::types::Type> {
+pub(crate) fn infer_expr_type(ctx: &LowerCtx, expr: &Expr) -> Option<glyph_core::types::Type> {
     match expr {
         // Local variable: look up in bindings
         Expr::Ident(name, _) => {
@@ -439,6 +463,15 @@ pub(crate) fn lower_method_call<'a>(
     args: &'a [Expr],
     span: Span,
 ) -> Option<Rvalue> {
+    if let Some(result) = lower_thread_method(ctx, receiver, &method.0, args, span) {
+        return result;
+    }
+    if let Some(result) = lower_arc_method(ctx, receiver, &method.0, args, span) {
+        return result;
+    }
+    if let Some(result) = lower_mutex_method(ctx, receiver, &method.0, args, span) {
+        return result;
+    }
     if matches!(
         method.0.as_str(),
         "load" | "store" | "swap" | "compare_exchange" | "fetch_add" | "fetch_sub" | "is_lock_free"
@@ -683,6 +716,15 @@ fn lower_method_builtin<'a>(
     span: Span,
 ) -> Option<Option<Rvalue>> {
     if let Expr::FieldAccess { base, field, .. } = callee {
+        if let Some(result) = lower_thread_method(ctx, base, &field.0, args, span) {
+            return Some(result);
+        }
+        if let Some(result) = lower_arc_method(ctx, base, &field.0, args, span) {
+            return Some(result);
+        }
+        if let Some(result) = lower_mutex_method(ctx, base, &field.0, args, span) {
+            return Some(result);
+        }
         if matches!(
             field.0.as_str(),
             "load"
@@ -735,6 +777,9 @@ fn lower_static_builtin_with_expected<'a>(
     };
 
     match name.0.as_str() {
+        name if is_canonical_spawn(ctx, name) => lower_thread_spawn(ctx, args, span),
+        name if is_canonical_arc_new(ctx, name) => lower_arc_new(ctx, args, span),
+        name if is_canonical_mutex_new(ctx, name) => lower_mutex_new(ctx, args, span),
         "Own::new" => lower_own_new(ctx, args, span),
         "Own::from_raw" => lower_own_from_raw(ctx, args, span),
         "Shared::new" => lower_shared_new(ctx, args, span),

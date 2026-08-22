@@ -173,15 +173,48 @@ pub enum Rvalue {
         task: LocalId,
         out_handle: LocalId,
     },
+    /// Transfer an owned `FnOnce() -> T` carrier to a native thread.
+    ///
+    /// The runtime owns an uninitialized `T` slot after a successful spawn.
+    /// `result_type` fixes the compiler-generated entry and drop thunks; it
+    /// must exactly match the task's concrete return type.
+    ThreadSpawnResult {
+        task: LocalId,
+        out_handle: LocalId,
+        result_type: Type,
+    },
     /// Join a private unit-thread handle, returning the runtime `i32` status.
     /// The runtime nulls handle storage only after a successful join.
     ThreadJoinUnit {
         handle: LocalId,
     },
+    /// Join a typed thread and move its result into `out_result` exactly once.
+    ///
+    /// The output local is initialized only when the returned runtime status
+    /// is zero. A failed join leaves both handle and runtime result retryable.
+    ThreadJoinResult {
+        handle: LocalId,
+        out_result: LocalId,
+        result_type: Type,
+    },
     /// Detach a private unit-thread handle, returning the runtime `i32` status.
     /// The runtime nulls handle storage only after a successful detach.
     ThreadDetachUnit {
         handle: LocalId,
+    },
+    /// Wrap private raw handle storage in the canonical, source-visible
+    /// `std::thread::JoinHandle<()>` identity. The raw source is cleared.
+    ThreadHandleFromRaw {
+        raw: LocalId,
+    },
+    /// Consume a canonical unit join handle into private raw storage. The
+    /// public source is cleared so its drop is a no-op.
+    ThreadHandleIntoRaw {
+        handle: LocalId,
+    },
+    /// Wrap a negative runtime status in canonical `ThreadError` storage.
+    ThreadErrorFromStatus {
+        status: MirValue,
     },
     StructLit {
         struct_name: String,
@@ -363,6 +396,74 @@ pub enum Rvalue {
         base: LocalId,
         elem_type: Type,
     },
+    /// Allocate one immutable payload behind an atomic strong count.
+    /// `value` is transferred into the new `std::sync::Arc<T>` allocation.
+    ArcNew {
+        value: MirValue,
+        elem_type: Type,
+    },
+    /// Explicitly clone an Arc owner with an atomic strong-count increment.
+    ArcClone {
+        base: LocalId,
+        elem_type: Type,
+    },
+    /// Borrow the immutable payload. The frontend must constrain the returned
+    /// reference to the source Arc owner's lifetime and reject escaping it.
+    ArcBorrow {
+        base: LocalId,
+        elem_type: Type,
+    },
+    /// Allocate a stable, exclusively locked payload owner.
+    MutexNew {
+        value: MirValue,
+        elem_type: Type,
+    },
+    /// Block until the mutex is acquired and return its nonescaping guard.
+    MutexLock {
+        base: LocalId,
+        elem_type: Type,
+    },
+    /// Attempt acquisition without blocking. A null guard denotes contention;
+    /// runtime failures other than contention are fatal.
+    MutexTryLock {
+        base: LocalId,
+        elem_type: Type,
+    },
+    /// Test the nullable guard returned by `MutexTryLock`.
+    MutexGuardIsAcquired {
+        guard: LocalId,
+        elem_type: Type,
+    },
+    /// Borrow the guarded payload mutably for the guard's lexical lifetime.
+    MutexGuardBorrow {
+        guard: LocalId,
+        elem_type: Type,
+    },
+    /// Allocate one fixed-capacity ring and initialize its unique endpoints.
+    /// The returned value is `Sender<T>`; `out_receiver` names writable
+    /// `Receiver<T>` storage (a local or `&mut Receiver<T>` parameter).
+    SpscChannelNew {
+        capacity: MirValue,
+        out_receiver: LocalId,
+        elem_type: Type,
+    },
+    /// Attempt to transfer `value` into the ring without blocking. The value
+    /// local is always consumed. Status is 0 on success, 1 when full, and 2
+    /// when disconnected; on either failure ownership is moved to
+    /// `out_unsent` (a local or mutable reference).
+    SpscTrySend {
+        sender: LocalId,
+        value: LocalId,
+        out_unsent: LocalId,
+        elem_type: Type,
+    },
+    /// Attempt to receive without blocking. Status is 0 with `out_value`
+    /// initialized, 1 while empty, and 2 when the producer is disconnected.
+    SpscTryRecv {
+        receiver: LocalId,
+        out_value: LocalId,
+        elem_type: Type,
+    },
     /// Initialize atomic storage before it can be shared.
     AtomicNew {
         value: MirValue,
@@ -507,6 +608,86 @@ mod tests {
             let encoded = serde_json::to_string(&rvalue).unwrap();
             let decoded: Rvalue = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, rvalue);
+        }
+    }
+
+    #[test]
+    fn arc_mir_round_trips_through_json() {
+        let rvalues = [
+            Rvalue::ArcNew {
+                value: MirValue::Local(LocalId(0)),
+                elem_type: Type::String,
+            },
+            Rvalue::ArcClone {
+                base: LocalId(1),
+                elem_type: Type::String,
+            },
+            Rvalue::ArcBorrow {
+                base: LocalId(2),
+                elem_type: Type::String,
+            },
+        ];
+
+        for rvalue in rvalues {
+            let encoded = serde_json::to_string(&rvalue).unwrap();
+            let decoded: Rvalue = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, rvalue);
+        }
+    }
+
+    #[test]
+    fn mutex_mir_round_trips_through_json() {
+        let rvalues = [
+            Rvalue::MutexNew {
+                value: MirValue::Int(1),
+                elem_type: Type::I32,
+            },
+            Rvalue::MutexLock {
+                base: LocalId(0),
+                elem_type: Type::I32,
+            },
+            Rvalue::MutexTryLock {
+                base: LocalId(0),
+                elem_type: Type::I32,
+            },
+            Rvalue::MutexGuardIsAcquired {
+                guard: LocalId(1),
+                elem_type: Type::I32,
+            },
+            Rvalue::MutexGuardBorrow {
+                guard: LocalId(1),
+                elem_type: Type::I32,
+            },
+        ];
+        for rvalue in rvalues {
+            let encoded = serde_json::to_string(&rvalue).unwrap();
+            assert_eq!(serde_json::from_str::<Rvalue>(&encoded).unwrap(), rvalue);
+        }
+    }
+
+    #[test]
+    fn spsc_mir_round_trips_through_json() {
+        let rvalues = [
+            Rvalue::SpscChannelNew {
+                capacity: MirValue::Int(8),
+                out_receiver: LocalId(1),
+                elem_type: Type::String,
+            },
+            Rvalue::SpscTrySend {
+                sender: LocalId(0),
+                value: LocalId(2),
+                out_unsent: LocalId(3),
+                elem_type: Type::String,
+            },
+            Rvalue::SpscTryRecv {
+                receiver: LocalId(1),
+                out_value: LocalId(4),
+                elem_type: Type::String,
+            },
+        ];
+        for rvalue in rvalues {
+            let encoded = serde_json::to_string(&rvalue).unwrap();
+            assert_eq!(serde_json::from_str::<Rvalue>(&encoded).unwrap(), rvalue);
         }
     }
 }

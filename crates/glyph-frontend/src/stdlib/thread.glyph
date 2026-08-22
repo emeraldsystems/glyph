@@ -1,0 +1,10 @@
+// Canonical compiler-owned thread surface. The declarations provide resolver
+// identities only; calls are lowered as intrinsics and never invoke these
+// placeholder bodies.
+
+import Result from std/enums
+
+struct JoinHandle<T> {}
+struct ThreadError {}
+
+fn spawn(task: FnOnce<(), ()>) -> Result<JoinHandle<()>, ThreadError> {}

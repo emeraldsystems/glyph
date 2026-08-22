@@ -1,0 +1,9 @@
+[package]
+name = "closures"
+version = "0.1.0"
+
+[dependencies]
+
+[[bin]]
+name = "closures"
+path = "src/main.glyph"
