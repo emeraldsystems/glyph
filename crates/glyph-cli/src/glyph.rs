@@ -109,6 +109,23 @@ enum DependencySpec {
     Path { path: String },
 }
 
+/// `[link]` section: native libraries and search paths passed to the linker.
+///
+/// ```toml
+/// [link]
+/// libs = ["m", "portaudio"]
+/// search_paths = ["vendor/lib"]
+/// ```
+///
+/// Relative search paths are resolved against the project root.
+#[derive(Debug, Deserialize, Default)]
+struct LinkSection {
+    #[serde(default)]
+    libs: Vec<String>,
+    #[serde(default)]
+    search_paths: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct Manifest {
     package: PackageSection,
@@ -118,6 +135,8 @@ struct Manifest {
     bin: Vec<BinTarget>,
     #[serde(default)]
     dependencies: HashMap<String, DependencySpec>,
+    #[serde(default)]
+    link: LinkSection,
 }
 
 fn main() {
@@ -594,11 +613,17 @@ fn build_bin(
 
         let linker = Linker::new();
         let runtime_lib = Linker::get_runtime_lib_path();
+        let link_search_paths = manifest
+            .link
+            .search_paths
+            .iter()
+            .map(|p| root.join(p))
+            .collect();
         let opts = LinkerOptions {
             output_path: exe_path.clone(),
             object_files: vec![obj_path.clone()],
-            link_libs: Vec::new(),
-            link_search_paths: Vec::new(),
+            link_libs: manifest.link.libs.clone(),
+            link_search_paths,
             runtime_lib_path: runtime_lib,
         };
 
