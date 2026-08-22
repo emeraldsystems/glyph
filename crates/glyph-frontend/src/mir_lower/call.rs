@@ -6,19 +6,155 @@ use glyph_core::types::{Mutability, Type};
 use crate::resolver::SelfKind;
 
 use super::builtins::{
-    lower_file_close, lower_file_open, lower_file_read_to_string, lower_file_write_string,
-    lower_map_add, lower_map_del, lower_map_get, lower_map_has, lower_map_keys,
-    lower_map_static_new, lower_map_static_with_capacity, lower_map_update, lower_map_vals,
-    lower_own_from_raw, lower_own_into_raw, lower_own_new, lower_print_builtin, lower_shared_clone,
-    lower_shared_new, lower_string_as_str, lower_string_clone, lower_string_concat,
-    lower_string_ends_with, lower_string_from, lower_string_len, lower_string_slice,
-    lower_string_split, lower_string_starts_with, lower_string_trim, lower_term_stdout,
-    lower_vec_get, lower_vec_len, lower_vec_pop, lower_vec_push, lower_vec_static_new,
-    lower_vec_static_with_capacity,
+    lower_atomic_constructor, lower_atomic_method, lower_file_close, lower_file_open,
+    lower_file_read_to_string, lower_file_write_string, lower_map_add, lower_map_del,
+    lower_map_get, lower_map_has, lower_map_keys, lower_map_static_new,
+    lower_map_static_with_capacity, lower_map_update, lower_map_vals, lower_own_from_raw,
+    lower_own_into_raw, lower_own_new, lower_print_builtin, lower_shared_clone, lower_shared_new,
+    lower_string_as_str, lower_string_clone, lower_string_concat, lower_string_ends_with,
+    lower_string_from, lower_string_len, lower_string_slice, lower_string_split,
+    lower_string_starts_with, lower_string_trim, lower_term_stdout, lower_vec_get, lower_vec_len,
+    lower_vec_pop, lower_vec_push, lower_vec_static_new, lower_vec_static_with_capacity,
 };
 use super::context::{LocalState, LowerCtx};
 use super::expr::{lower_array_len, lower_ref_expr, lower_value, lower_value_with_expected};
 use super::value::infer_value_type;
+
+pub(crate) fn call_types_compatible(actual: &Type, expected: &Type) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if matches!(actual, Type::Param(_)) || matches!(expected, Type::Param(_)) {
+        return true;
+    }
+    let is_unit = |ty: &Type| {
+        matches!(ty, Type::Void) || matches!(ty, Type::Tuple(elements) if elements.is_empty())
+    };
+    if is_unit(actual) && is_unit(expected) {
+        return true;
+    }
+    if matches!(
+        (actual, expected),
+        (Type::Str, Type::String) | (Type::String, Type::Str)
+    ) {
+        return true;
+    }
+    match (actual, expected) {
+        (Type::Ref(inner, _), expected) => inner.as_ref() == expected,
+        (actual, Type::Ref(inner, _)) => actual == inner.as_ref(),
+        _ => false,
+    }
+}
+
+fn validate_call_argument(
+    ctx: &mut LowerCtx<'_>,
+    value: &MirValue,
+    expected: &Type,
+    index: usize,
+    callee_name: &str,
+    span: Span,
+) -> bool {
+    let Some(actual) = infer_value_type(value, ctx) else {
+        ctx.error(
+            format!(
+                "cannot infer type of argument {} in call to '{}'",
+                index + 1,
+                callee_name
+            ),
+            Some(span),
+        );
+        return false;
+    };
+    if call_types_compatible(&actual, expected) {
+        return true;
+    }
+    ctx.error(
+        format!(
+            "argument {} to '{}' has type '{}', expected '{}'",
+            index + 1,
+            callee_name,
+            LowerCtx::type_label(&actual),
+            LowerCtx::type_label(expected)
+        ),
+        Some(span),
+    );
+    false
+}
+
+fn lower_indirect_call<'a>(
+    ctx: &mut LowerCtx<'a>,
+    callee: glyph_core::mir::LocalId,
+    callee_name: &str,
+    signature: Type,
+    args: &'a [Expr],
+    span: Span,
+    expected_ret: Option<&Type>,
+) -> Option<Rvalue> {
+    if !ctx.check_local_available(callee, Some(span)) {
+        return None;
+    }
+    let Type::Function { params, ret } = &signature else {
+        ctx.error(
+            format!(
+                "value '{}' of type '{}' is not callable",
+                callee_name,
+                LowerCtx::type_label(&signature)
+            ),
+            Some(span),
+        );
+        return None;
+    };
+    if params.len() != args.len() {
+        ctx.error(
+            format!(
+                "callable '{}' expects {} arguments but got {}",
+                callee_name,
+                params.len(),
+                args.len()
+            ),
+            Some(span),
+        );
+        return None;
+    }
+    if let Some(expected) = expected_ret {
+        if !call_types_compatible(ret, expected) {
+            ctx.error(
+                format!(
+                    "callable '{}' returns '{}', but '{}' is required here",
+                    callee_name,
+                    LowerCtx::type_label(ret),
+                    LowerCtx::type_label(expected)
+                ),
+                Some(span),
+            );
+            return None;
+        }
+    }
+
+    let mut lowered_args = Vec::with_capacity(args.len());
+    for (index, (arg, expected)) in args.iter().zip(params).enumerate() {
+        let value = lower_value_with_expected(ctx, arg, Some(expected))?;
+        if !validate_call_argument(ctx, &value, expected, index, callee_name, span) {
+            return None;
+        }
+        if !consume_call_local(ctx, &value, span, Some(expected)) {
+            return None;
+        }
+        lowered_args.push(value);
+    }
+
+    let tmp = ctx.fresh_local(None);
+    ctx.locals[tmp.0 as usize].ty = Some(ret.as_ref().clone());
+    ctx.push_inst(MirInst::Assign {
+        local: tmp,
+        value: Rvalue::CallIndirect {
+            callee,
+            signature,
+            args: lowered_args,
+        },
+    });
+    Some(Rvalue::Move(tmp))
+}
 
 fn consume_call_local(
     ctx: &mut LowerCtx<'_>,
@@ -83,9 +219,23 @@ pub(crate) fn lower_call<'a>(
     }
 
     let Expr::Ident(name, _) = callee else {
-        ctx.error("call target must be an identifier", Some(span));
+        ctx.error(
+            "call target must be a function or callable local",
+            Some(span),
+        );
         return None;
     };
+
+    if let Some(local) = ctx.bindings.get(name.0.as_str()).copied() {
+        let Some(local_ty) = ctx.local_ty(local).cloned() else {
+            ctx.error(
+                format!("cannot call '{}' because its type is unknown", name.0),
+                Some(span),
+            );
+            return None;
+        };
+        return lower_indirect_call(ctx, local, &name.0, local_ty, args, span, expected_ret);
+    }
 
     let Some(sig) = ctx.fn_sigs.get(&name.0) else {
         ctx.error(format!("unknown function '{}'", name.0), Some(span));
@@ -112,6 +262,24 @@ pub(crate) fn lower_call<'a>(
             Some(span),
         );
         return None;
+    }
+
+    if let Some(expected) = expected_ret {
+        let actual = sig.ret.as_ref().unwrap_or(&Type::Void);
+        if (matches!(actual, Type::Function { .. }) || matches!(expected, Type::Function { .. }))
+            && !call_types_compatible(actual, expected)
+        {
+            ctx.error(
+                format!(
+                    "function '{}' returns '{}', but '{}' is required here",
+                    name.0,
+                    LowerCtx::type_label(actual),
+                    LowerCtx::type_label(expected)
+                ),
+                Some(span),
+            );
+            return None;
+        }
     }
 
     let mut lowered_args = Vec::new();
@@ -271,6 +439,15 @@ pub(crate) fn lower_method_call<'a>(
     args: &'a [Expr],
     span: Span,
 ) -> Option<Rvalue> {
+    if matches!(
+        method.0.as_str(),
+        "load" | "store" | "swap" | "compare_exchange" | "fetch_add" | "fetch_sub" | "is_lock_free"
+    ) {
+        if let Some(rv) = lower_atomic_method(ctx, receiver, &method.0, args, span) {
+            return Some(rv);
+        }
+    }
+
     // Handle built-in method-like operations that are not tied to interfaces.
     match method.0.as_str() {
         "len" => {
@@ -506,6 +683,18 @@ fn lower_method_builtin<'a>(
     span: Span,
 ) -> Option<Option<Rvalue>> {
     if let Expr::FieldAccess { base, field, .. } = callee {
+        if matches!(
+            field.0.as_str(),
+            "load"
+                | "store"
+                | "swap"
+                | "compare_exchange"
+                | "fetch_add"
+                | "fetch_sub"
+                | "is_lock_free"
+        ) {
+            return Some(lower_atomic_method(ctx, base, &field.0, args, span));
+        }
         match field.0.as_str() {
             "len" => {
                 if !args.is_empty() {
@@ -549,6 +738,9 @@ fn lower_static_builtin_with_expected<'a>(
         "Own::new" => lower_own_new(ctx, args, span),
         "Own::from_raw" => lower_own_from_raw(ctx, args, span),
         "Shared::new" => lower_shared_new(ctx, args, span),
+        name if name.starts_with("Atomic") && name.ends_with("::new") => {
+            lower_atomic_constructor(ctx, name, args, span)
+        }
         "Terminal::stdout" => lower_term_stdout(ctx, args, span),
         "Vec::new" => lower_vec_static_new(ctx, args, span, expected_ret),
         "Vec::with_capacity" => lower_vec_static_with_capacity(ctx, args, span, expected_ret),

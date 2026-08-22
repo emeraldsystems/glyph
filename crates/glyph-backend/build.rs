@@ -12,12 +12,15 @@ const RUNTIME_SOURCES: &[&str] = &[
     "glyph_term",
     "glyph_net",
     "glyph_audio",
+    "glyph_thread",
 ];
 
 fn main() {
     // Get the output directory where cargo builds artifacts
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let runtime_lib = out_dir.join("libglyph_runtime.a");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let profile = env::var("PROFILE").unwrap_or_default();
 
     let mut objects = Vec::new();
     for name in RUNTIME_SOURCES {
@@ -28,13 +31,22 @@ fn main() {
 
         let obj = out_dir.join(format!("{}.o", name));
         println!("cargo:warning=Compiling runtime library from {:?}", src);
-        let status = Command::new("cc")
-            .args(&[
-                "-c",    // Compile only, don't link
-                "-O2",   // Optimize
-                "-fPIC", // Position-independent code for shared libraries
-                "-Wall", // Enable warnings
-            ])
+        let mut cc = Command::new("cc");
+        cc.args(&[
+            "-c",    // Compile only, don't link
+            "-O2",   // Optimize
+            "-fPIC", // Position-independent code for shared libraries
+            "-Wall", // Enable warnings
+        ]);
+        if name == &"glyph_thread" {
+            if matches!(target_os.as_str(), "macos" | "linux") {
+                cc.arg("-pthread");
+            }
+            if profile != "release" {
+                cc.arg("-DGLYPH_THREAD_ENABLE_TEST_HOOKS=1");
+            }
+        }
+        let status = cc
             .arg(&src)
             .arg("-o")
             .arg(&obj)
@@ -49,6 +61,9 @@ fn main() {
         }
 
         println!("cargo:rerun-if-changed=../../runtime/{}.c", name);
+        if name == &"glyph_thread" {
+            println!("cargo:rerun-if-changed=../../runtime/glyph_thread.h");
+        }
         objects.push(obj);
     }
 
@@ -69,6 +84,9 @@ fn main() {
     // Tell cargo where to find the runtime library
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=glyph_runtime");
+    if matches!(target_os.as_str(), "macos" | "linux") {
+        println!("cargo:rustc-link-lib=pthread");
+    }
 
     println!(
         "cargo:warning=Runtime library built successfully at {}",

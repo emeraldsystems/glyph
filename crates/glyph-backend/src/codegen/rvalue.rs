@@ -266,6 +266,13 @@ impl CodegenContext {
             Rvalue::RawPtrNull { .. } => "RawPtrNull",
             Rvalue::SharedNew { .. } => "SharedNew",
             Rvalue::SharedClone { .. } => "SharedClone",
+            Rvalue::AtomicNew { .. } => "AtomicNew",
+            Rvalue::AtomicLoad { .. } => "AtomicLoad",
+            Rvalue::AtomicStore { .. } => "AtomicStore",
+            Rvalue::AtomicRmw { .. } => "AtomicRmw",
+            Rvalue::AtomicCompareExchange { .. } => "AtomicCompareExchange",
+            Rvalue::AtomicFence { .. } => "AtomicFence",
+            Rvalue::AtomicIsLockFree { .. } => "AtomicIsLockFree",
         }
     }
 
@@ -382,6 +389,19 @@ impl CodegenContext {
                     global_name,
                 } => self.codegen_string_literal(content, global_name),
                 Rvalue::Move(local_id) => {
+                    if let Some(Type::Atomic(scalar)) = func
+                        .locals
+                        .get(local_id.0 as usize)
+                        .and_then(|local| local.ty.as_ref())
+                    {
+                        return self.codegen_atomic_load(
+                            *local_id,
+                            *scalar,
+                            glyph_core::atomic::AtomicOrdering::SeqCst,
+                            func,
+                            local_map,
+                        );
+                    }
                     let local_ptr = local_map
                         .get(local_id)
                         .ok_or_else(|| anyhow!("undefined local {:?}", local_id))?;
@@ -1085,6 +1105,40 @@ impl CodegenContext {
                 Rvalue::SharedClone { base, elem_type } => {
                     self.codegen_shared_clone(*base, elem_type, local_map)
                 }
+                Rvalue::AtomicNew { value, scalar } => {
+                    self.codegen_atomic_new(value, *scalar, func, local_map)
+                }
+                Rvalue::AtomicLoad {
+                    atomic,
+                    scalar,
+                    ordering,
+                } => self.codegen_atomic_load(*atomic, *scalar, *ordering, func, local_map),
+                Rvalue::AtomicStore {
+                    atomic,
+                    value,
+                    scalar,
+                    ordering,
+                } => self.codegen_atomic_store(*atomic, value, *scalar, *ordering, func, local_map),
+                Rvalue::AtomicRmw {
+                    atomic,
+                    value,
+                    scalar,
+                    op,
+                    ordering,
+                } => self
+                    .codegen_atomic_rmw(*atomic, value, *scalar, *op, *ordering, func, local_map),
+                Rvalue::AtomicCompareExchange {
+                    atomic,
+                    expected,
+                    desired,
+                    scalar,
+                    success,
+                    failure,
+                } => self.codegen_atomic_compare_exchange(
+                    *atomic, expected, desired, *scalar, *success, *failure, func, local_map,
+                ),
+                Rvalue::AtomicFence { ordering } => self.codegen_atomic_fence(*ordering),
+                Rvalue::AtomicIsLockFree { scalar } => self.codegen_atomic_is_lock_free(*scalar),
             }
         }
     }
@@ -1095,6 +1149,25 @@ impl CodegenContext {
         func: &MirFunction,
         local_map: &HashMap<LocalId, LLVMValueRef>,
     ) -> Result<LLVMValueRef> {
+        if let MirValue::Local(local_id) = value {
+            if let Some(Type::Atomic(scalar)) = func
+                .locals
+                .get(local_id.0 as usize)
+                .and_then(|local| local.ty.as_ref())
+            {
+                // Moving an atomic wrapper through a call/return boundary is
+                // still an access to its backing storage. The destination is
+                // a distinct, unaliased wrapper, but the source read must not
+                // fall through to the generic non-atomic load path.
+                return self.codegen_atomic_load(
+                    *local_id,
+                    *scalar,
+                    glyph_core::atomic::AtomicOrdering::SeqCst,
+                    func,
+                    local_map,
+                );
+            }
+        }
         unsafe {
             match value {
                 MirValue::Unit => {

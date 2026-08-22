@@ -1,3 +1,4 @@
+mod atomic;
 mod file;
 mod map;
 mod print;
@@ -6,6 +7,7 @@ mod string;
 mod term;
 mod vec;
 
+pub(crate) use atomic::{lower_atomic_constructor, lower_atomic_method};
 pub(crate) use file::{
     lower_file_close, lower_file_open, lower_file_read_to_string, lower_file_write_string,
 };

@@ -461,6 +461,7 @@ dependencies = [
  "anyhow",
  "glyph-core",
  "insta",
+ "libc",
  "llvm-sys",
 ]
 

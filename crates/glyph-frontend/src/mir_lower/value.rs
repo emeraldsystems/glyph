@@ -242,6 +242,19 @@ pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
         Rvalue::RawPtrNull { elem_type } => Some(Type::RawPtr(Box::new(elem_type.clone()))),
         Rvalue::SharedNew { elem_type, .. } => Some(Type::Shared(Box::new(elem_type.clone()))),
         Rvalue::SharedClone { elem_type, .. } => Some(Type::Shared(Box::new(elem_type.clone()))),
+        Rvalue::AtomicNew { scalar, .. } => Some(Type::Atomic(*scalar)),
+        Rvalue::AtomicLoad { scalar, .. }
+        | Rvalue::AtomicRmw { scalar, .. }
+        | Rvalue::AtomicCompareExchange { scalar, .. } => Some(match scalar {
+            glyph_core::atomic::AtomicScalar::Bool => Type::Bool,
+            glyph_core::atomic::AtomicScalar::I32 => Type::I32,
+            glyph_core::atomic::AtomicScalar::U32 => Type::U32,
+            glyph_core::atomic::AtomicScalar::I64 => Type::I64,
+            glyph_core::atomic::AtomicScalar::U64 => Type::U64,
+            glyph_core::atomic::AtomicScalar::Usize => Type::Usize,
+        }),
+        Rvalue::AtomicStore { .. } | Rvalue::AtomicFence { .. } => Some(Type::Void),
+        Rvalue::AtomicIsLockFree { .. } => Some(Type::Bool),
         Rvalue::FunctionRef { signature, .. } => Some(signature.clone()),
         Rvalue::CallIndirect { signature, .. } => {
             signature.function_signature().map(|(_, ret)| ret.clone())

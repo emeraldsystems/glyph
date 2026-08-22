@@ -384,6 +384,7 @@ impl<'a> LowerCtx<'a> {
         match ty {
             Type::Own(_)
             | Type::Shared(_)
+            | Type::Atomic(_)
             | Type::String
             | Type::Enum(_)
             | Type::Function { .. } => true,
@@ -400,6 +401,7 @@ impl<'a> LowerCtx<'a> {
         match ty {
             Type::Own(_)
             | Type::Shared(_)
+            | Type::Atomic(_)
             | Type::String
             | Type::Enum(_)
             | Type::Function { .. } => true,
@@ -417,7 +419,7 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    fn type_label(ty: &Type) -> String {
+    pub(crate) fn type_label(ty: &Type) -> String {
         match ty {
             Type::I8 => "i8".to_string(),
             Type::I32 => "i32".to_string(),
@@ -451,6 +453,7 @@ impl<'a> LowerCtx<'a> {
             Type::Own(inner) => format!("Own<{}>", Self::type_label(inner)),
             Type::RawPtr(inner) => format!("RawPtr<{}>", Self::type_label(inner)),
             Type::Shared(inner) => format!("Shared<{}>", Self::type_label(inner)),
+            Type::Atomic(scalar) => scalar.type_name().to_string(),
             Type::Function { params, ret } => {
                 let args = match params.as_slice() {
                     [] => "()".to_string(),
@@ -567,6 +570,13 @@ impl<'a> LowerCtx<'a> {
             // Function call ownership depends on the callee parameter type,
             // so call lowering handles by-value consumption and by-reference
             // non-consumption explicitly.
+            // An indirect call consumes its FnOnce carrier. Argument ownership
+            // is still handled by call lowering using the signature.
+            Rvalue::CallIndirect { callee, .. } => {
+                if let Some(state) = self.local_states.get_mut(callee.0 as usize) {
+                    *state = LocalState::Moved;
+                }
+            }
             // Map mutations take ownership of keys/values.
             Rvalue::MapAdd {
                 key, value: val, ..

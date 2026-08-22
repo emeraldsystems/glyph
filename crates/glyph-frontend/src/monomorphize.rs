@@ -174,6 +174,7 @@ fn type_key(ty: &Type) -> String {
         Type::Own(inner) => format!("own_{}", type_key(inner)),
         Type::RawPtr(inner) => format!("rawptr_{}", type_key(inner)),
         Type::Shared(inner) => format!("shared_{}", type_key(inner)),
+        Type::Atomic(scalar) => format!("atomic_{}", scalar.type_name()),
         Type::Function { params, ret } => {
             let params: Vec<String> = params.iter().map(type_key).collect();
             format!(

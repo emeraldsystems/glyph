@@ -17,3 +17,4 @@ llvm-sys = { version = "201", optional = true }
 
 [dev-dependencies]
 insta.workspace = true
+libc = "0.2"

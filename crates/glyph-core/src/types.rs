@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::atomic::AtomicScalar;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Mutability {
     Immutable,
@@ -25,12 +27,18 @@ pub enum Type {
     Named(String),
     Enum(String),
     Param(String),
-    App { base: String, args: Vec<Type> },
+    App {
+        base: String,
+        args: Vec<Type>,
+    },
     Ref(Box<Type>, Mutability),
     Array(Box<Type>, usize),
     Own(Box<Type>),
     RawPtr(Box<Type>),
     Shared(Box<Type>),
+    /// A non-Copy scalar atomic. Its backing storage may only be accessed by
+    /// atomic MIR operations.
+    Atomic(AtomicScalar),
     /// An owned, once-callable value.
     ///
     /// The backend represents this as an erased `{ env, invoke, drop }`
@@ -59,6 +67,12 @@ impl Type {
             "bool" | "b" => Some(Type::Bool),
             "str" => Some(Type::Str),
             "String" => Some(Type::String),
+            "AtomicBool" => Some(Type::Atomic(AtomicScalar::Bool)),
+            "AtomicI32" => Some(Type::Atomic(AtomicScalar::I32)),
+            "AtomicU32" => Some(Type::Atomic(AtomicScalar::U32)),
+            "AtomicI64" => Some(Type::Atomic(AtomicScalar::I64)),
+            "AtomicU64" => Some(Type::Atomic(AtomicScalar::U64)),
+            "AtomicUsize" => Some(Type::Atomic(AtomicScalar::Usize)),
             _ => None,
         }
     }
@@ -151,6 +165,13 @@ impl Type {
     pub fn shared_inner_type(&self) -> Option<&Type> {
         match self {
             Type::Shared(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    pub fn atomic_scalar(&self) -> Option<AtomicScalar> {
+        match self {
+            Type::Atomic(scalar) => Some(*scalar),
             _ => None,
         }
     }

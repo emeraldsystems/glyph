@@ -248,6 +248,9 @@ impl CodegenContext {
 
                 let alloca =
                     unsafe { LLVMBuildAlloca(self.builder, local_ty, local_name.as_ptr()) };
+                if let Some(Type::Atomic(scalar)) = local.ty.as_ref() {
+                    unsafe { LLVMSetAlignment(alloca, self.atomic_alignment(*scalar)?) };
+                }
                 local_map.insert(local_id, alloca);
             }
 
@@ -332,7 +335,18 @@ impl CodegenContext {
                         let target_ty = self.local_llvm_type(func, *local)?;
                         let signed = matches!(local_ty, Some(Type::I8 | Type::I32 | Type::I64));
                         let val = self.coerce_int_value(val, target_ty, signed);
-                        LLVMBuildStore(self.builder, val, *local_ptr);
+                        let store = LLVMBuildStore(self.builder, val, *local_ptr);
+                        if let Some(Type::Atomic(scalar)) = local_ty {
+                            // AtomicNew initializes private storage. Every
+                            // later wrapper move remains an atomic access.
+                            if !matches!(value, Rvalue::AtomicNew { .. }) {
+                                LLVMSetOrdering(
+                                    store,
+                                    llvm_sys::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                                );
+                            }
+                            LLVMSetAlignment(store, self.atomic_alignment(*scalar)?);
+                        }
                     }
                 }
                 MirInst::AssignField {
@@ -396,8 +410,7 @@ impl CodegenContext {
                             if returns_view(func, val) {
                                 if let Some(ret_ty) = func.ret_type.as_ref() {
                                     if Self::type_needs_clone(ret_ty) {
-                                        ret_val =
-                                            self.codegen_deep_clone_value(ret_ty, ret_val)?;
+                                        ret_val = self.codegen_deep_clone_value(ret_ty, ret_val)?;
                                     }
                                 }
                             }

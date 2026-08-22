@@ -1,4 +1,5 @@
 use super::ast::BinaryOp;
+use super::atomic::{AtomicOrdering, AtomicRmwOp, AtomicScalar};
 use super::types::{EnumType, Mutability, StructType, Type};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -306,6 +307,45 @@ pub enum Rvalue {
         base: LocalId,
         elem_type: Type,
     },
+    /// Initialize atomic storage before it can be shared.
+    AtomicNew {
+        value: MirValue,
+        scalar: AtomicScalar,
+    },
+    AtomicLoad {
+        atomic: LocalId,
+        scalar: AtomicScalar,
+        ordering: AtomicOrdering,
+    },
+    AtomicStore {
+        atomic: LocalId,
+        value: MirValue,
+        scalar: AtomicScalar,
+        ordering: AtomicOrdering,
+    },
+    AtomicRmw {
+        atomic: LocalId,
+        value: MirValue,
+        scalar: AtomicScalar,
+        op: AtomicRmwOp,
+        ordering: AtomicOrdering,
+    },
+    /// Returns the value observed before the compare-exchange attempt. The
+    /// exchange succeeded exactly when the result equals `expected`.
+    AtomicCompareExchange {
+        atomic: LocalId,
+        expected: MirValue,
+        desired: MirValue,
+        scalar: AtomicScalar,
+        success: AtomicOrdering,
+        failure: AtomicOrdering,
+    },
+    AtomicFence {
+        ordering: AtomicOrdering,
+    },
+    AtomicIsLockFree {
+        scalar: AtomicScalar,
+    },
     EnumConstruct {
         enum_name: String,
         variant_index: u32,
@@ -336,6 +376,7 @@ pub enum MirValue {
 #[cfg(test)]
 mod tests {
     use super::{LocalId, MirValue, Rvalue};
+    use crate::atomic::{AtomicOrdering, AtomicRmwOp, AtomicScalar};
     use crate::types::Type;
 
     #[test]
@@ -353,6 +394,38 @@ mod tests {
                 callee: LocalId(4),
                 signature,
                 args: vec![MirValue::Int(3), MirValue::Bool(true)],
+            },
+        ];
+
+        for rvalue in rvalues {
+            let encoded = serde_json::to_string(&rvalue).unwrap();
+            let decoded: Rvalue = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, rvalue);
+        }
+    }
+
+    #[test]
+    fn atomic_mir_round_trips_through_json() {
+        let rvalues = [
+            Rvalue::AtomicLoad {
+                atomic: LocalId(0),
+                scalar: AtomicScalar::Usize,
+                ordering: AtomicOrdering::Acquire,
+            },
+            Rvalue::AtomicRmw {
+                atomic: LocalId(0),
+                value: MirValue::Int(1),
+                scalar: AtomicScalar::Usize,
+                op: AtomicRmwOp::Add,
+                ordering: AtomicOrdering::Release,
+            },
+            Rvalue::AtomicCompareExchange {
+                atomic: LocalId(0),
+                expected: MirValue::Int(1),
+                desired: MirValue::Int(2),
+                scalar: AtomicScalar::Usize,
+                success: AtomicOrdering::AcqRel,
+                failure: AtomicOrdering::Acquire,
             },
         ];
 

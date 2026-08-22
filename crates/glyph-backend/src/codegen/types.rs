@@ -139,6 +139,7 @@ impl CodegenContext {
             Type::Own(inner) => format!("own_{}", self.type_key(inner)),
             Type::RawPtr(inner) => format!("rawptr_{}", self.type_key(inner)),
             Type::Shared(inner) => format!("shared_{}", self.type_key(inner)),
+            Type::Atomic(scalar) => format!("atomic_{}", scalar.type_name()),
             Type::Function { params, ret } => {
                 let params: Vec<String> = params.iter().map(|p| self.type_key(p)).collect();
                 format!(
@@ -265,6 +266,7 @@ impl CodegenContext {
                     let elem_ty = self.get_llvm_type(&inner)?;
                     LLVMPointerType(elem_ty, 0)
                 }
+                Type::Atomic(scalar) => self.atomic_storage_type(scalar)?,
                 Type::Function { .. } => {
                     let ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(self.context), 0);
                     let mut fields = [ptr_ty, ptr_ty, ptr_ty];

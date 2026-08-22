@@ -19,6 +19,22 @@ pub(crate) struct FnSig {
     pub(crate) enum_ctor: Option<EnumCtorInfo>,
 }
 
+impl FnSig {
+    /// Convert a fully known function declaration into the owned callable
+    /// signature used for function-item coercion. Enum constructors remain
+    /// compiler operations rather than first-class function values.
+    pub(crate) fn callable_type(&self) -> Option<Type> {
+        if self.enum_ctor.is_some() {
+            return None;
+        }
+        let params = self.params.iter().cloned().collect::<Option<Vec<_>>>()?;
+        Some(Type::Function {
+            params,
+            ret: Box::new(self.ret.clone().unwrap_or(Type::Void)),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EnumCtorInfo {
     pub(crate) enum_name: String,

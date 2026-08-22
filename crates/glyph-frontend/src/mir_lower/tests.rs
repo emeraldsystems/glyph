@@ -890,6 +890,104 @@ fn main() -> i32 {
 }
 
 #[test]
+fn lowers_public_atomic_api_to_seqcst_mir() {
+    use glyph_core::atomic::{AtomicOrdering, AtomicRmwOp, AtomicScalar};
+
+    let src = r#"
+fn main() -> usize {
+  let counter: AtomicUsize = AtomicUsize::new(1)
+  let before = counter.fetch_add(2)
+  counter.store(9)
+  let observed = counter.compare_exchange(9, 12)
+  let current = counter.load()
+  ret before + observed + current
+}
+"#;
+    let out = compile_source(
+        src,
+        FrontendOptions {
+            emit_mir: true,
+            include_std: false,
+        },
+    );
+    assert!(
+        out.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        out.diagnostics
+    );
+
+    let main = out.mir.functions.iter().find(|f| f.name == "main").unwrap();
+    let rvalues: Vec<&Rvalue> = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| match inst {
+            MirInst::Assign { value, .. } => Some(value),
+            _ => None,
+        })
+        .collect();
+
+    assert!(rvalues.iter().any(|value| matches!(
+        value,
+        Rvalue::AtomicNew {
+            scalar: AtomicScalar::Usize,
+            ..
+        }
+    )));
+    assert!(rvalues.iter().any(|value| matches!(
+        value,
+        Rvalue::AtomicRmw {
+            scalar: AtomicScalar::Usize,
+            op: AtomicRmwOp::Add,
+            ordering: AtomicOrdering::SeqCst,
+            ..
+        }
+    )));
+    assert!(rvalues.iter().any(|value| matches!(
+        value,
+        Rvalue::AtomicStore {
+            ordering: AtomicOrdering::SeqCst,
+            ..
+        }
+    )));
+    assert!(rvalues.iter().any(|value| matches!(
+        value,
+        Rvalue::AtomicCompareExchange {
+            success: AtomicOrdering::SeqCst,
+            failure: AtomicOrdering::SeqCst,
+            ..
+        }
+    )));
+    assert!(rvalues.iter().any(|value| matches!(
+        value,
+        Rvalue::AtomicLoad {
+            ordering: AtomicOrdering::SeqCst,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn atomic_bool_rejects_integer_only_fetch_operations() {
+    let out = compile_source(
+        r#"
+fn main() {
+  let flag = AtomicBool::new(false)
+  flag.fetch_add(true)
+}
+"#,
+        FrontendOptions {
+            emit_mir: true,
+            include_std: false,
+        },
+    );
+    assert!(out.diagnostics.iter().any(|diag| {
+        diag.message
+            .contains("AtomicBool does not support .fetch_add()")
+    }));
+}
+
+#[test]
 fn lowers_extern_function_call() {
     let module = Module {
         imports: vec![],

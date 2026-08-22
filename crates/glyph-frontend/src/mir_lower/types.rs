@@ -69,6 +69,7 @@ pub(crate) fn type_key_simple(ty: &Type) -> String {
         Type::Own(inner) => format!("own_{}", type_key_simple(inner)),
         Type::RawPtr(inner) => format!("rawptr_{}", type_key_simple(inner)),
         Type::Shared(inner) => format!("shared_{}", type_key_simple(inner)),
+        Type::Atomic(scalar) => format!("atomic_{}", scalar.type_name()),
         Type::Function { params, ret } => {
             let params: Vec<String> = params.iter().map(type_key_simple).collect();
             format!(

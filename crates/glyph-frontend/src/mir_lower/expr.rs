@@ -5,7 +5,7 @@ use glyph_core::types::{EnumType, Mutability, Type};
 
 use crate::resolver::{ConstValue, ResolvedSymbol};
 
-use super::call::{lower_call, lower_method_call};
+use super::call::{call_types_compatible, lower_call, lower_method_call};
 use super::context::{LocalState, LowerCtx};
 use super::flow::{
     lower_block_with_expected, lower_for, lower_for_in, lower_if_value, lower_while,
@@ -48,6 +48,63 @@ fn type_is_copy(ty: &Type) -> bool {
             | Type::RawPtr(_)
             | Type::Shared(_)
     )
+}
+
+fn validate_callable_expectation(
+    ctx: &mut LowerCtx<'_>,
+    actual: &Type,
+    expected: Option<&Type>,
+    subject: &str,
+    span: Span,
+) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    if !matches!(actual, Type::Function { .. }) && !matches!(expected, Type::Function { .. }) {
+        return true;
+    }
+    if call_types_compatible(actual, expected) {
+        return true;
+    }
+    ctx.error(
+        format!(
+            "{} has type '{}', expected '{}'",
+            subject,
+            LowerCtx::type_label(actual),
+            LowerCtx::type_label(expected)
+        ),
+        Some(span),
+    );
+    false
+}
+
+fn lower_function_item(
+    ctx: &mut LowerCtx<'_>,
+    name: &str,
+    span: Span,
+    expected: Option<&Type>,
+) -> Option<Rvalue> {
+    let sig = ctx.fn_sigs.get(name).cloned()?;
+    let Some(signature) = sig.callable_type() else {
+        ctx.error(
+            format!("'{}' cannot be used as a callable value", name),
+            Some(span),
+        );
+        return None;
+    };
+    if !validate_callable_expectation(
+        ctx,
+        &signature,
+        expected,
+        &format!("function '{}'", name),
+        span,
+    ) {
+        return None;
+    }
+    Some(Rvalue::FunctionRef {
+        name: sig.target_name,
+        signature,
+    })
 }
 
 fn is_move_context(expected: Option<&Type>, field_type: &Type) -> bool {
@@ -239,6 +296,17 @@ pub(crate) fn lower_expr_with_expected<'a>(
         } => lower_match(ctx, scrutinee, arms, true, *span, expected),
         Expr::Ident(ident, span) => {
             if let Some(local) = ctx.bindings.get(ident.0.as_str()).copied() {
+                if let Some(actual) = ctx.local_ty(local).cloned() {
+                    if !validate_callable_expectation(
+                        ctx,
+                        &actual,
+                        expected,
+                        &format!("value '{}'", ident.0),
+                        *span,
+                    ) {
+                        return None;
+                    }
+                }
                 if ctx.consume_local(local, Some(*span)) {
                     Some(Rvalue::Move(local))
                 } else {
@@ -250,6 +318,8 @@ pub(crate) fn lower_expr_with_expected<'a>(
                 // Bare unit-variant paths (`Val::Nil`, `None`) construct the
                 // variant; delegate to call lowering with zero arguments.
                 lower_call(ctx, expr, &[], *span, false, expected)
+            } else if ctx.fn_sigs.contains_key(ident.0.as_str()) {
+                lower_function_item(ctx, ident.0.as_str(), *span, expected)
             } else {
                 None
             }
@@ -354,9 +424,8 @@ fn lower_cast<'a>(
     let value = lower_value(ctx, expr)?;
     let from_ty = infer_value_type(&value, ctx).unwrap_or(Type::I32);
 
-    let castable_source = from_ty.is_int()
-        || from_ty.is_float()
-        || matches!(from_ty, Type::Char | Type::Bool);
+    let castable_source =
+        from_ty.is_int() || from_ty.is_float() || matches!(from_ty, Type::Char | Type::Bool);
     if !castable_source {
         ctx.error(
             "only numeric values (integers, floats, char, bool) can be cast with 'as'",
@@ -381,9 +450,9 @@ fn lower_cast<'a>(
 /// True when `name` resolves to a zero-parameter enum variant constructor,
 /// so a bare identifier like `Val::Nil` or `None` builds that variant.
 fn is_unit_enum_ctor(ctx: &LowerCtx<'_>, name: &str) -> bool {
-    ctx.fn_sigs
-        .get(name)
-        .map_or(false, |sig| sig.enum_ctor.is_some() && sig.params.is_empty())
+    ctx.fn_sigs.get(name).map_or(false, |sig| {
+        sig.enum_ctor.is_some() && sig.params.is_empty()
+    })
 }
 
 fn lookup_const_value<'a>(ctx: &mut LowerCtx<'a>, name: &str, span: Span) -> Option<ConstValue> {
@@ -1807,6 +1876,17 @@ pub(crate) fn lower_value_with_expected<'a>(
         }
         Expr::Ident(ident, span) => {
             if let Some(local) = ctx.bindings.get(ident.0.as_str()).copied() {
+                if let Some(actual) = ctx.local_ty(local).cloned() {
+                    if !validate_callable_expectation(
+                        ctx,
+                        &actual,
+                        expected,
+                        &format!("value '{}'", ident.0),
+                        *span,
+                    ) {
+                        return None;
+                    }
+                }
                 if ctx.consume_local(local, Some(*span)) {
                     Some(MirValue::Local(local))
                 } else {
@@ -1818,6 +1898,19 @@ pub(crate) fn lower_value_with_expected<'a>(
                 // Bare unit-variant paths (`Val::Nil`, `None`) construct the
                 // variant; delegate to call lowering with zero arguments.
                 lower_call(ctx, expr, &[], *span, false, expected).and_then(rvalue_to_value)
+            } else if ctx.fn_sigs.contains_key(ident.0.as_str()) {
+                let function_ref = lower_function_item(ctx, ident.0.as_str(), *span, expected)?;
+                let signature = match &function_ref {
+                    Rvalue::FunctionRef { signature, .. } => signature.clone(),
+                    _ => unreachable!(),
+                };
+                let tmp = ctx.fresh_local(None);
+                ctx.locals[tmp.0 as usize].ty = Some(signature);
+                ctx.push_inst(MirInst::Assign {
+                    local: tmp,
+                    value: function_ref,
+                });
+                Some(MirValue::Local(tmp))
             } else {
                 None
             }

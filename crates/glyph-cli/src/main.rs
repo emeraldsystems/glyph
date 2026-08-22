@@ -16,6 +16,9 @@ use diagnostics::format_diagnostic;
 
 mod build_version;
 
+#[cfg(feature = "codegen")]
+mod thread_runtime;
+
 #[cfg(not(feature = "codegen"))]
 use glyph_backend::NullBackend;
 #[cfg(feature = "codegen")]
@@ -360,6 +363,7 @@ fn run(path: &PathBuf) -> Result<()> {
             "glyph_term_poll_event".to_string(),
             glyph_term_poll_event as usize as u64,
         );
+        thread_runtime::register_symbols(&mut symbols);
 
         let exit = ctx.jit_execute_i32_with_symbols("main", &symbols)?;
         if exit != 0 {

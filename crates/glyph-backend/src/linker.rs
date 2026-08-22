@@ -84,6 +84,7 @@ impl Linker {
         // std/audio live output resolves (same precedent as -lm on Linux for
         // std/math; unreferenced frameworks cost nothing at runtime).
         cmd.arg("-lSystem");
+        cmd.arg("-pthread");
         cmd.arg("-framework");
         cmd.arg("AudioToolbox");
 
@@ -136,6 +137,7 @@ impl Linker {
         // is part of libSystem.)
         cmd.arg("-lc");
         cmd.arg("-lm");
+        cmd.arg("-pthread");
 
         // Execute the linker
         let output = cmd
