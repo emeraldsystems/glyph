@@ -82,6 +82,23 @@ pub(crate) fn type_key_simple(ty: &Type) -> String {
                 type_key_simple(ret)
             )
         }
+        Type::BorrowedFunction { kind, params, ret } => {
+            let capability = match kind {
+                glyph_core::types::BorrowedCallableKind::Fn => "fn_ref",
+                glyph_core::types::BorrowedCallableKind::FnMut => "fn_mut",
+            };
+            let params: Vec<String> = params.iter().map(type_key_simple).collect();
+            format!(
+                "{}_{}_to_{}",
+                capability,
+                if params.is_empty() {
+                    "unit".to_string()
+                } else {
+                    params.join("__")
+                },
+                type_key_simple(ret)
+            )
+        }
         Type::App { base, args } => {
             let args: Vec<String> = args.iter().map(type_key_simple).collect();
             format!("app_{}_{}", base.replace("::", "_"), args.join("__"))
@@ -368,8 +385,57 @@ fn parse_type_application(name: &str, resolver: &ResolverContext) -> Option<Type
                 ret: Box::new(ret),
             });
         }
-        "FnOnce" => return None,
+        "Fn" | "FnMut" if args.len() == 2 => {
+            let ret = args.pop().unwrap();
+            let args = args.pop().unwrap();
+            let params = match args {
+                Type::Tuple(params) => params,
+                param => vec![param],
+            };
+            return Some(Type::BorrowedFunction {
+                kind: if base_str == "Fn" {
+                    glyph_core::types::BorrowedCallableKind::Fn
+                } else {
+                    glyph_core::types::BorrowedCallableKind::FnMut
+                },
+                params,
+                ret: Box::new(ret),
+            });
+        }
+        "FnOnce" | "Fn" | "FnMut" => return None,
         _ => {}
+    }
+
+    // Preserve compiler-issued identities for audited generic runtime types.
+    // This must precede the ordinary `get_struct` shortcut below, which keeps
+    // user-facing imported names unqualified for structural generics.
+    if let Some(crate::resolver::ResolvedSymbol::Struct(module, symbol)) =
+        resolver.resolve_symbol(base_str)
+    {
+        match (module.as_str(), symbol.as_str(), args.as_slice()) {
+            ("std/thread", "JoinHandle", [result]) => {
+                return Some(glyph_core::thread::canonical_thread_handle_type(
+                    result.clone(),
+                ));
+            }
+            ("std/thread", "ScopedJoinHandle", [result]) => {
+                return Some(glyph_core::thread::canonical_scoped_thread_handle_type(
+                    result.clone(),
+                ));
+            }
+            ("std/sync", "Arc", [inner]) => return Some(Type::arc(inner.clone())),
+            ("std/sync", "Mutex", [inner]) => return Some(Type::mutex(inner.clone())),
+            ("std/sync", "MutexGuard", [inner]) => {
+                return Some(Type::mutex_guard(inner.clone()));
+            }
+            ("std/sync/spsc", "Sender", [inner]) => {
+                return Some(Type::spsc_sender(inner.clone()));
+            }
+            ("std/sync/spsc", "Receiver", [inner]) => {
+                return Some(Type::spsc_receiver(inner.clone()));
+            }
+            _ => {}
+        }
     }
 
     // Normalize base using existing symbol resolution.

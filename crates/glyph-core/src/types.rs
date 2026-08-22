@@ -24,6 +24,18 @@ pub enum Mutability {
     Mutable,
 }
 
+/// A non-owning callable capability whose environment is valid only for a
+/// compiler-proven region.
+///
+/// `Fn` permits repeatable shared access to the environment. `FnMut` permits
+/// repeatable exclusive access. Owned, consuming callables remain represented
+/// by [`Type::Function`] so their serialized MIR and ABI stay unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BorrowedCallableKind {
+    Fn,
+    FnMut,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Type {
     I8,
@@ -61,6 +73,17 @@ pub enum Type {
     /// carrier. `invoke` receives the hidden environment pointer before the
     /// declared parameters (after an ABI-mandated sret pointer, when present).
     Function {
+        params: Vec<Type>,
+        ret: Box<Type>,
+    },
+    /// A borrowed, repeatable callable view.
+    ///
+    /// This uses the same physical `{ env, invoke, drop }` carrier as
+    /// [`Type::Function`], but does not own or consume `env`. Lifetime and
+    /// exclusivity checks are a frontend responsibility; the backend preserves
+    /// the non-consuming invocation contract.
+    BorrowedFunction {
+        kind: BorrowedCallableKind,
         params: Vec<Type>,
         ret: Box<Type>,
     },
@@ -296,7 +319,16 @@ impl Type {
 
     pub fn function_signature(&self) -> Option<(&[Type], &Type)> {
         match self {
-            Type::Function { params, ret } => Some((params, ret)),
+            Type::Function { params, ret } | Type::BorrowedFunction { params, ret, .. } => {
+                Some((params, ret))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn borrowed_callable_kind(&self) -> Option<BorrowedCallableKind> {
+        match self {
+            Type::BorrowedFunction { kind, .. } => Some(*kind),
             _ => None,
         }
     }
@@ -370,6 +402,36 @@ mod tests {
                 args: vec![Type::String],
             }
             .is_spsc_sender()
+        );
+    }
+
+    #[test]
+    fn borrowed_callable_kinds_preserve_their_signature_and_serde_identity() {
+        for kind in [BorrowedCallableKind::Fn, BorrowedCallableKind::FnMut] {
+            let callable = Type::BorrowedFunction {
+                kind,
+                params: vec![Type::I32, Type::Bool],
+                ret: Box::new(Type::String),
+            };
+
+            assert_eq!(
+                callable.function_signature(),
+                Some((&[Type::I32, Type::Bool][..], &Type::String))
+            );
+            assert_eq!(callable.borrowed_callable_kind(), Some(kind));
+
+            let encoded = serde_json::to_string(&callable).unwrap();
+            let decoded: Type = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, callable);
+        }
+
+        assert_eq!(
+            Type::Function {
+                params: vec![],
+                ret: Box::new(Type::Void),
+            }
+            .borrowed_callable_kind(),
+            None
         );
     }
 }

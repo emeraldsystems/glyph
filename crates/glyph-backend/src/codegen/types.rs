@@ -176,6 +176,23 @@ impl CodegenContext {
                     self.type_key(ret)
                 )
             }
+            Type::BorrowedFunction { kind, params, ret } => {
+                let capability = match kind {
+                    BorrowedCallableKind::Fn => "fn_ref",
+                    BorrowedCallableKind::FnMut => "fn_mut",
+                };
+                let params: Vec<String> = params.iter().map(|p| self.type_key(p)).collect();
+                format!(
+                    "{}_{}_to_{}",
+                    capability,
+                    if params.is_empty() {
+                        "unit".to_string()
+                    } else {
+                        params.join("__")
+                    },
+                    self.type_key(ret)
+                )
+            }
             Type::App { base, args } => {
                 let args: Vec<String> = args.iter().map(|a| self.type_key(a)).collect();
                 format!("app_{}_{}", self.sanitize(base), args.join("__"))
@@ -230,7 +247,8 @@ impl CodegenContext {
             | Type::Enum(_)
             | Type::Array(_, _)
             | Type::App { .. }
-            | Type::Function { .. } => {}
+            | Type::Function { .. }
+            | Type::BorrowedFunction { .. } => {}
             _ => return Ok(false),
         }
 
@@ -268,8 +286,14 @@ impl CodegenContext {
                 Type::String => LLVMPointerType(LLVMInt8TypeInContext(self.context), 0),
                 Type::Void => LLVMVoidTypeInContext(self.context),
                 Type::Named(name) => {
-                    if glyph_core::thread::is_canonical_thread_error(&Type::Named(name.clone())) {
+                    let named = Type::Named(name.clone());
+                    if glyph_core::thread::is_canonical_thread_error(&named) {
                         LLVMInt32TypeInContext(self.context)
+                    } else if named == glyph_core::thread::canonical_thread_scope_type()
+                        || named == glyph_core::thread::private_thread_scope_type()
+                        || name == glyph_core::thread::SCOPED_THREAD_HANDLE_TYPE
+                    {
+                        LLVMPointerType(LLVMInt8TypeInContext(self.context), 0)
                     } else {
                         // Check enum_types first, then struct_types
                         self.enum_types
@@ -295,7 +319,7 @@ impl CodegenContext {
                     LLVMPointerType(elem_ty, 0)
                 }
                 Type::Atomic(scalar) => self.atomic_storage_type(scalar)?,
-                Type::Function { .. } => {
+                Type::Function { .. } | Type::BorrowedFunction { .. } => {
                     let ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(self.context), 0);
                     let mut fields = [ptr_ty, ptr_ty, ptr_ty];
                     LLVMStructTypeInContext(
@@ -350,6 +374,12 @@ impl CodegenContext {
                                 .expect("is_mutex_guard validated one argument"),
                         )?
                     } else if glyph_core::thread::is_canonical_thread_handle(&application) {
+                        LLVMPointerType(LLVMInt8TypeInContext(self.context), 0)
+                    } else if glyph_core::thread::is_canonical_scoped_thread_handle(&application) {
+                        LLVMPointerType(LLVMInt8TypeInContext(self.context), 0)
+                    } else if glyph_core::thread::private_scoped_thread_handle_result(&application)
+                        .is_some()
+                    {
                         LLVMPointerType(LLVMInt8TypeInContext(self.context), 0)
                     } else if application.is_spsc_sender() || application.is_spsc_receiver() {
                         let elem = application

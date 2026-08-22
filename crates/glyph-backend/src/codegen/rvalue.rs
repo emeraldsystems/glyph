@@ -218,6 +218,7 @@ impl CodegenContext {
             Rvalue::Cast { .. } => "Cast",
             Rvalue::StringLit { .. } => "StringLit",
             Rvalue::Move(_) => "Move",
+            Rvalue::Deref { .. } => "Deref",
             Rvalue::Binary { .. } => "Binary",
             Rvalue::StructLit { .. } => "StructLit",
             Rvalue::FieldAccess { .. } => "FieldAccess",
@@ -240,7 +241,10 @@ impl CodegenContext {
             Rvalue::Call { .. } => "Call",
             Rvalue::FunctionRef { .. } => "FunctionRef",
             Rvalue::MakeClosure { .. } => "MakeClosure",
+            Rvalue::MakeBorrowedClosure { .. } => "MakeBorrowedClosure",
             Rvalue::CallIndirect { .. } => "CallIndirect",
+            Rvalue::CallIndirectShared { .. } => "CallIndirectShared",
+            Rvalue::CallIndirectMut { .. } => "CallIndirectMut",
             Rvalue::ThreadSpawnUnit { .. } => "ThreadSpawnUnit",
             Rvalue::ThreadSpawnResult { .. } => "ThreadSpawnResult",
             Rvalue::ThreadJoinUnit { .. } => "ThreadJoinUnit",
@@ -249,6 +253,16 @@ impl CodegenContext {
             Rvalue::ThreadHandleFromRaw { .. } => "ThreadHandleFromRaw",
             Rvalue::ThreadHandleIntoRaw { .. } => "ThreadHandleIntoRaw",
             Rvalue::ThreadErrorFromStatus { .. } => "ThreadErrorFromStatus",
+            Rvalue::ThreadScopeCreate { .. } => "ThreadScopeCreate",
+            Rvalue::ThreadScopeExit { .. } => "ThreadScopeExit",
+            Rvalue::ThreadScopeFromRaw { .. } => "ThreadScopeFromRaw",
+            Rvalue::ThreadScopeDrain { .. } => "ThreadScopeDrain",
+            Rvalue::ScopedThreadSpawnUnit { .. } => "ScopedThreadSpawnUnit",
+            Rvalue::ScopedThreadSpawnResult { .. } => "ScopedThreadSpawnResult",
+            Rvalue::ScopedThreadJoinUnit { .. } => "ScopedThreadJoinUnit",
+            Rvalue::ScopedThreadJoinResult { .. } => "ScopedThreadJoinResult",
+            Rvalue::ScopedThreadHandleFromRaw { .. } => "ScopedThreadHandleFromRaw",
+            Rvalue::ScopedThreadHandleIntoRaw { .. } => "ScopedThreadHandleIntoRaw",
             Rvalue::Ref { .. } => "Ref",
             Rvalue::ArrayLit { .. } => "ArrayLit",
             Rvalue::ArrayIndex { .. } => "ArrayIndex",
@@ -340,6 +354,92 @@ impl CodegenContext {
         mir_module: &MirModule,
         target_local: Option<LocalId>,
     ) -> Result<LLVMValueRef> {
+        // Callable carriers intentionally share one erased LLVM layout, but their
+        // source-level ownership semantics do not. Reject hand-written or stale
+        // MIR that tries to relabel an owned FnOnce carrier as borrowed (or the
+        // reverse) merely by assigning it to a differently typed destination.
+        let callable_signature = match rvalue {
+            Rvalue::FunctionRef { signature, .. }
+            | Rvalue::MakeClosure { signature, .. }
+            | Rvalue::MakeBorrowedClosure { signature, .. } => Some(signature),
+            _ => None,
+        };
+        if let (Some(target), Some(signature)) = (target_local, callable_signature) {
+            let destination = func
+                .locals
+                .get(target.0 as usize)
+                .and_then(|local| local.ty.as_ref())
+                .ok_or_else(|| anyhow!("callable destination local {target:?} has no type"))?;
+            if destination != signature {
+                bail!(
+                    "callable destination type {destination:?} does not match carrier signature {signature:?}"
+                );
+            }
+        }
+
+        if let Some(target) = target_local {
+            match rvalue {
+                Rvalue::ThreadScopeFromRaw { .. } => {
+                    let destination = func
+                        .locals
+                        .get(target.0 as usize)
+                        .and_then(|local| local.ty.as_ref())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "thread scope destination local {target:?} in function '{}' has no type",
+                                func.name
+                            )
+                        })?;
+                    let expected = glyph_core::thread::canonical_thread_scope_type();
+                    if destination != &expected {
+                        bail!(
+                            "thread scope view destination has type {destination:?}, expected {expected:?}"
+                        );
+                    }
+                }
+                Rvalue::ScopedThreadHandleFromRaw { result_type, .. } => {
+                    let destination = func
+                        .locals
+                        .get(target.0 as usize)
+                        .and_then(|local| local.ty.as_ref())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "scoped handle destination local {target:?} in function '{}' has no type",
+                                func.name
+                            )
+                        })?;
+                    let expected = glyph_core::thread::canonical_scoped_thread_handle_type(
+                        result_type.clone(),
+                    );
+                    if destination != &expected {
+                        bail!(
+                            "scoped handle wrap destination has type {destination:?}, expected {expected:?}"
+                        );
+                    }
+                }
+                Rvalue::ScopedThreadHandleIntoRaw { result_type, .. } => {
+                    let destination = func
+                        .locals
+                        .get(target.0 as usize)
+                        .and_then(|local| local.ty.as_ref())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "private scoped handle destination local {target:?} in function '{}' has no type",
+                                func.name
+                            )
+                        })?;
+                    let expected =
+                        glyph_core::thread::private_scoped_thread_handle_type(result_type.clone());
+                    if destination != &expected {
+                        bail!(
+                            "scoped handle unwrap destination has type {destination:?}, expected {expected:?}"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // For ConstInt assigned to a typed local, use that local's type
         if let Rvalue::ConstInt(i) = rvalue {
             if let Some(lid) = target_local {
@@ -440,6 +540,15 @@ impl CodegenContext {
                     } else {
                         Ok(*local_ptr)
                     }
+                }
+                Rvalue::Deref { base, ty } => {
+                    let reference = self.codegen_value(&MirValue::Local(*base), func, local_map)?;
+                    Ok(LLVMBuildLoad2(
+                        self.builder,
+                        self.get_llvm_type(ty)?,
+                        reference,
+                        CString::new("deref")?.as_ptr(),
+                    ))
                 }
                 Rvalue::Binary { op, lhs, rhs } => {
                     use glyph_core::ast::BinaryOp;
@@ -1001,11 +1110,28 @@ impl CodegenContext {
                 } => self.codegen_make_closure(
                     function, signature, captures, func, local_map, functions, mir_module,
                 ),
+                Rvalue::MakeBorrowedClosure {
+                    function,
+                    signature,
+                    captures,
+                } => self.codegen_make_borrowed_closure(
+                    function, signature, captures, func, local_map, functions, mir_module,
+                ),
                 Rvalue::CallIndirect {
                     callee,
                     signature,
                     args,
                 } => self.codegen_call_indirect(*callee, signature, args, func, local_map),
+                Rvalue::CallIndirectShared {
+                    callee,
+                    signature,
+                    args,
+                } => self.codegen_call_indirect_shared(*callee, signature, args, func, local_map),
+                Rvalue::CallIndirectMut {
+                    callee,
+                    signature,
+                    args,
+                } => self.codegen_call_indirect_mut(*callee, signature, args, func, local_map),
                 Rvalue::ThreadSpawnUnit { task, out_handle } => {
                     self.codegen_thread_spawn_unit(*task, *out_handle, func, local_map)
                 }
@@ -1046,6 +1172,68 @@ impl CodegenContext {
                 Rvalue::ThreadErrorFromStatus { status } => {
                     self.codegen_value(status, func, local_map)
                 }
+                Rvalue::ThreadScopeCreate { out_scope } => {
+                    self.codegen_thread_scope_create(*out_scope, func, local_map)
+                }
+                Rvalue::ThreadScopeExit { scope } => {
+                    self.codegen_thread_scope_exit(*scope, func, local_map)
+                }
+                Rvalue::ThreadScopeFromRaw { raw } => {
+                    self.codegen_thread_scope_from_raw(*raw, func, local_map)
+                }
+                Rvalue::ThreadScopeDrain { scope } => {
+                    self.codegen_thread_scope_drain(*scope, func, local_map)
+                }
+                Rvalue::ScopedThreadSpawnUnit {
+                    scope,
+                    task,
+                    out_handle,
+                } => self.codegen_scoped_thread_spawn_unit(
+                    *scope,
+                    *task,
+                    *out_handle,
+                    func,
+                    local_map,
+                ),
+                Rvalue::ScopedThreadSpawnResult {
+                    scope,
+                    task,
+                    out_handle,
+                    result_type,
+                } => self.codegen_scoped_thread_spawn_result(
+                    *scope,
+                    *task,
+                    *out_handle,
+                    result_type,
+                    func,
+                    local_map,
+                ),
+                Rvalue::ScopedThreadJoinUnit { handle } => {
+                    self.codegen_scoped_thread_join_unit(*handle, func, local_map)
+                }
+                Rvalue::ScopedThreadJoinResult {
+                    handle,
+                    out_result,
+                    result_type,
+                } => self.codegen_scoped_thread_join_result(
+                    *handle,
+                    *out_result,
+                    result_type,
+                    func,
+                    local_map,
+                ),
+                Rvalue::ScopedThreadHandleFromRaw { raw, result_type } => {
+                    self.codegen_scoped_thread_handle_from_raw(*raw, result_type, func, local_map)
+                }
+                Rvalue::ScopedThreadHandleIntoRaw {
+                    handle,
+                    result_type,
+                } => self.codegen_scoped_thread_handle_into_raw(
+                    *handle,
+                    result_type,
+                    func,
+                    local_map,
+                ),
                 Rvalue::Ref { base, .. } => {
                     let base_ptr = local_map
                         .get(base)

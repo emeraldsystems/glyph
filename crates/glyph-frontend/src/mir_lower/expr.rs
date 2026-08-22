@@ -61,7 +61,7 @@ fn validate_callable_expectation(
     let Some(expected) = expected else {
         return true;
     };
-    if !matches!(actual, Type::Function { .. }) && !matches!(expected, Type::Function { .. }) {
+    if actual.function_signature().is_none() && expected.function_signature().is_none() {
         return true;
     }
     if call_types_compatible(actual, expected) {
@@ -86,7 +86,7 @@ fn lower_function_item(
     expected: Option<&Type>,
 ) -> Option<Rvalue> {
     let sig = ctx.fn_sigs.get(name).cloned()?;
-    let Some(signature) = sig.callable_type() else {
+    let Some(mut signature) = sig.callable_type() else {
         ctx.error(
             format!("'{}' cannot be used as a callable value", name),
             Some(span),
@@ -101,6 +101,9 @@ fn lower_function_item(
         span,
     ) {
         return None;
+    }
+    if matches!(expected, Some(Type::BorrowedFunction { .. })) {
+        signature = expected.expect("matched Some above").clone();
     }
     Some(Rvalue::FunctionRef {
         name: sig.target_name,
@@ -308,7 +311,13 @@ pub(crate) fn lower_expr_with_expected<'a>(
                         return None;
                     }
                 }
-                if ctx.consume_local(local, Some(*span)) {
+                let implicit = ctx.implicit_deref_type(local).cloned();
+                if implicit.is_some() && !matches!(expected, Some(Type::Ref(_, _))) {
+                    Some(Rvalue::Deref {
+                        base: local,
+                        ty: implicit.expect("checked above"),
+                    })
+                } else if ctx.consume_local(local, Some(*span)) {
                     Some(Rvalue::Move(local))
                 } else {
                     None
@@ -1693,6 +1702,26 @@ pub(crate) fn lower_ref_expr<'a>(
                 ctx.error(format!("unknown identifier '{}'", ident.0), Some(span));
                 return None;
             };
+            if mutability == Mutability::Mutable {
+                let can_mutably_borrow = ctx.locals.get(local.0 as usize).is_some_and(|binding| {
+                    binding.mutable || matches!(binding.ty, Some(Type::Ref(_, Mutability::Mutable)))
+                });
+                if !can_mutably_borrow {
+                    ctx.error(
+                        format!("cannot mutably borrow immutable variable `{}`", ident.0),
+                        Some(span),
+                    );
+                    return None;
+                }
+            }
+            let kind = if mutability == Mutability::Mutable {
+                glyph_core::mir::BorrowKind::Mutable
+            } else {
+                glyph_core::mir::BorrowKind::Shared
+            };
+            if !ctx.validate_new_lexical_borrow(local, kind, span) {
+                return None;
+            }
             if !ctx.check_local_available(local, Some(span)) {
                 return None;
             }
@@ -1891,7 +1920,21 @@ pub(crate) fn lower_value_with_expected<'a>(
                         return None;
                     }
                 }
-                if ctx.consume_local(local, Some(*span)) {
+                let implicit = ctx.implicit_deref_type(local).cloned();
+                if let Some(inner) = implicit.filter(|_| !matches!(expected, Some(Type::Ref(_, _))))
+                {
+                    let tmp = ctx.fresh_local(None);
+                    ctx.locals[tmp.0 as usize].ty = Some(inner.clone());
+                    ctx.locals[tmp.0 as usize].skip_drop = !type_is_copy(&inner);
+                    ctx.push_inst(MirInst::Assign {
+                        local: tmp,
+                        value: Rvalue::Deref {
+                            base: local,
+                            ty: inner,
+                        },
+                    });
+                    Some(MirValue::Local(tmp))
+                } else if ctx.consume_local(local, Some(*span)) {
                     Some(MirValue::Local(local))
                 } else {
                     None
@@ -1991,7 +2034,8 @@ pub(crate) fn lower_value_with_expected<'a>(
         } => {
             let rv = lower_closure_rvalue(ctx, *capture, params, body, *span, expected)?;
             let signature = match &rv {
-                Rvalue::MakeClosure { signature, .. } => signature.clone(),
+                Rvalue::MakeClosure { signature, .. }
+                | Rvalue::MakeBorrowedClosure { signature, .. } => signature.clone(),
                 _ => unreachable!("closure lowering always constructs a closure"),
             };
             let tmp = ctx.fresh_local(None);

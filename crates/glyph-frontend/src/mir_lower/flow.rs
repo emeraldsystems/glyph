@@ -1,13 +1,14 @@
 use glyph_core::ast::{Block, CaptureMode, Expr, Function, Ident, Param, Stmt};
 use glyph_core::diag::Severity;
 use glyph_core::mir::{
-    BlockId, CaptureTransfer, LocalId, MirCapture, MirFunction, MirInst, MirValue, Rvalue,
+    BlockId, BorrowCaptureSource, BorrowKind, CaptureTransfer, LocalId, MirBorrowCapture,
+    MirCapture, MirFunction, MirInst, MirValue, Rvalue,
 };
 use glyph_core::span::Span;
-use glyph_core::types::{Mutability, Type};
+use glyph_core::types::{BorrowedCallableKind, Mutability, Type};
 
 use crate::resolver::ResolverContext;
-use crate::{CaptureOwnership, analyze_function_closure_ownership};
+use crate::{CaptureAccess, CaptureOwnership, analyze_function_closure_ownership};
 
 use super::context::{LocalState, LowerCtx};
 use super::expr::{lower_expr, lower_expr_with_expected, lower_value, lower_value_with_expected};
@@ -27,7 +28,7 @@ fn type_contains_borrow(
     visiting: &mut std::collections::HashSet<String>,
 ) -> bool {
     match ty {
-        Type::Ref(_, _) => true,
+        Type::Ref(_, _) | Type::BorrowedFunction { .. } => true,
         Type::Array(inner, _) | Type::Own(inner) | Type::RawPtr(inner) | Type::Shared(inner) => {
             type_contains_borrow(inner, resolver, visiting)
         }
@@ -133,12 +134,15 @@ pub(crate) fn lower_function(
 
     let mut ctx = LowerCtx::new(resolver, module, fn_sigs, func.name.0.clone());
     ctx.fn_ret_type = ret_type.clone();
-    if ret_type
-        .as_ref()
-        .is_some_and(|ty| type_contains_borrow(ty, resolver, &mut std::collections::HashSet::new()))
+    if let Some(ret) = ret_type.as_ref()
+        && type_contains_borrow(ret, resolver, &mut std::collections::HashSet::new())
     {
         ctx.error(
-            "borrowed references cannot escape through return; return owned data instead",
+            if matches!(ret, Type::BorrowedFunction { .. }) {
+                "a borrowed callable cannot escape through a function return; use owned FnOnce"
+            } else {
+                "borrowed references cannot escape through return; return owned data instead"
+            },
             func.ret_type.as_ref().map(|ret| ret.span()),
         );
     }
@@ -169,6 +173,9 @@ pub(crate) fn lower_function(
             .as_ref()
             .and_then(|t| crate::resolver::resolve_type_expr_to_type(t, resolver))
         {
+            if ty == glyph_core::thread::canonical_thread_scope_type() {
+                ctx.register_scoped_callback_scope(local);
+            }
             ctx.locals[local.0 as usize].ty = Some(ty);
         }
         if let Some(state) = ctx.local_states.get_mut(local.0 as usize) {
@@ -264,10 +271,15 @@ pub(crate) fn lower_function(
 fn type_has_concrete_layout(ty: &Type) -> bool {
     match ty {
         Type::Param(_) => false,
-        Type::App { args, .. } | Type::Tuple(args) | Type::Function { params: args, .. } => {
+        Type::App { args, .. }
+        | Type::Tuple(args)
+        | Type::Function { params: args, .. }
+        | Type::BorrowedFunction { params: args, .. } => {
             args.iter().all(type_has_concrete_layout)
                 && match ty {
-                    Type::Function { ret, .. } => type_has_concrete_layout(ret),
+                    Type::Function { ret, .. } | Type::BorrowedFunction { ret, .. } => {
+                        type_has_concrete_layout(ret)
+                    }
                     _ => true,
                 }
         }
@@ -301,9 +313,10 @@ fn closure_return_types(ctx: &LowerCtx<'_>) -> Vec<Type> {
         .collect()
 }
 
-/// Convert one source closure into an owned callable plus a collision-safe
-/// lifted MIR function. Capture locals are looked up by their declaration
-/// identity, not just their spelling, so shadowed bindings remain distinct.
+/// Convert one source closure into an owned or lexically borrowed callable
+/// plus a collision-safe lifted MIR function. Capture locals are looked up by
+/// declaration identity, not just spelling, so shadowed bindings remain
+/// distinct.
 pub(crate) fn lower_closure_rvalue<'a>(
     ctx: &mut LowerCtx<'a>,
     capture_mode: CaptureMode,
@@ -311,6 +324,42 @@ pub(crate) fn lower_closure_rvalue<'a>(
     body: &'a Expr,
     span: Span,
     expected: Option<&Type>,
+) -> Option<Rvalue> {
+    lower_closure_rvalue_impl(ctx, capture_mode, params, body, span, expected, None)
+}
+
+/// Lower a compiler-intrinsic borrowed callback whose parameter types are
+/// fixed by the intrinsic while its result type remains inferred from the
+/// closure body.
+pub(crate) fn lower_inferred_borrowed_closure_rvalue<'a>(
+    ctx: &mut LowerCtx<'a>,
+    capture_mode: CaptureMode,
+    params: &'a [Param],
+    body: &'a Expr,
+    span: Span,
+    kind: BorrowedCallableKind,
+    expected_params: Vec<Type>,
+    scoped_callback: bool,
+) -> Option<Rvalue> {
+    lower_closure_rvalue_impl(
+        ctx,
+        capture_mode,
+        params,
+        body,
+        span,
+        None,
+        Some((kind, expected_params, scoped_callback)),
+    )
+}
+
+fn lower_closure_rvalue_impl<'a>(
+    ctx: &mut LowerCtx<'a>,
+    capture_mode: CaptureMode,
+    params: &'a [Param],
+    body: &'a Expr,
+    span: Span,
+    expected: Option<&Type>,
+    forced_borrowed: Option<(BorrowedCallableKind, Vec<Type>, bool)>,
 ) -> Option<Rvalue> {
     let Some(info) = ctx
         .closure_infos
@@ -333,26 +382,49 @@ pub(crate) fn lower_closure_rvalue<'a>(
         return None;
     }
 
-    let expected_signature = match expected {
-        Some(Type::Function { params, ret }) => Some((params.clone(), ret.as_ref().clone())),
-        Some(other) => {
-            ctx.error(
-                format!(
-                    "closure has a callable type, but '{}' is required here",
-                    LowerCtx::type_label(other)
-                ),
-                Some(span),
-            );
-            return None;
+    let borrowed_kind =
+        forced_borrowed
+            .as_ref()
+            .map(|(kind, _, _)| *kind)
+            .or_else(|| match expected {
+                Some(Type::BorrowedFunction { kind, .. }) => Some(*kind),
+                _ => None,
+            });
+    if borrowed_kind.is_some() && capture_mode == CaptureMode::Move {
+        ctx.error(
+            "a move closure is an owned FnOnce and cannot be used as a borrowed Fn/FnMut callback",
+            Some(span),
+        );
+        return None;
+    }
+
+    let expected_signature = if let Some((_, params, _)) = &forced_borrowed {
+        Some((params.clone(), None))
+    } else {
+        match expected {
+            Some(Type::Function { params, ret })
+            | Some(Type::BorrowedFunction { params, ret, .. }) => {
+                Some((params.clone(), Some(ret.as_ref().clone())))
+            }
+            Some(other) => {
+                ctx.error(
+                    format!(
+                        "closure has a callable type, but '{}' is required here",
+                        LowerCtx::type_label(other)
+                    ),
+                    Some(span),
+                );
+                return None;
+            }
+            None => None,
         }
-        None => None,
     };
 
     if let Some((expected_params, _)) = &expected_signature {
         if expected_params.len() != params.len() {
             ctx.error(
                 format!(
-                    "closure expects {} parameters from its contextual FnOnce type, but declares {}",
+                    "closure expects {} parameters from its contextual callable type, but declares {}",
                     expected_params.len(),
                     params.len()
                 ),
@@ -376,7 +448,7 @@ pub(crate) fn lower_closure_rvalue<'a>(
             if !super::call::call_types_compatible(annotated, contextual) {
                 ctx.error(
                     format!(
-                        "closure parameter '{}' has type '{}', but contextual FnOnce requires '{}'",
+                        "closure parameter '{}' has type '{}', but its contextual callable type requires '{}'",
                         param.name.0,
                         LowerCtx::type_label(annotated),
                         LowerCtx::type_label(contextual)
@@ -389,7 +461,7 @@ pub(crate) fn lower_closure_rvalue<'a>(
         let Some(param_ty) = annotated.or(contextual) else {
             ctx.error(
                 format!(
-                    "cannot infer type of closure parameter '{}'; add a type annotation or a FnOnce context",
+                    "cannot infer type of closure parameter '{}'; add a type annotation or a callable context",
                     param.name.0
                 ),
                 Some(param.span),
@@ -419,6 +491,7 @@ pub(crate) fn lower_closure_rvalue<'a>(
     lifted.closure_infos = ctx.closure_infos.clone();
 
     let mut mir_captures = Vec::with_capacity(info.captures.len());
+    let mut mir_borrow_captures = Vec::with_capacity(info.captures.len());
     let mut lifted_params = Vec::with_capacity(info.captures.len() + params.len());
     for capture in &info.captures {
         let Some(ty) = capture.resolved_type.clone() else {
@@ -453,22 +526,111 @@ pub(crate) fn lower_closure_rvalue<'a>(
             );
             return None;
         };
-        if !ctx.check_local_available(source_local, Some(capture.first_use_span)) {
+        if borrowed_kind.is_none()
+            && !ctx.check_local_available(source_local, Some(capture.first_use_span))
+        {
             return None;
         }
 
-        mir_captures.push(MirCapture {
-            name: capture.name.clone(),
-            local: source_local,
-            ty: ty.clone(),
-            transfer: match capture.ownership {
-                CaptureOwnership::Copy => CaptureTransfer::Copy,
-                CaptureOwnership::Move => CaptureTransfer::Move,
-            },
-        });
+        let lifted_capture_ty = if let Some(kind) = borrowed_kind {
+            if capture.access == CaptureAccess::Move {
+                ctx.error(
+                    format!(
+                        "borrowed {} closure cannot move capture `{}`; use an owned FnOnce or borrow the value in the operation",
+                        match kind {
+                            BorrowedCallableKind::Fn => "Fn",
+                            BorrowedCallableKind::FnMut => "FnMut",
+                        },
+                        capture.name
+                    ),
+                    Some(capture.first_use_span),
+                );
+                return None;
+            }
+            if kind == BorrowedCallableKind::Fn && capture.access == CaptureAccess::Mutate {
+                ctx.error(
+                    format!(
+                        "Fn closure cannot mutate capture `{}`; use FnMut",
+                        capture.name
+                    ),
+                    Some(capture.first_use_span),
+                );
+                return None;
+            }
+            let borrow = if capture.access == CaptureAccess::Mutate {
+                BorrowKind::Mutable
+            } else {
+                BorrowKind::Shared
+            };
+            if !ctx.validate_new_lexical_borrow(source_local, borrow, capture.first_use_span)
+                || !ctx.check_local_available(source_local, Some(capture.first_use_span))
+            {
+                return None;
+            }
+            if borrow == BorrowKind::Mutable
+                && !ctx
+                    .locals
+                    .get(source_local.0 as usize)
+                    .is_some_and(|local| local.mutable)
+            {
+                ctx.error(
+                    format!(
+                        "FnMut closure cannot mutably capture immutable variable `{}`; declare it with `let mut`",
+                        capture.name
+                    ),
+                    Some(capture.first_use_span),
+                );
+                return None;
+            }
+            mir_borrow_captures.push(MirBorrowCapture {
+                name: capture.name.clone(),
+                local: source_local,
+                ty: ty.clone(),
+                borrow,
+                source: match ctx.local_ty(source_local) {
+                    Some(Type::Ref(inner, mutability)) if inner.as_ref() == &ty => {
+                        if borrow == BorrowKind::Mutable && *mutability != Mutability::Mutable {
+                            ctx.error(
+                                format!(
+                                    "cannot mutably reborrow shared capture `{}` for an FnMut closure",
+                                    capture.name
+                                ),
+                                Some(capture.first_use_span),
+                            );
+                            return None;
+                        }
+                        BorrowCaptureSource::Reborrow
+                    }
+                    _ => BorrowCaptureSource::Local,
+                },
+            });
+            Type::Ref(
+                Box::new(ty.clone()),
+                if borrow == BorrowKind::Mutable {
+                    Mutability::Mutable
+                } else {
+                    Mutability::Immutable
+                },
+            )
+        } else {
+            mir_captures.push(MirCapture {
+                name: capture.name.clone(),
+                local: source_local,
+                ty: ty.clone(),
+                transfer: match capture.ownership {
+                    CaptureOwnership::Copy => CaptureTransfer::Copy,
+                    CaptureOwnership::Move => CaptureTransfer::Move,
+                },
+            });
+            ty.clone()
+        };
 
         let local = lifted.fresh_local(Some(&capture.name));
-        lifted.locals[local.0 as usize].ty = Some(ty);
+        lifted.locals[local.0 as usize].ty = Some(lifted_capture_ty);
+        lifted.locals[local.0 as usize].mutable = capture.access == CaptureAccess::Mutate;
+        if borrowed_kind.is_some() {
+            lifted.mark_implicit_deref(local);
+        }
         lifted.local_states[local.0 as usize] = LocalState::Initialized;
         lifted.bind_name(&capture.name, local);
         lifted.register_source_binding(&capture.name, capture.declaration_span, local);
@@ -482,9 +644,12 @@ pub(crate) fn lower_closure_rvalue<'a>(
         lifted.bind_name(&param.name.0, local);
         lifted.register_source_binding(&param.name.0, param.span, local);
         lifted_params.push(local);
+        if ty == &glyph_core::thread::canonical_thread_scope_type() {
+            lifted.register_scoped_callback_scope(local);
+        }
     }
 
-    let expected_ret = expected_signature.as_ref().map(|(_, ret)| ret.clone());
+    let expected_ret = expected_signature.as_ref().and_then(|(_, ret)| ret.clone());
     lifted.fn_ret_type = expected_ret.clone();
     let mut implicit_return = match body {
         Expr::Block(block) => {
@@ -523,9 +688,16 @@ pub(crate) fn lower_closure_rvalue<'a>(
         }
     }
     let ret = expected_ret.unwrap_or(inferred_ret);
-    let signature = Type::Function {
-        params: callable_params,
-        ret: Box::new(ret.clone()),
+    let signature = match borrowed_kind {
+        Some(kind) => Type::BorrowedFunction {
+            kind,
+            params: callable_params,
+            ret: Box::new(ret.clone()),
+        },
+        None => Type::Function {
+            params: callable_params,
+            ret: Box::new(ret.clone()),
+        },
     };
     let lifted_function = MirFunction {
         name: lifted_name.clone(),
@@ -539,10 +711,18 @@ pub(crate) fn lower_closure_rvalue<'a>(
     ctx.lifted_functions.extend(lifted.lifted_functions);
     ctx.lifted_functions.push(lifted_function);
 
-    Some(Rvalue::MakeClosure {
-        function: lifted_name,
-        signature,
-        captures: mir_captures,
+    Some(if borrowed_kind.is_some() {
+        Rvalue::MakeBorrowedClosure {
+            function: lifted_name,
+            signature,
+            captures: mir_borrow_captures,
+        }
+    } else {
+        Rvalue::MakeClosure {
+            function: lifted_name,
+            signature,
+            captures: mir_captures,
+        }
     })
 }
 
@@ -622,6 +802,7 @@ pub(crate) fn lower_block_with_expected<'a>(
                     }
                 }
                 ctx.reject_mutex_guard_return(value.as_ref(), *ret_span);
+                ctx.reject_lexical_loan_return(value.as_ref(), *ret_span);
                 if let Some(MirValue::Local(local)) = value.as_ref() {
                     if let Some(state) = ctx.local_states.get_mut(local.0 as usize) {
                         *state = LocalState::Moved;
@@ -828,6 +1009,7 @@ pub(crate) fn lower_block_with_expected<'a>(
         if let Some(MirValue::Local(local)) = last_value {
             ctx.reject_arc_loan_scope_escape(local);
             ctx.reject_mutex_guard_return(Some(&MirValue::Local(local)), block.span);
+            ctx.reject_lexical_loan_return(Some(&MirValue::Local(local)), block.span);
             if let Some(state) = ctx.local_states.get_mut(local.0 as usize) {
                 *state = LocalState::Moved;
             }

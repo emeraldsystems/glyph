@@ -62,6 +62,18 @@ struct GlyphThread {
     GlyphThreadDropResult drop_result;
 };
 
+struct GlyphScopedThread {
+    GlyphThread* thread;
+    struct GlyphScopedThread* previous;
+    struct GlyphScopedThread* next;
+    struct GlyphThreadScope* scope;
+};
+
+struct GlyphThreadScope {
+    GlyphScopedThread* first;
+    GlyphScopedThread* last;
+};
+
 static int32_t glyph_thread_error(int error_code) {
     return error_code > 0 ? -(int32_t)error_code : -EIO;
 }
@@ -405,6 +417,196 @@ int32_t glyph_thread_detach(GlyphThread** handle) {
     return 0;
 }
 
+int32_t glyph_thread_scope_create(GlyphThreadScope** out) {
+    if (out == NULL) {
+        return -EINVAL;
+    }
+    *out = (GlyphThreadScope*)calloc(1, sizeof(GlyphThreadScope));
+    return *out == NULL ? -ENOMEM : 0;
+}
+
+static int32_t glyph_thread_scope_spawn_impl(
+    GlyphThreadScope* scope,
+    GlyphScopedThread** out,
+    GlyphThreadEntry entry,
+    GlyphThreadResultEntry result_entry,
+    void* invoke,
+    void* env,
+    size_t result_size,
+    GlyphThreadDropResult drop_result) {
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (scope == NULL || out == NULL) {
+        return -EINVAL;
+    }
+
+    GlyphScopedThread* child =
+        (GlyphScopedThread*)calloc(1, sizeof(GlyphScopedThread));
+    if (child == NULL) {
+        return -ENOMEM;
+    }
+
+    int32_t status = glyph_thread_spawn_impl(
+        &child->thread, entry, result_entry, invoke, env, NULL, result_size,
+        drop_result);
+    if (status != 0) {
+        free(child);
+        return status;
+    }
+
+    child->scope = scope;
+    child->previous = scope->last;
+    if (scope->last != NULL) {
+        scope->last->next = child;
+    } else {
+        scope->first = child;
+    }
+    scope->last = child;
+    *out = child;
+    return 0;
+}
+
+int32_t glyph_thread_scope_spawn(GlyphThreadScope* scope,
+                                 GlyphScopedThread** out,
+                                 GlyphThreadEntry entry,
+                                 void* env) {
+    return glyph_thread_scope_spawn_impl(scope, out, entry, NULL, NULL, env,
+                                         0, NULL);
+}
+
+int32_t glyph_thread_scope_spawn_result(GlyphThreadScope* scope,
+                                        GlyphScopedThread** out,
+                                        GlyphThreadResultEntry entry,
+                                        void* invoke,
+                                        void* env,
+                                        size_t result_size,
+                                        GlyphThreadDropResult drop_result) {
+    return glyph_thread_scope_spawn_impl(scope, out, NULL, entry, invoke, env,
+                                         result_size, drop_result);
+}
+
+static int glyph_thread_scope_owns(const GlyphThreadScope* scope,
+                                   const GlyphScopedThread* child) {
+    return scope != NULL && child != NULL && child->scope == scope;
+}
+
+static void glyph_thread_scope_unlink(GlyphThreadScope* scope,
+                                      GlyphScopedThread* child) {
+    if (child->previous != NULL) {
+        child->previous->next = child->next;
+    } else {
+        scope->first = child->next;
+    }
+    if (child->next != NULL) {
+        child->next->previous = child->previous;
+    } else {
+        scope->last = child->previous;
+    }
+    child->scope = NULL;
+    child->previous = NULL;
+    child->next = NULL;
+}
+
+static int32_t glyph_thread_scope_join_drop(GlyphThreadScope* scope,
+                                            GlyphScopedThread* child) {
+    if (!glyph_thread_scope_owns(scope, child)) {
+        return -EINVAL;
+    }
+    int32_t status = glyph_thread_join_native(child->thread);
+    if (status != 0) {
+        return status;
+    }
+    GlyphThread* thread = child->thread;
+    child->thread = NULL;
+    glyph_thread_scope_unlink(scope, child);
+    glyph_thread_release(thread);
+    free(child);
+    return 0;
+}
+
+int32_t glyph_thread_scope_join(GlyphScopedThread** child_ptr) {
+    if (child_ptr == NULL || *child_ptr == NULL ||
+        (*child_ptr)->scope == NULL || (*child_ptr)->thread->has_result) {
+        return -EINVAL;
+    }
+    GlyphThreadScope* scope = (*child_ptr)->scope;
+    int32_t status = glyph_thread_scope_join_drop(scope, *child_ptr);
+    if (status == 0) {
+        *child_ptr = NULL;
+    }
+    return status;
+}
+
+int32_t glyph_thread_scope_join_result(GlyphScopedThread** child_ptr,
+                                       void* out_result) {
+    if (child_ptr == NULL || *child_ptr == NULL || (*child_ptr)->scope == NULL) {
+        return -EINVAL;
+    }
+    GlyphThreadScope* scope = (*child_ptr)->scope;
+    GlyphThread* thread = (*child_ptr)->thread;
+    if (!thread->has_result || (thread->result_size != 0 && out_result == NULL)) {
+        return -EINVAL;
+    }
+
+    int32_t status = glyph_thread_join_native(thread);
+    if (status != 0) {
+        return status;
+    }
+    pthread_mutex_lock(&thread->lock);
+    int initialized = thread->result_initialized;
+    if (initialized && thread->result_size != 0) {
+        memcpy(out_result, thread->result, thread->result_size);
+    }
+    thread->result_initialized = 0;
+    pthread_mutex_unlock(&thread->lock);
+
+    GlyphScopedThread* child = *child_ptr;
+    child->thread = NULL;
+    glyph_thread_scope_unlink(scope, child);
+    glyph_thread_release(thread);
+    free(child);
+    *child_ptr = NULL;
+    return initialized ? 0 : -EIO;
+}
+
+int32_t glyph_thread_scope_drain(GlyphThreadScope* scope) {
+    if (scope == NULL) {
+        return -EINVAL;
+    }
+    while (scope->first != NULL) {
+        int32_t status = glyph_thread_scope_join_drop(scope, scope->first);
+        if (status != 0) {
+            return status;
+        }
+    }
+    return 0;
+}
+
+void glyph_thread_scope_drain_or_abort(GlyphThreadScope* scope) {
+    int32_t status = glyph_thread_scope_drain(scope);
+    if (status != 0) {
+        status = glyph_thread_scope_drain(scope);
+    }
+    if (status != 0) {
+        abort();
+    }
+}
+
+int32_t glyph_thread_scope_join_all(GlyphThreadScope** scope_ptr) {
+    if (scope_ptr == NULL || *scope_ptr == NULL) {
+        return -EINVAL;
+    }
+    GlyphThreadScope* scope = *scope_ptr;
+    int32_t status = glyph_thread_scope_drain(scope);
+    if (status != 0) {
+        return status;
+    }
+    free(scope);
+    *scope_ptr = NULL;
+    return 0;
+}
+
 #if defined(GLYPH_THREAD_ENABLE_TEST_HOOKS)
 
 struct GlyphThreadTestLatch {
@@ -524,6 +726,14 @@ struct GlyphThread {
     uint8_t unavailable;
 };
 
+struct GlyphThreadScope {
+    uint8_t unavailable;
+};
+
+struct GlyphScopedThread {
+    uint8_t unavailable;
+};
+
 int32_t glyph_thread_spawn(GlyphThread** out,
                            GlyphThreadEntry entry,
                            void* env,
@@ -567,6 +777,72 @@ int32_t glyph_thread_join_result(GlyphThread** handle, void* out_result) {
 
 int32_t glyph_thread_detach(GlyphThread** handle) {
     (void)handle;
+    return -ENOSYS;
+}
+
+int32_t glyph_thread_scope_create(GlyphThreadScope** out) {
+    if (out != NULL) {
+        *out = NULL;
+    }
+    return -ENOSYS;
+}
+
+int32_t glyph_thread_scope_spawn(GlyphThreadScope* scope,
+                                 GlyphScopedThread** out,
+                                 GlyphThreadEntry entry,
+                                 void* env) {
+    (void)scope;
+    (void)entry;
+    (void)env;
+    if (out != NULL) {
+        *out = NULL;
+    }
+    return -ENOSYS;
+}
+
+int32_t glyph_thread_scope_spawn_result(GlyphThreadScope* scope,
+                                        GlyphScopedThread** out,
+                                        GlyphThreadResultEntry entry,
+                                        void* invoke,
+                                        void* env,
+                                        size_t result_size,
+                                        GlyphThreadDropResult drop_result) {
+    (void)scope;
+    (void)entry;
+    (void)invoke;
+    (void)env;
+    (void)result_size;
+    (void)drop_result;
+    if (out != NULL) {
+        *out = NULL;
+    }
+    return -ENOSYS;
+}
+
+int32_t glyph_thread_scope_join(GlyphScopedThread** child) {
+    (void)child;
+    return -ENOSYS;
+}
+
+int32_t glyph_thread_scope_join_result(GlyphScopedThread** child,
+                                       void* out_result) {
+    (void)child;
+    (void)out_result;
+    return -ENOSYS;
+}
+
+int32_t glyph_thread_scope_drain(GlyphThreadScope* scope) {
+    (void)scope;
+    return -ENOSYS;
+}
+
+void glyph_thread_scope_drain_or_abort(GlyphThreadScope* scope) {
+    (void)scope;
+    abort();
+}
+
+int32_t glyph_thread_scope_join_all(GlyphThreadScope** scope) {
+    (void)scope;
     return -ENOSYS;
 }
 

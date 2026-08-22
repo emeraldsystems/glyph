@@ -575,6 +575,12 @@ impl<'a> ThreadSafetyRegistry<'a> {
                 "callable environment provenance was lost before thread-safety checking",
                 trace,
             ),
+            Type::BorrowedFunction { .. } => self.reject(
+                requirement,
+                path,
+                "borrowed callable environments cannot escape to an unscoped thread",
+                trace,
+            ),
             Type::App { base, .. } => self.reject(
                 requirement,
                 path,

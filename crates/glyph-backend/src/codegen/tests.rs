@@ -1,8 +1,9 @@
 use super::*;
 use glyph_core::mir::{
-    CaptureTransfer, Local, LocalId, MirBlock, MirCapture, MirExternFunction, MirFunction, MirInst,
-    MirModule, MirValue, Rvalue,
+    BorrowKind, CaptureTransfer, Local, LocalId, MirBlock, MirBorrowCapture, MirCapture,
+    MirExternFunction, MirFunction, MirInst, MirModule, MirValue, Rvalue,
 };
+use glyph_core::types::BorrowedCallableKind;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
@@ -310,7 +311,10 @@ fn jit_resolves_extern_symbol_from_host() {
 
     // Create symbol map with the address of our test function
     let mut symbols = HashMap::new();
-    symbols.insert("test_add_ten".to_string(), test_add_ten as u64);
+    symbols.insert(
+        "test_add_ten".to_string(),
+        test_add_ten as *const () as usize as u64,
+    );
 
     // Execute and verify the result
     let result = ctx.jit_execute_i32_with_symbols("main", &symbols).unwrap();
@@ -418,7 +422,10 @@ fn jit_hello_world_with_putchar() {
 
     // Register putchar symbol
     let mut symbols = HashMap::new();
-    symbols.insert("putchar".to_string(), putchar_wrapper as u64);
+    symbols.insert(
+        "putchar".to_string(),
+        putchar_wrapper as *const () as usize as u64,
+    );
 
     // Execute - should "print" 'H' and return 72
     let result = ctx.jit_execute_i32_with_symbols("main", &symbols).unwrap();
@@ -485,7 +492,10 @@ fn jit_hello_world_with_puts_literal() {
     ctx.codegen_module(&mir).unwrap();
 
     let mut symbols = HashMap::new();
-    symbols.insert("puts".to_string(), puts_wrapper as u64);
+    symbols.insert(
+        "puts".to_string(),
+        puts_wrapper as *const () as usize as u64,
+    );
 
     let result = ctx.jit_execute_i32_with_symbols("main", &symbols).unwrap();
     assert_eq!(result, 5);
@@ -768,6 +778,403 @@ fn callable_views_are_never_silently_cloned() {
         .codegen_deep_clone_value(&signature, std::ptr::null_mut())
         .unwrap_err();
     assert!(error.to_string().contains("cannot be cloned"));
+}
+
+#[test]
+fn jit_reuses_shared_borrowed_closure_without_consuming_or_freeing_it() {
+    let signature = Type::BorrowedFunction {
+        kind: BorrowedCallableKind::Fn,
+        params: vec![Type::I32],
+        ret: Box::new(Type::I32),
+    };
+    let capture_ref = Type::Ref(Box::new(Type::I32), Mutability::Immutable);
+    let mut ctx = CodegenContext::new("borrowed_fn_repeat").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "add".into(),
+                ret_type: Some(Type::I32),
+                params: vec![LocalId(0), LocalId(1)],
+                locals: vec![
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::Binary {
+                                op: glyph_core::ast::BinaryOp::Add,
+                                lhs: MirValue::Local(LocalId(0)),
+                                rhs: MirValue::Local(LocalId(1)),
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(2)))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main::__closure_borrowed".into(),
+                ret_type: Some(Type::I32),
+                params: vec![LocalId(0), LocalId(1)],
+                locals: vec![
+                    typed_local(capture_ref),
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::Call {
+                                name: "add".into(),
+                                args: vec![
+                                    MirValue::Local(LocalId(0)),
+                                    MirValue::Local(LocalId(1)),
+                                ],
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(2)))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    typed_local(Type::I32),
+                    typed_local(signature.clone()),
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::ConstInt(40),
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::MakeBorrowedClosure {
+                                function: "main::__closure_borrowed".into(),
+                                signature: signature.clone(),
+                                captures: vec![MirBorrowCapture {
+                                    name: "offset".into(),
+                                    local: LocalId(0),
+                                    ty: Type::I32,
+                                    borrow: BorrowKind::Shared,
+                                    source: glyph_core::mir::BorrowCaptureSource::Local,
+                                }],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::CallIndirectShared {
+                                callee: LocalId(1),
+                                signature: signature.clone(),
+                                args: vec![MirValue::Int(1)],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(3),
+                            value: Rvalue::CallIndirectShared {
+                                callee: LocalId(1),
+                                signature,
+                                args: vec![MirValue::Int(2)],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(4),
+                            value: Rvalue::Binary {
+                                op: glyph_core::ast::BinaryOp::Add,
+                                lhs: MirValue::Local(LocalId(2)),
+                                rhs: MirValue::Local(LocalId(3)),
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(4)))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 83);
+    let ir = ctx.dump_ir();
+    assert!(ir.contains("borrowed.closure.env"));
+    assert!(ir.contains("__glyph_borrowed_closure_invoke_"));
+    assert!(!ir.contains("borrowed.closure.env.free"));
+}
+
+#[test]
+fn jit_reuses_fnmut_carrier_without_consuming_it() {
+    let signature = Type::BorrowedFunction {
+        kind: BorrowedCallableKind::FnMut,
+        params: vec![],
+        ret: Box::new(Type::I32),
+    };
+    let capture_ref = Type::Ref(Box::new(Type::I32), Mutability::Mutable);
+    let mut ctx = CodegenContext::new("borrowed_fnmut_repeat").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "identity".into(),
+                ret_type: Some(Type::I32),
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(Type::I32)],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Return(Some(MirValue::Local(LocalId(0))))],
+                }],
+            },
+            MirFunction {
+                name: "main::__closure_borrowed_mut".into(),
+                ret_type: Some(Type::I32),
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(capture_ref), typed_local(Type::I32)],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::Call {
+                                name: "identity".into(),
+                                args: vec![MirValue::Local(LocalId(0))],
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(1)))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    typed_local(Type::I32),
+                    typed_local(signature.clone()),
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::ConstInt(7),
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::MakeBorrowedClosure {
+                                function: "main::__closure_borrowed_mut".into(),
+                                signature: signature.clone(),
+                                captures: vec![MirBorrowCapture {
+                                    name: "state".into(),
+                                    local: LocalId(0),
+                                    ty: Type::I32,
+                                    borrow: BorrowKind::Mutable,
+                                    source: glyph_core::mir::BorrowCaptureSource::Local,
+                                }],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::CallIndirectMut {
+                                callee: LocalId(1),
+                                signature: signature.clone(),
+                                args: vec![],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(3),
+                            value: Rvalue::CallIndirectMut {
+                                callee: LocalId(1),
+                                signature,
+                                args: vec![],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(4),
+                            value: Rvalue::Binary {
+                                op: glyph_core::ast::BinaryOp::Add,
+                                lhs: MirValue::Local(LocalId(2)),
+                                rhs: MirValue::Local(LocalId(3)),
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(4)))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 14);
+}
+
+#[test]
+fn consuming_and_repeatable_indirect_call_mir_cannot_be_interchanged() {
+    let owned = Type::Function {
+        params: vec![],
+        ret: Box::new(Type::I32),
+    };
+    let borrowed = Type::BorrowedFunction {
+        kind: BorrowedCallableKind::Fn,
+        params: vec![],
+        ret: Box::new(Type::I32),
+    };
+
+    let make_module = |local_ty: Type, call: Rvalue| MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![MirFunction {
+            name: "main".into(),
+            ret_type: Some(Type::I32),
+            params: vec![],
+            locals: vec![typed_local(local_ty), typed_local(Type::I32)],
+            blocks: vec![MirBlock {
+                insts: vec![
+                    MirInst::Assign {
+                        local: LocalId(1),
+                        value: call,
+                    },
+                    MirInst::Return(Some(MirValue::Local(LocalId(1)))),
+                ],
+            }],
+        }],
+    };
+
+    let mut consuming = CodegenContext::new("bad_consuming_borrowed").unwrap();
+    let error = consuming
+        .codegen_module(&make_module(
+            borrowed.clone(),
+            Rvalue::CallIndirect {
+                callee: LocalId(0),
+                signature: borrowed,
+                args: vec![],
+            },
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("owned FnOnce"));
+
+    let mut repeatable = CodegenContext::new("bad_repeatable_owned").unwrap();
+    let error = repeatable
+        .codegen_module(&make_module(
+            owned.clone(),
+            Rvalue::CallIndirectShared {
+                callee: LocalId(0),
+                signature: owned,
+                args: vec![],
+            },
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("borrowed Fn"));
+
+    let make_function_module = |signature: Type, construction: Rvalue| MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "target".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Return(Some(MirValue::Int(1)))],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![typed_local(signature)],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: construction,
+                        },
+                        MirInst::Return(Some(MirValue::Int(0))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    let borrowed = Type::BorrowedFunction {
+        kind: BorrowedCallableKind::Fn,
+        params: vec![],
+        ret: Box::new(Type::I32),
+    };
+    let mut owned_constructor = CodegenContext::new("bad_owned_constructor").unwrap();
+    let error = owned_constructor
+        .codegen_module(&make_function_module(
+            borrowed.clone(),
+            Rvalue::MakeClosure {
+                function: "target".into(),
+                signature: borrowed,
+                captures: vec![],
+            },
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("owned FnOnce"));
+
+    let owned = Type::Function {
+        params: vec![],
+        ret: Box::new(Type::I32),
+    };
+    let mut borrowed_constructor = CodegenContext::new("bad_borrowed_constructor").unwrap();
+    let error = borrowed_constructor
+        .codegen_module(&make_function_module(
+            owned.clone(),
+            Rvalue::MakeBorrowedClosure {
+                function: "target".into(),
+                signature: owned.clone(),
+                captures: vec![],
+            },
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("Fn/FnMut"));
+
+    let borrowed = Type::BorrowedFunction {
+        kind: BorrowedCallableKind::Fn,
+        params: vec![],
+        ret: Box::new(Type::I32),
+    };
+    let mut relabeled_borrowed = CodegenContext::new("relabeled_borrowed_as_owned").unwrap();
+    let error = relabeled_borrowed
+        .codegen_module(&make_function_module(
+            owned.clone(),
+            Rvalue::MakeBorrowedClosure {
+                function: "target".into(),
+                signature: borrowed.clone(),
+                captures: vec![],
+            },
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("destination type"));
+
+    let mut relabeled_owned = CodegenContext::new("relabeled_owned_as_borrowed").unwrap();
+    let error = relabeled_owned
+        .codegen_module(&make_function_module(
+            borrowed,
+            Rvalue::MakeClosure {
+                function: "target".into(),
+                signature: owned,
+                captures: vec![],
+            },
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("destination type"));
 }
 
 #[test]

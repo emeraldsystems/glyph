@@ -7,6 +7,16 @@ struct GlyphThread {
 }
 
 #[repr(C)]
+struct GlyphThreadScope {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct GlyphScopedThread {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 struct GlyphMutex {
     _private: [u8; 0],
 }
@@ -35,6 +45,30 @@ unsafe extern "C" {
     fn glyph_thread_join(handle: *mut *mut GlyphThread) -> i32;
     fn glyph_thread_join_result(handle: *mut *mut GlyphThread, out_result: *mut c_void) -> i32;
     fn glyph_thread_detach(handle: *mut *mut GlyphThread) -> i32;
+    fn glyph_thread_scope_create(out: *mut *mut GlyphThreadScope) -> i32;
+    fn glyph_thread_scope_spawn(
+        scope: *mut GlyphThreadScope,
+        out: *mut *mut GlyphScopedThread,
+        entry: Option<GlyphThreadEntry>,
+        env: *mut c_void,
+    ) -> i32;
+    fn glyph_thread_scope_spawn_result(
+        scope: *mut GlyphThreadScope,
+        out: *mut *mut GlyphScopedThread,
+        entry: Option<GlyphThreadResultEntry>,
+        invoke: *mut c_void,
+        env: *mut c_void,
+        result_size: usize,
+        drop_result: Option<GlyphThreadDropResult>,
+    ) -> i32;
+    fn glyph_thread_scope_join(handle: *mut *mut GlyphScopedThread) -> i32;
+    fn glyph_thread_scope_join_result(
+        handle: *mut *mut GlyphScopedThread,
+        out_result: *mut c_void,
+    ) -> i32;
+    fn glyph_thread_scope_drain(scope: *mut GlyphThreadScope) -> i32;
+    fn glyph_thread_scope_drain_or_abort(scope: *mut GlyphThreadScope);
+    fn glyph_thread_scope_join_all(scope: *mut *mut GlyphThreadScope) -> i32;
     fn glyph_mutex_create(out: *mut *mut GlyphMutex) -> i32;
     fn glyph_mutex_lock(mutex: *mut GlyphMutex) -> i32;
     fn glyph_mutex_try_lock(mutex: *mut GlyphMutex) -> i32;
@@ -66,6 +100,42 @@ pub(super) fn register_symbols(symbols: &mut HashMap<String, u64>) {
         "glyph_thread_detach".to_string(),
         glyph_thread_detach as *const () as usize as u64,
     );
+    for (name, address) in [
+        (
+            "glyph_thread_scope_create",
+            glyph_thread_scope_create as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_scope_spawn",
+            glyph_thread_scope_spawn as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_scope_spawn_result",
+            glyph_thread_scope_spawn_result as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_scope_join",
+            glyph_thread_scope_join as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_scope_join_result",
+            glyph_thread_scope_join_result as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_scope_drain",
+            glyph_thread_scope_drain as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_scope_drain_or_abort",
+            glyph_thread_scope_drain_or_abort as *const () as usize as u64,
+        ),
+        (
+            "glyph_thread_scope_join_all",
+            glyph_thread_scope_join_all as *const () as usize as u64,
+        ),
+    ] {
+        symbols.insert(name.to_string(), address);
+    }
     symbols.insert(
         "glyph_mutex_create".to_string(),
         glyph_mutex_create as *const () as usize as u64,
@@ -102,13 +172,21 @@ mod tests {
     fn registers_complete_public_thread_runtime_surface() {
         let mut symbols = HashMap::new();
         register_symbols(&mut symbols);
-        assert_eq!(symbols.len(), 10);
+        assert_eq!(symbols.len(), 18);
         for name in [
             "glyph_thread_spawn",
             "glyph_thread_join",
             "glyph_thread_spawn_result",
             "glyph_thread_join_result",
             "glyph_thread_detach",
+            "glyph_thread_scope_create",
+            "glyph_thread_scope_spawn",
+            "glyph_thread_scope_spawn_result",
+            "glyph_thread_scope_join",
+            "glyph_thread_scope_join_result",
+            "glyph_thread_scope_drain",
+            "glyph_thread_scope_drain_or_abort",
+            "glyph_thread_scope_join_all",
             "glyph_mutex_create",
             "glyph_mutex_lock",
             "glyph_mutex_try_lock",

@@ -7,7 +7,7 @@ use glyph_core::mir::{
     BlockId, LocalId, MirBlock, MirExternFunction, MirFunction, MirInst, MirModule, MirValue,
     Rvalue,
 };
-use glyph_core::types::{EnumType, Mutability, StructType, Type};
+use glyph_core::types::{BorrowedCallableKind, EnumType, Mutability, StructType, Type};
 use llvm_sys::analysis::*;
 use llvm_sys::core::*;
 use llvm_sys::prelude::*;
@@ -30,6 +30,7 @@ pub struct CodegenContext {
     function_types: HashMap<String, LLVMTypeRef>,
     function_ref_thunks: HashMap<String, LLVMValueRef>,
     closure_artifacts: HashMap<String, ClosureArtifacts>,
+    borrowed_closure_artifacts: HashMap<String, BorrowedClosureArtifacts>,
     sret_functions: HashMap<String, Type>,
     target_data: Option<LLVMTargetDataRef>,
     requested_target_triple: Option<String>,
@@ -45,6 +46,12 @@ struct ClosureArtifacts {
     env_type: LLVMTypeRef,
     invoke: LLVMValueRef,
     drop: LLVMValueRef,
+}
+
+#[derive(Clone, Copy)]
+struct BorrowedClosureArtifacts {
+    env_type: LLVMTypeRef,
+    invoke: LLVMValueRef,
 }
 
 mod aggregate;
@@ -128,6 +135,23 @@ fn type_key_simple_codegen(ty: &Type) -> String {
             let params: Vec<String> = params.iter().map(type_key_simple_codegen).collect();
             format!(
                 "fn_{}_to_{}",
+                if params.is_empty() {
+                    "unit".to_string()
+                } else {
+                    params.join("__")
+                },
+                type_key_simple_codegen(ret)
+            )
+        }
+        Type::BorrowedFunction { kind, params, ret } => {
+            let capability = match kind {
+                BorrowedCallableKind::Fn => "fn_ref",
+                BorrowedCallableKind::FnMut => "fn_mut",
+            };
+            let params: Vec<String> = params.iter().map(type_key_simple_codegen).collect();
+            format!(
+                "{}_{}_to_{}",
+                capability,
                 if params.is_empty() {
                     "unit".to_string()
                 } else {

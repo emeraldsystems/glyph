@@ -29,6 +29,14 @@ pub enum CaptureOwnership {
     Move,
 }
 
+/// Strongest operation a closure performs through a captured binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CaptureAccess {
+    Read,
+    Mutate,
+    Move,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureEscapeKind {
     Return,
@@ -55,6 +63,7 @@ pub struct ClosureCapture {
     /// Resolved annotation or conservative local expression inference.
     pub resolved_type: Option<Type>,
     pub ownership: CaptureOwnership,
+    pub access: CaptureAccess,
     /// Preserves the user's `move ... -> ...` intent even when a Copy capture
     /// does not invalidate its source.
     pub explicit_move: bool,
@@ -95,6 +104,7 @@ struct Binding {
 struct CapturedBinding {
     binding: Binding,
     first_use_span: Span,
+    access: CaptureAccess,
 }
 
 struct WalkState {
@@ -176,11 +186,15 @@ impl WalkState {
         visible
     }
 
-    fn capture(&mut self, binding: Binding, span: Span) {
-        self.captures.entry(binding.id).or_insert(CapturedBinding {
-            binding,
-            first_use_span: span,
-        });
+    fn capture(&mut self, binding: Binding, span: Span, access: CaptureAccess) {
+        self.captures
+            .entry(binding.id)
+            .and_modify(|capture| capture.access = capture.access.max(access))
+            .or_insert(CapturedBinding {
+                binding,
+                first_use_span: span,
+                access,
+            });
     }
 
     fn absorb_nested_capture(&mut self, capture: &CapturedBinding) {
@@ -192,7 +206,11 @@ impl WalkState {
             .values()
             .any(|binding| binding.id == capture.binding.id)
         {
-            self.capture(capture.binding.clone(), capture.first_use_span);
+            self.capture(
+                capture.binding.clone(),
+                capture.first_use_span,
+                capture.access,
+            );
         }
     }
 
@@ -279,14 +297,20 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn reference_name(&mut self, state: &mut WalkState, name: &str, span: Span) {
+    fn reference_name_with_access(
+        &mut self,
+        state: &mut WalkState,
+        name: &str,
+        span: Span,
+        access: CaptureAccess,
+    ) {
         if let Some(binding) = state.local_binding(name).cloned() {
             self.check_available(&binding, span);
             return;
         }
         if let Some(binding) = state.outer_visible.get(name).cloned() {
             self.check_available(&binding, span);
-            state.capture(binding, span);
+            state.capture(binding, span, access);
             return;
         }
         if state
@@ -304,6 +328,32 @@ impl<'a> Analyzer<'a> {
         // Function items, constants, enum constructors, and ordinary
         // unresolved names are not lexical captures. The resolver/lowerer
         // reports unknown symbols separately.
+    }
+
+    fn reference_name(&mut self, state: &mut WalkState, name: &str, span: Span) {
+        self.reference_name_with_access(state, name, span, CaptureAccess::Read);
+    }
+
+    fn visit_capture_root(&mut self, expr: &Expr, state: &mut WalkState, access: CaptureAccess) {
+        match expr {
+            Expr::Ident(name, span) => {
+                self.reference_name_with_access(state, &name.0, *span, access)
+            }
+            Expr::FieldAccess { base, .. } | Expr::Index { base, .. } => {
+                let access = if access == CaptureAccess::Move
+                    && self
+                        .infer_expr_type(expr, state)
+                        .as_ref()
+                        .is_some_and(type_is_copy)
+                {
+                    CaptureAccess::Read
+                } else {
+                    access
+                };
+                self.visit_capture_root(base, state, access)
+            }
+            _ => self.visit_expr(expr, state, None),
+        }
     }
 
     fn visit_block(
@@ -328,14 +378,16 @@ impl<'a> Analyzer<'a> {
     fn visit_stmt(&mut self, stmt: &Stmt, state: &mut WalkState, implicit_return: bool) {
         match stmt {
             Stmt::Expr(expr, span) => {
-                self.visit_expr(expr, state, None);
                 if implicit_return {
+                    self.visit_capture_root(expr, state, CaptureAccess::Move);
                     self.mark_escape(expr, state, ClosureEscapeKind::Return, *span);
+                } else {
+                    self.visit_expr(expr, state, None);
                 }
             }
             Stmt::Ret(expr, span) => {
                 if let Some(expr) = expr {
-                    self.visit_expr(expr, state, None);
+                    self.visit_capture_root(expr, state, CaptureAccess::Move);
                     self.mark_escape(expr, state, ClosureEscapeKind::Return, *span);
                 }
             }
@@ -360,6 +412,19 @@ impl<'a> Analyzer<'a> {
                 let inferred_type = value
                     .as_ref()
                     .and_then(|value| self.infer_expr_type(value, state));
+                let resolved_context = ty
+                    .as_ref()
+                    .and_then(|ty| resolve_type_expr_to_type(ty, self.resolver))
+                    .or_else(|| inferred_type.clone());
+                if matches!(resolved_context, Some(Type::BorrowedFunction { .. })) {
+                    for closure_id in &closure_values {
+                        if let Some(closure) = self.closures.get(*closure_id as usize) {
+                            for capture in &closure.captures {
+                                self.moved_bindings.remove(&capture.binding_id);
+                            }
+                        }
+                    }
+                }
                 let binding =
                     self.binding(&name.0, *span, ty.as_ref(), inferred_type, closure_values);
                 state.declare(binding);
@@ -369,7 +434,7 @@ impl<'a> Analyzer<'a> {
                 value,
                 span,
             } => {
-                self.visit_expr(target, state, None);
+                self.visit_capture_root(target, state, CaptureAccess::Mutate);
                 let owner = match target {
                     Expr::Ident(name, _) => state
                         .visible_binding(&name.0)
@@ -428,7 +493,7 @@ impl<'a> Analyzer<'a> {
                 self.visit_expr(callee, state, None);
                 self.record_calls(callee, state, *span);
                 for arg in args {
-                    self.visit_expr(arg, state, None);
+                    self.visit_capture_root(arg, state, CaptureAccess::Move);
                     self.mark_escape(arg, state, ClosureEscapeKind::Transfer, *span);
                 }
             }
@@ -501,7 +566,13 @@ impl<'a> Analyzer<'a> {
                 args,
                 span,
             } => {
-                self.visit_expr(receiver, state, None);
+                let receiver_access = match method.0.as_str() {
+                    "push" | "pop" | "add" | "update" | "del" | "insert" | "set" | "write"
+                    | "read_to_string" | "borrow_mut" => CaptureAccess::Mutate,
+                    "into_raw" => CaptureAccess::Move,
+                    _ => CaptureAccess::Read,
+                };
+                self.visit_capture_root(receiver, state, receiver_access);
                 let container_insert = matches!(
                     method.0.as_str(),
                     "push" | "insert" | "add" | "update" | "set"
@@ -587,7 +658,7 @@ impl<'a> Analyzer<'a> {
         match body {
             Expr::Block(block) => self.visit_block(block, &mut state, true, true),
             _ => {
-                self.visit_expr(body, &mut state, None);
+                self.visit_capture_root(body, &mut state, CaptureAccess::Move);
                 self.mark_escape(body, &state, ClosureEscapeKind::Return, span);
             }
         }
@@ -634,6 +705,17 @@ impl<'a> Analyzer<'a> {
                     declared_type: capture.binding.declared_type.clone(),
                     resolved_type: capture.binding.resolved_type.clone(),
                     ownership,
+                    access: if capture
+                        .binding
+                        .resolved_type
+                        .as_ref()
+                        .is_some_and(type_is_copy)
+                        && capture.access == CaptureAccess::Move
+                    {
+                        CaptureAccess::Read
+                    } else {
+                        capture.access
+                    },
                     explicit_move: capture_mode == CaptureMode::Move,
                     transitively_borrowed: borrowed,
                 }
@@ -719,6 +801,15 @@ impl<'a> Analyzer<'a> {
     }
 
     fn record_calls(&mut self, callee: &Expr, state: &WalkState, span: Span) {
+        // Contextual Fn/FnMut bindings borrow their closure environment and
+        // remain callable after an invocation. Only owned FnOnce values are
+        // consumed by a call.
+        if matches!(
+            self.infer_expr_type(callee, state),
+            Some(Type::BorrowedFunction { .. })
+        ) {
+            return;
+        }
         for closure_id in self.closure_values(callee, state) {
             if self.closure_calls.insert(closure_id, span).is_some() {
                 let name = match callee {
@@ -1071,6 +1162,15 @@ fn type_label(ty: &Type) -> String {
         Type::Atomic(scalar) => scalar.type_name().into(),
         Type::Function { params, ret } => format!(
             "FnOnce<({}), {}>",
+            params.iter().map(type_label).collect::<Vec<_>>().join(", "),
+            type_label(ret)
+        ),
+        Type::BorrowedFunction { kind, params, ret } => format!(
+            "{}<({}), {}>",
+            match kind {
+                glyph_core::types::BorrowedCallableKind::Fn => "Fn",
+                glyph_core::types::BorrowedCallableKind::FnMut => "FnMut",
+            },
             params.iter().map(type_label).collect::<Vec<_>>().join(", "),
             type_label(ret)
         ),

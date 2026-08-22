@@ -1,20 +1,23 @@
-# Closures and Concurrency v0: Semantics and ABI
+# Closures and Concurrency: Semantics and ABI
 
 **Status:** Accepted for the GLYPH-32 implementation epic
 
 **Decision owner:** GLYPH-33
 
-**Scope:** Owned `FnOnce` closures, safe native threads, atomics, `Arc<T>`,
-`Mutex<T>`, and bounded SPSC communication
+**Scope:** Owned `FnOnce` and lexically borrowed `Fn`/`FnMut` closures, owned
+and scoped native threads, atomics, `Arc<T>`, `Mutex<T>`, and bounded SPSC
+communication
 
-This document is normative for the first closures-and-concurrency release. It
-locks the language and runtime contracts that the implementation stories share.
+This document is normative for the closures-and-concurrency release. It locks
+the language and runtime contracts that the implementation stories share.
 Later work may add capabilities, but must not silently weaken these safety
-rules.
+rules. Sections describing the pre-epic baseline are historical context, not a
+statement of the current implementation.
 
-The older lambda proposal's arrow spelling remains valid. Its borrowed
-`Fn`/`FnMut` capture model is superseded for this release: v0 closures own their
-captures and are callable once.
+The older lambda proposal's arrow spelling remains valid. Owned `FnOnce`
+closures are the escaping callable form. `Fn` and `FnMut` are repeatable,
+stack-backed borrowed callable views with conservative lexical loans and a
+strict noescape contract.
 
 ## 1. Current baseline and constraints
 
@@ -30,9 +33,10 @@ At the start of this epic:
   normal thread and submits them through a blocking runtime API. Glyph code
   does not execute on the real-time callback.
 
-These constraints favor a deliberately small first step: one owned callable
-kind, structural thread-safety checks, compiler-known generic APIs, and a
-bounded communication primitive.
+These constraints favored a deliberately small foundation: an owned callable,
+structural thread-safety checks, compiler-known generic APIs, and a bounded
+communication primitive. The release then adds borrowed callables and scoped
+threads without claiming general lifetime or non-lexical-loan analysis.
 
 ## 2. Closure surface syntax
 
@@ -75,21 +79,23 @@ The following parsing rules are part of the decision:
 - Parameter and result types use local, bidirectional inference. If a
   parameter cannot be determined from its body or expected callable type, the
   compiler requires an annotation.
-- `move` is an explicit capture marker. In v0, both implicit and explicit
-  capture forms produce an owned environment; `move` makes the ownership
-  transfer visible and is the canonical spelling at escaping and thread
-  boundaries.
+- `move` is an explicit owned-capture marker and always produces `FnOnce`.
+  Without `move`, an expected `Fn`/`FnMut` type selects borrowed capture;
+  otherwise the closure uses the owned `FnOnce` form. `move` is canonical at
+  escaping and unscoped-thread boundaries.
 
 `async` closures, variadics, generators, pattern parameters, and FFI closure
 parameters are not in this release.
 
-## 3. Callable type and `FnOnce` behavior
+## 3. Callable capabilities
 
-There is one callable capability in v0: `FnOnce`. The compiler recognizes the
-type constructor below; it is not a user-implementable interface:
+The compiler recognizes three callable type constructors; they are not
+user-implementable interfaces:
 
 ```text
 FnOnce<Args, Return>
+Fn<Args, Return>
+FnMut<Args, Return>
 ```
 
 `Args` is `()` for zero parameters, the parameter type for one parameter, and
@@ -107,17 +113,27 @@ significant and must be preserved by type rendering. This distinguishes it
 from `FnOnce<(i32, i32), R>`, which takes two scalar parameters.
 
 A closure literal normally has a unique environment type internally, but it
-coerces to the corresponding `FnOnce<Args, Return>` value. A named function
-item may coerce to the same callable type. Callable values are move-only and
-cannot be cloned.
+coerces to the corresponding callable type. A named function item may coerce
+to the same callable signature. Owned `FnOnce` values are move-only and cannot
+be cloned.
 
-Calling a callable local consumes it. A second call, a call after another
+Calling an `FnOnce` local consumes it. A second call, a call after another
 move, or dropping both the source and a moved copy is a compile error. A named
 function may still be called repeatedly because each reference to the function
 creates a new environment-free callable value.
 
-`Fn` and `FnMut` are deferred until Glyph has the loan, lifetime, and alias
-analysis needed for borrowed and repeatedly callable environments.
+`Fn` permits repeated shared invocation. Its captures are shared lexical loans
+and it cannot mutate them. `FnMut` permits repeated exclusive invocation and
+may mutate captures declared with `let mut`. A borrowed callable is selected
+by an expected `Fn`/`FnMut` type; a `move` closure always produces owned
+`FnOnce`.
+
+Borrowed callables are noescape. They may appear as direct function parameters
+or direct lexical locals, but cannot be returned, placed in an aggregate or
+collection, allocated under an owner, captured by an owned closure, or sent to
+an unscoped thread. A shared callable can be passed directly; an `FnMut` cannot
+be copied, assigned, or aliased across multiple arguments. Loans end at the
+holder's lexical block, not its last use.
 
 ### 3.1 Uniform internal ABI
 
@@ -159,6 +175,12 @@ pointer. They use an environment-first adapter thunk so indirect calls retain
 one representation. Direct-call and stack-environment optimizations are
 allowed only when they preserve the same observable move/drop behavior.
 
+`Fn` and `FnMut` use the same three-word carrier layout but do not own the
+environment. Their environment is stack-backed, invocation does not consume
+it, and the drop pointer is null. The frontend proves lexical validity and
+exclusivity; the backend rejects forged borrowed callables in escaping
+returns or storage.
+
 Environment storage is not a public ABI. The first implementation may heap
 allocate nonempty environments. Escape analysis may stack-allocate a proven
 nonescaping environment. Callable values are not C-compatible and cannot be
@@ -167,8 +189,9 @@ passed through `extern "C"`.
 ## 4. Capture and escape rules
 
 Capture analysis finds free local bindings referenced by a closure body after
-name resolution. Function items, constants, and globals are not captures.
-Each captured local is transferred when the closure expression is evaluated:
+name resolution. Function items, constants, and globals are not captures. In
+an owned closure, each captured local is transferred when the closure
+expression is evaluated:
 
 - move-only values move into the environment;
 - trivially copyable values are copied into the environment;
@@ -179,21 +202,21 @@ Each captured local is transferred when the closure expression is evaluated:
   order), although it is not a stable external ABI.
 
 `CaptureMode::Inferred` means that the compiler infers the *set* of free
-locals. It does not infer borrowed versus owned capture. `CaptureMode::Move`
-uses the same v0 ownership rules while recording explicit programmer intent.
+locals. The expected callable capability determines borrowed versus owned
+capture. `CaptureMode::Move` records explicit owned `FnOnce` intent.
 
-The v0 environment must be self-contained. Capturing `&T`, `&mut T`, `str`, or
-an aggregate that transitively contains a borrowed view is rejected. A string
-literal may be referenced directly as static data; a runtime string view must
-be converted to an owned `String` before capture. This conservative rule is
-intentional: borrowed captures and their nonescape proof belong to the later
-`Fn`/`FnMut` and scoped-thread work.
+An owned `FnOnce` environment must be self-contained. Capturing `&T`, `&mut T`,
+`str`, or an aggregate that transitively contains a borrowed view is rejected.
+A string literal may be referenced directly as static data; a runtime string
+view must be converted to an owned `String` before owned capture. `Fn` and
+`FnMut` instead record lexical shared or mutable capture loans. Their noescape
+and storage rules prevent those loans from outliving the owners.
 
-Because environments own all captures, they may escape their defining block by
-being returned, stored, or passed to another function once the destination
-supports the callable type. Thread escape adds the structural `Send` checks in
-Section 6. Dynamic callable trait objects, closure cloning, and closure
-serialization are deferred.
+Because `FnOnce` environments own all captures, they may escape their defining
+block by being returned, stored, or passed to another function once the
+destination supports the callable type. Thread escape adds the structural
+`Send` checks in Section 6. Dynamic callable trait objects, closure cloning,
+and closure serialization are deferred.
 
 ## 5. Compiler-intrinsic generic-looking APIs
 
@@ -207,6 +230,17 @@ must not gain intrinsic behavior.
 ```text
 spawn<T>(task: FnOnce<(), T>)
     -> Result<JoinHandle<T>, ThreadError>
+
+scope<R>(body: FnMut<(Scope,), R>)
+    -> Result<R, ThreadError>
+
+Scope::spawn<T>(self: &Scope, task: Fn<(), T>)
+    -> Result<ScopedJoinHandle<T>, ThreadError>
+Scope::spawn<T>(self: &Scope, task: FnMut<(), T>)
+    -> Result<ScopedJoinHandle<T>, ThreadError>
+
+ScopedJoinHandle<T>::join(self)
+    -> Result<T, ThreadError>
 
 channel<T>(capacity: usize)
     -> Result<(Sender<T>, Receiver<T>), ChannelError>
@@ -227,9 +261,9 @@ runtime type descriptors or type erasure are introduced by these APIs.
 ## 6. Structural `Send` and `Sync`
 
 `Send` means ownership of a value may move to another thread. `Sync` means the
-type supports safe shared access from multiple threads. In v0 these are
-compiler predicates, not user-declared interfaces. There is no `unsafe impl`
-escape hatch.
+type supports safe shared access from multiple threads. In this release these
+are compiler predicates, not user-declared interfaces. There is no `unsafe
+impl` escape hatch.
 
 The compiler evaluates them structurally and reports the field/capture path
 that made a type fail. The minimum rules are:
@@ -242,13 +276,16 @@ that made a type fail. The minimum rules are:
 | `Own<T>`, `Vec<T>`, `Map<K,V>` | iff owned components are `Send` | iff shared observation of every component is `Sync` |
 | `Shared<T>` | no | no |
 | `RawPtr<T>` | no | no |
-| Borrowed `str`, `&T`, `&mut T` | never thread-escaping in v0 | never thread-escaping in v0 |
+| Borrowed `str`, `&T` | scoped task capture only when the referent is `Sync` | no unscoped escape |
+| `&mut T` | scoped task capture only when `T: Send` | no unscoped escape |
 | Atomic scalar types | yes | yes |
 | `Arc<T>` | iff `T: Send + Sync` | iff `T: Send + Sync` |
 | `Mutex<T>` | iff `T: Send` | iff `T: Send` |
 | `MutexGuard<T>` | no | no |
 | `FnOnce<A,R>` | iff every capture is `Send` | no |
+| `Fn<A,R>`, `FnMut<A,R>` | no unscoped escape; scoped captures checked individually | no |
 | `JoinHandle<T>` | iff `T: Send` | no |
+| `Scope`, `ScopedJoinHandle<T>` | noescape scope tokens | noescape scope tokens |
 | `Sender<T>`, `Receiver<T>` | iff `T: Send` | no |
 
 `spawn` requires both its closure and result `T` to be `Send`. This checks the
@@ -267,11 +304,11 @@ AtomicBool:  new, load, store, swap, compare_exchange
 AtomicUsize: new, load, store, swap, compare_exchange, fetch_add, fetch_sub
 ```
 
-Every public atomic operation is sequentially consistent (`SeqCst`). v0 has no
-public ordering parameter, fence API, or safe `AtomicPtr<T>`. This makes source
-semantics small and prevents callers from accidentally weakening a safety
-protocol. Integer read/modify/write overflow follows the corresponding
-unsigned wrapping operation.
+Every public atomic operation is sequentially consistent (`SeqCst`). The
+release has no public ordering parameter, fence API, or safe `AtomicPtr<T>`.
+This makes source semantics small and prevents callers from accidentally
+weakening a safety protocol. Integer read/modify/write overflow follows the
+corresponding unsigned wrapping operation.
 
 Compiler/runtime internals use the weakest ordering required by their locked
 protocols:
@@ -314,7 +351,7 @@ and safe `AtomicPtr<T>` are deferred.
 `Mutex<T>` provides blocking mutual exclusion and owns its `T`. It is suitable
 for ordinary worker/control threads, not the audio callback. `lock` blocks
 until it acquires the mutex and returns a guard. Glyph does not introduce
-poisoning in v0; an impossible runtime mutex invariant failure aborts rather
+poisoning; an impossible runtime mutex invariant failure aborts rather
 than returning an unlocked guard.
 
 `MutexGuard<T>` is a compiler-known RAII guard. Its drop glue unlocks exactly
@@ -353,8 +390,29 @@ model must extend, not reinterpret, `ThreadError`.
 Dropping an unjoined handle detaches the native thread. It does not cancel or
 join it. The detached thread keeps its state alive until completion, then drops
 an unclaimed result and frees the state. Process termination does not wait for
-detached threads. Forced cancellation, scoped threads, thread priorities,
-names, affinity, and deadlines are deferred.
+detached threads. Forced cancellation, thread priorities, names, affinity, and
+deadlines are deferred.
+
+### 10.1 Scoped thread lifecycle
+
+`scope` creates a private runtime owner and passes a non-owning lexical `Scope`
+view to its `FnMut` callback. `Scope::spawn` accepts a zero-argument borrowed
+`Fn` or `FnMut`, allowing child work to borrow callback or outer locals. Shared
+captures require `Sync`, mutable captures require `Send`, and the result `T`
+requires `Send`.
+
+Every callback cleanup path drains all children before callback locals are
+dropped. `ScopedJoinHandle<T>::join` consumes the public handle and moves its
+result once; leaving a handle unjoined gives up explicit access but the scope
+still joins the child and drops an unclaimed result. Scoped handles cannot
+detach. `Scope` and `ScopedJoinHandle<T>` are compiler-issued noescape tokens
+that cannot be returned, stored, captured by a child, or forged with a
+same-named user type.
+
+The conservative checker reserves a spawned task's capture loans until scope
+drain, including after an explicit join. It rejects overlapping spawns of one
+`FnMut` task value. General non-lexical release, arbitrary reborrowing, nested
+worker-side spawning, and detached borrowed work are outside this contract.
 
 ## 11. Bounded SPSC channel
 
@@ -395,7 +453,7 @@ MPMC/MPSC channels, endpoint cloning, selection, and async wakeups are deferred.
 This epic enables sequencer and synthesis architecture; it does not claim a
 hard real-time Glyph runtime.
 
-- Glyph closures do not run on the platform audio callback in v0. The existing
+- Glyph closures do not run on the platform audio callback. The existing
   C callback and prefilled-buffer architecture remains the boundary.
 - Thread creation/join, `Mutex`, blocking audio writes, allocation, `Arc` last
   drop, arbitrary `T` drop glue, printing, file I/O, and public `SeqCst`
@@ -421,9 +479,14 @@ path. At minimum:
   multiple parameters;
 - use of a capture after it moved into an environment;
 - second invocation or use after move of `FnOnce`;
-- borrowed or `str` capture in an owned v0 closure;
+- borrowed or `str` capture in an owned closure;
+- mutation through `Fn`, aliasing or copying `FnMut`, and a lexical-loan
+  conflict involving a borrowed callable;
+- borrowed callable return or aggregate/container/owner storage;
 - closure/thread escape containing the first non-`Send` capture and nested
   field path;
+- scoped token escape, detach, forged identity, non-`Send`/`Sync` capture path,
+  or overlapping `FnMut` scoped spawns;
 - attempted shared `Arc<T>` mutation without an interior synchronization type;
 - mutex guard or guard-derived borrow escape;
 - cloning an SPSC endpoint;
@@ -444,9 +507,13 @@ coverage where applicable.
 | Function item | Bind a named function to a callable local and call it | Environment-free indirect call succeeds |
 | Owned capture drop | Create but do not call a closure capturing `String` | Environment drop frees the string once |
 | Owned capture invoke | Call a closure capturing `String` | Invoke path frees/moves captures once |
+| Repeated shared callback | Invoke one `Fn` twice while reading a capture | Both calls observe the same lexical environment |
+| Repeated mutable callback | Invoke one `FnMut` twice while updating a mutable capture | Calls use exclusive, non-consuming access |
 | Aggregate result | Closure returns a struct/enum/string aggregate | Indirect `sret` ABI matches direct ABI |
 | Thread result | Spawn `move () -> 42`, then join | Join returns `Ok(42)` once |
 | Detached result | Spawn an owned task and drop its handle | Task/result/captures eventually drop without leak |
+| Scoped borrowed task | Spawn a child that reads or mutates a callback local | Child joins before the local is dropped |
+| Scoped result | Explicitly join one child and leave another handle unjoined | Joined result moves once; unclaimed result drops once at drain |
 | Structural send | Move `String`, `Own<i32>`, or an all-`Send` struct into a task | Compiles |
 | Atomic publication | One thread stores, another loads an atomic flag | Public operations are `SeqCst` and race-free |
 | Arc lifetime | Clone `Arc<String>` across tasks and join | Last owner drops data once |
@@ -465,7 +532,10 @@ coverage where applicable.
 | Callable type arity | `FnOnce<i32>` or `FnOnce<i32,i32,i32>` | `FnOnce` expects exactly two type arguments |
 | Use after capture | Create `move () -> owned`, then use `owned` | Value moved into closure |
 | Call twice | Invoke the same callable local twice | `FnOnce` already consumed |
-| Borrowed capture | Capture `&T`, `&mut T`, or runtime `str` | Borrowed captures are deferred; own/clone the value |
+| Borrowed owned capture | Capture `&T`, `&mut T`, or runtime `str` in `FnOnce` | Own/clone the value or use a noescape borrowed callable |
+| Borrowed callable escape | Return or store `Fn`/`FnMut` | Borrowed callable is noescape; use owned `FnOnce` |
+| Shared callback mutation | Mutate a capture through `Fn` | Use `FnMut` and a mutable binding |
+| Mutable callback alias | Copy, assign, or pass one `FnMut` twice | Exclusive callable cannot be aliased |
 | Non-`Send` capture | Spawn a closure containing `Shared<T>` | Capture path is not `Send` |
 | Raw pointer capture | Spawn a closure containing `RawPtr<T>` | Raw pointers are not `Send` |
 | Arc laundering | Spawn with `Arc<Shared<T>>` | Nested `Shared<T>` prevents `Send + Sync` |
@@ -476,8 +546,10 @@ coverage where applicable.
 | Endpoint clone | Clone a `Sender<T>` or `Receiver<T>` | SPSC endpoints are move-only |
 | Endpoint sharing | Attempt simultaneous shared endpoint use | Endpoint is not `Sync`; exclusive owner required |
 | Atomic plain access | Read/write atomic backing value as an ordinary scalar | Atomic storage requires atomic methods |
-| Public weak ordering | Request `Relaxed`/`Acquire` on a public atomic method | Ordering parameters are not part of v0 API |
+| Public weak ordering | Request `Relaxed`/`Acquire` on a public atomic method | Ordering parameters are not part of the public API |
 | Closure FFI | Pass a callable to `extern "C"` | Callable ABI is Glyph-internal |
+| Scoped detach | Call `detach` on `ScopedJoinHandle<T>` | Scoped children must join before scope exit |
+| Scoped token escape | Return/store `Scope` or `ScopedJoinHandle<T>` | Compiler-issued scope token is noescape |
 
 ## 16. Runtime and release verification
 
@@ -499,8 +571,9 @@ escape patterns.
 
 ## 17. Explicitly deferred work
 
-- borrowed `Fn`/`FnMut` closures and general loan/region analysis;
-- scoped threads and references crossing a proven scope;
+- general region inference, non-lexical loan termination, and unrestricted
+  reborrowing beyond the conservative lexical `Fn`/`FnMut` model;
+- nested worker-side scoped spawning and detached borrowed work;
 - weak `Arc` references and cycles;
 - safe `AtomicPtr<T>` and public memory-order selection;
 - async tasks/futures and channel selection;

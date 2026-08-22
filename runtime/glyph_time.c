@@ -94,3 +94,33 @@ int32_t glyph_time_sleep_us(uint32_t us) {
     }
     return 0;
 }
+
+// Sleep until an absolute CLOCK_MONOTONIC deadline. Recomputing the
+// remaining interval after EINTR preserves the absolute schedule instead of
+// accumulating relative-sleep drift across sequencer ticks.
+int32_t glyph_time_sleep_until_ns(uint64_t deadline_ns) {
+    for (;;) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            return -1;
+        }
+
+        uint64_t now_ns =
+            (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+        if (now_ns >= deadline_ns) {
+            return 0;
+        }
+
+        uint64_t remaining_ns = deadline_ns - now_ns;
+        struct timespec remaining;
+        remaining.tv_sec = (time_t)(remaining_ns / 1000000000ULL);
+        remaining.tv_nsec = (long)(remaining_ns % 1000000000ULL);
+
+        if (nanosleep(&remaining, NULL) == 0) {
+            return 0;
+        }
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+}

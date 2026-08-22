@@ -192,7 +192,6 @@ fn struct_with_vec_string_field_access() {
 // that prevents the aliased-pointer bug B2 describes.
 #[cfg(all(feature = "codegen", unix))]
 #[test]
-#[ignore = "B2: resolver correctly prevents Vec field move — compile error, not runtime"]
 fn struct_vec_field_read_elements() {
     let source = r#"
         from std import String
@@ -216,7 +215,24 @@ fn struct_vec_field_read_elements() {
         }
     "#;
 
-    assert_eq!(build_and_run_exit_code(source), 0);
+    let output = compile_source(
+        source,
+        FrontendOptions {
+            emit_mir: true,
+            include_std: true,
+        },
+    );
+    assert!(
+        output.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("cannot move field 'items' out of a struct")),
+        "expected the ownership diagnostic, got {:?}",
+        output.diagnostics
+    );
+    assert!(
+        output.mir.functions.is_empty(),
+        "rejected field move must not reach executable MIR"
+    );
 }
 
 // T11: B1 at scale — 100 iterations, each leaking a String allocation.

@@ -155,8 +155,9 @@ This is not the final language spec, but these features are working now (see `ex
 **Advanced Features**
 - Multi-file projects with module discovery
 - C FFI via `extern "C"` declarations
-- Owned, first-class `FnOnce` closures and named-function values
-- Native threads, atomic scalars, `Arc<T>`, and worker-only `Mutex<T>` shared state
+- Owned `FnOnce` closures plus repeatable, lexically borrowed `Fn`/`FnMut` callbacks
+- Owned and scoped native threads, atomic scalars, `Arc<T>`, and worker-only `Mutex<T>` shared state
+- Bounded SPSC channels and a sequencer acceptance example
 - Error propagation with `?` operator
 - Arrays with bounds checking
 - LSP server with real-time diagnostics

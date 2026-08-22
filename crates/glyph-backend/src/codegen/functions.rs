@@ -199,6 +199,7 @@ impl CodegenContext {
         functions: &HashMap<String, LLVMValueRef>,
         mir_module: &MirModule,
     ) -> Result<()> {
+        self.validate_scoped_thread_function(func)?;
         // Create basic blocks
         let mut bb_map: HashMap<BlockId, LLVMBasicBlockRef> = HashMap::new();
         for (i, _) in func.blocks.iter().enumerate() {
@@ -487,6 +488,15 @@ impl CodegenContext {
                 }
                 MirInst::DropThreadHandle(handle) => {
                     self.codegen_drop_thread_handle(*handle, func, local_map)?;
+                }
+                MirInst::DropThreadScope(scope) => {
+                    self.codegen_drop_thread_scope(*scope, func, local_map)?;
+                }
+                MirInst::DrainThreadScope(scope) => {
+                    self.codegen_drain_thread_scope(*scope, func, local_map)?;
+                }
+                MirInst::DropScopedThreadHandle(handle) => {
+                    self.codegen_drop_scoped_thread_handle(*handle, func, local_map)?;
                 }
                 MirInst::Nop => {}
             }

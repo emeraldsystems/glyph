@@ -4,11 +4,13 @@ This directory contains the C runtime library that provides low-level formatting
 
 ## Callable ABI Boundary
 
-Owned `FnOnce` values use a compiler-internal three-pointer representation:
-an opaque environment pointer, an invoke-thunk pointer, and a drop-thunk
-pointer. Capturing closures may allocate their environment; compiler-generated
-invoke/drop thunks own its destruction. This is not a C ABI, and callable
-values must not be passed directly through `extern "C"`.
+Callable values use a compiler-internal three-pointer representation: an
+opaque environment pointer, an invoke-thunk pointer, and a drop-thunk pointer.
+Owned `FnOnce` environments may allocate; compiler-generated invoke/drop
+thunks own their destruction. Borrowed `Fn`/`FnMut` environments are
+stack-backed, noescape views: invocation does not consume them and their drop
+pointer is null. This is not a C ABI, and callable values must not be passed
+directly through `extern "C"`.
 
 Closure construction, invocation, and destruction may allocate, free, or run
 arbitrary capture drop glue. None of those operations is guaranteed safe in a
@@ -35,6 +37,20 @@ observable effects must join their workers before returning from `main`.
 Detached workers must also finish before a JIT execution engine is destroyed,
 because their generated entry and drop thunks belong to that engine.
 
+## Scoped Thread Ownership
+
+`glyph_thread_scope_create` allocates a private owner for one lexical scope.
+Scoped spawn links each child into that owner before it becomes observable.
+Explicit scoped join consumes one child handle; scope drain joins every
+remaining child and drops each unclaimed typed result exactly once.
+
+Compiler-generated cleanup calls `glyph_thread_scope_drain` (or the aborting
+cleanup form when ordinary error recovery is no longer possible) before any
+borrowed callback local is destroyed. `glyph_thread_scope_join_all` then drains
+and frees the private owner. The public `Scope` value is only a non-owning view,
+and `ScopedJoinHandle<T>` has no detach operation. Neither runtime pointer is a
+public or C-compatible Glyph ABI.
+
 ## Mutex Runtime Boundary
 
 `glyph_mutex_create`, `glyph_mutex_lock`, `glyph_mutex_try_lock`,
@@ -50,6 +66,20 @@ owned slot before unlocking, guaranteeing at most one unlock.
 These calls are worker/control synchronization. They may block or enter the OS
 and are prohibited on the hard real-time audio callback path. `Arc<Mutex<T>>`
 has the same restriction; final release may also destroy `T` and free memory.
+
+## SPSC Compiler Boundary
+
+Bounded `std/sync/spsc` channels are compiler-generated rather than C runtime
+objects. The compiler emits one heap allocation for the fixed ring and uses
+the shared atomic lowering for its acquire/release indices. `try_send` and
+`try_recv` neither allocate nor call the OS. Their endpoint and result layouts
+are internal Glyph ABI and must not cross `extern "C"`.
+
+Final endpoint release may drain droppable messages and free the ring. The
+current audio architecture uses SPSC between ordinary Glyph control,
+sequencer, and render loops. Glyph code submits prefilled buffers through the
+blocking audio API; the native device callback only consumes those buffers and
+does not invoke Glyph or its SPSC operations.
 
 ## Overview
 

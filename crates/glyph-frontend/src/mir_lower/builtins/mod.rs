@@ -5,6 +5,7 @@ mod map;
 mod mutex;
 mod print;
 mod ptr;
+mod spsc;
 mod string;
 mod term;
 mod thread;
@@ -24,13 +25,17 @@ pub(crate) use print::lower_print_builtin;
 pub(crate) use ptr::{
     lower_own_from_raw, lower_own_into_raw, lower_own_new, lower_shared_clone, lower_shared_new,
 };
+pub(crate) use spsc::{is_canonical_channel, lower_channel, lower_spsc_method};
 pub(crate) use string::{
     lower_string_as_str, lower_string_clone, lower_string_concat, lower_string_ends_with,
     lower_string_from, lower_string_len, lower_string_slice, lower_string_split,
     lower_string_starts_with, lower_string_trim,
 };
 pub(crate) use term::lower_term_stdout;
-pub(crate) use thread::{is_canonical_spawn, lower_thread_method, lower_thread_spawn};
+pub(crate) use thread::{
+    is_canonical_scope, is_canonical_spawn, lower_thread_method, lower_thread_scope,
+    lower_thread_spawn,
+};
 pub(crate) use vec::{
     lower_vec_get, lower_vec_len, lower_vec_pop, lower_vec_push, lower_vec_static_new,
     lower_vec_static_with_capacity,

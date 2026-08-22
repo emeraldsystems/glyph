@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-49ba643b.js";
+            window.path_to_searchindex_js = "searchindex-d2c92e95.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-ee24a55e.js"></script>
+        <script src="toc-2dc36abc.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -175,9 +175,9 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="threads-and-shared-state"><a class="header" href="#threads-and-shared-state">Threads and Shared State</a></h1>
-<p>Glyph’s first concurrency surface uses owned <code>FnOnce</code> tasks, native join
-handles, atomic scalars, <code>Arc&lt;T&gt;</code>, and <code>Mutex&lt;T&gt;</code>. These are intended for
-control and worker threads.</p>
+<p>Glyph’s concurrency surface provides owned <code>FnOnce</code> tasks, lexically scoped
+<code>Fn</code>/<code>FnMut</code> tasks, native join handles, atomic scalars, <code>Arc&lt;T&gt;</code>, <code>Mutex&lt;T&gt;</code>,
+and bounded SPSC channels. These are intended for control and worker threads.</p>
 <pre><code class="language-glyph">import Arc from std/sync
 import Mutex from std/sync
 import spawn from std/thread
@@ -195,6 +195,11 @@ let outcome = spawn(task)
 <p><code>Arc&lt;T&gt;</code> provides atomic shared ownership but only immutable access.
 <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> is the standard way to share mutable worker state. <code>Mutex&lt;T&gt;</code>
 is <code>Send + Sync</code> only when <code>T</code> is <code>Send</code>.</p>
+<p><code>Arc&lt;T&gt;</code> atomically protects the pointee’s lifetime; it is not an atomic raw
+pointer and does not make arbitrary mutation safe. Glyph does not expose a
+safe <code>AtomicPtr&lt;T&gt;</code> in this release. Pointer replacement needs an ownership and
+reclamation protocol beyond an atomic address update, so use <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>,
+an atomic scalar, or message passing instead.</p>
 <p><code>lock()</code> blocks and returns a move-only <code>MutexGuard&lt;T&gt;</code>. <code>try_lock()</code> returns
 <code>Option&lt;MutexGuard&lt;T&gt;&gt;</code> without blocking. A guard supplies exclusive mutable
 access through <code>borrow_mut()</code> and unlocks exactly once when its lexical scope
@@ -205,12 +210,82 @@ array, enum, or collection. The locked <code>Mutex</code> cannot move or be drop
 the guard is live. Use a nested block to make the unlock point explicit.</p>
 <p>Mutexes are non-reentrant and fairness is unspecified. Glyph does not poison a
 mutex because it has no catchable unwind model.</p>
+<h2 id="scoped-threads"><a class="header" href="#scoped-threads">Scoped threads</a></h2>
+<p><code>std/thread::scope</code> permits a child task to borrow local state. It invokes a
+borrowed callback with a lexical <code>Scope</code> token. <code>Scope::spawn</code> accepts a
+zero-argument <code>Fn</code> or <code>FnMut</code> and returns a <code>ScopedJoinHandle&lt;T&gt;</code>:</p>
+<pre><code class="language-glyph">import scope from std/thread
+import Scope from std/thread
+import ScopedJoinHandle from std/thread
+import ThreadError from std/thread
+import Result from std/enums
+
+fn main() -&gt; Result&lt;Result&lt;i32, ThreadError&gt;, ThreadError&gt; {
+  let base: i32 = 40
+  ret scope((thread_scope: Scope) -&gt; {
+    let local: i32 = 2
+    let task: Fn&lt;(), i32&gt; = () -&gt; base + local
+    let handle: ScopedJoinHandle&lt;i32&gt; = thread_scope.spawn(task)?
+    ret handle.join()
+  })
+}
+</code></pre>
+<p>The outer <code>Result</code> reports scope creation or drain failure. An explicit
+<code>join()</code> consumes a handle and reports the child’s result. A handle may also be
+left unjoined: scope exit still joins that child and drops an unclaimed result
+exactly once.</p>
+<p>Every callback exit—including <code>ret</code>, <code>?</code>, <code>break</code>, and <code>cont</code> cleanup—drains
+its children before captured locals are destroyed. <code>Scope</code> and
+<code>ScopedJoinHandle&lt;T&gt;</code> are compiler-issued noescape tokens: they may exist only
+in direct lexical bindings, cannot be returned or stored in aggregates, and a
+scoped handle cannot detach. Nested spawning from a worker by capturing a
+<code>Scope</code> token is not supported.</p>
+<p>A shared capture requires its referent to be <code>Sync</code>; a mutable capture and a
+task result require <code>Send</code>. The current checker conservatively reserves a
+task’s loans until scope drain, even after an explicit join. Consequently one
+<code>FnMut</code> task value cannot have two live spawns. Put shorter-lived work in a
+nested <code>scope</code> when the captured owner must become available earlier.</p>
+<h2 id="bounded-spsc-channels"><a class="header" href="#bounded-spsc-channels">Bounded SPSC channels</a></h2>
+<p><code>std/sync/spsc</code> provides a bounded, nonblocking channel for exactly one
+producer and one consumer. Construct it with a positive capacity:</p>
+<pre><code class="language-glyph">from std/sync/spsc import channel, Sender, Receiver, TrySendResult, TryRecvResult
+
+let mut receiver: Receiver&lt;i32&gt;
+let sender: Sender&lt;i32&gt; = channel(256, &amp;mut receiver)
+</code></pre>
+<p>The two-argument form above is convenient until Glyph gains tuple
+destructuring. The canonical one-argument form is also available when the
+pair can be passed or stored as a tuple:</p>
+<pre><code class="language-glyph">let pair: (Sender&lt;i32&gt;, Receiver&lt;i32&gt;) = channel(256)
+</code></pre>
+<p><code>sender.try_send(value)</code> returns <code>Sent</code>, <code>Full(value)</code>, or
+<code>Disconnected(value)</code>. Both failure variants return the unsent value to the
+caller, so sending never silently destroys ownership. <code>receiver.try_recv()</code>
+returns <code>Value(value)</code>, <code>Empty</code>, or <code>Disconnected</code>.</p>
+<p>Endpoints are move-only: cloning either endpoint is rejected, preserving the
+single-producer/single-consumer invariant. <code>Sender&lt;T&gt;</code> and <code>Receiver&lt;T&gt;</code> may
+cross a thread boundary only when <code>T</code> is <code>Send</code>. Dropping an endpoint closes
+its side; the last endpoint destroys every queued value exactly once.</p>
+<p>Construction makes one fixed-capacity allocation. After that, <code>try_send</code> and
+<code>try_recv</code> use acquire/release atomics and perform no allocation, locking, or
+system call per message. They are therefore the intended primitive for a
+pre-allocated sequencer-to-render event path. Endpoint destruction can drain
+values and free memory, so arrange for final endpoint drops on an ordinary
+control or render thread.</p>
+<p>The tracked sequencer acceptance example and its metric definitions are in
+<a href="../../../examples/sequencer/README.html"><code>examples/sequencer</code></a>. Its offline
+golden uses sample-frame timestamps for deterministic rendering; its opt-in
+live producer uses absolute monotonic <code>sleep_until_ns</code> deadlines and reports
+scheduler jitter without ever running Glyph code in the device callback.</p>
 <h2 id="hard-real-time-boundary"><a class="header" href="#hard-real-time-boundary">Hard real-time boundary</a></h2>
 <p>Do not use <code>Mutex</code>, <code>Arc</code>, thread creation/join, or closure allocation and drop
-on an audio render/device callback. Mutex operations may block in the kernel;
+on a hard-real-time device callback. Mutex operations may block in the kernel;
 Arc destruction and callable cleanup may free memory or run arbitrary drop
-glue. Prepare immutable state on a control thread and communicate with the
-callback through the sequencer’s dedicated bounded real-time protocol.</p>
+glue. In the current audio architecture, SPSC connects ordinary Glyph control,
+sequencer, and render loops. Glyph submits prefilled native buffers through the
+blocking audio API; the native device callback only consumes those buffers and
+never invokes Glyph code. Running Glyph DSP or SPSC operations directly in
+that callback is a future protocol, not a current guarantee.</p>
 
                     </main>
 

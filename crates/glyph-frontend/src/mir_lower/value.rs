@@ -179,6 +179,7 @@ pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
             .locals
             .get(local.0 as usize)
             .and_then(|l| l.ty.as_ref().cloned()),
+        Rvalue::Deref { ty, .. } => Some(ty.clone()),
         Rvalue::StringLit { .. } => Some(Type::Str),
         Rvalue::StringClone { .. } => Some(Type::String),
         Rvalue::Ref { base, mutability } => ctx
@@ -271,9 +272,9 @@ pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
         }),
         Rvalue::AtomicStore { .. } | Rvalue::AtomicFence { .. } => Some(Type::Void),
         Rvalue::AtomicIsLockFree { .. } => Some(Type::Bool),
-        Rvalue::FunctionRef { signature, .. } | Rvalue::MakeClosure { signature, .. } => {
-            Some(signature.clone())
-        }
+        Rvalue::FunctionRef { signature, .. }
+        | Rvalue::MakeClosure { signature, .. }
+        | Rvalue::MakeBorrowedClosure { signature, .. } => Some(signature.clone()),
         Rvalue::ThreadHandleFromRaw { .. } => {
             Some(glyph_core::thread::canonical_unit_handle_type())
         }
@@ -281,7 +282,9 @@ pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
         Rvalue::ThreadErrorFromStatus { .. } => {
             Some(glyph_core::thread::canonical_thread_error_type())
         }
-        Rvalue::CallIndirect { signature, .. } => {
+        Rvalue::CallIndirect { signature, .. }
+        | Rvalue::CallIndirectShared { signature, .. }
+        | Rvalue::CallIndirectMut { signature, .. } => {
             signature.function_signature().map(|(_, ret)| ret.clone())
         }
         Rvalue::EnumConstruct { enum_name, .. } => Some(Type::Enum(enum_name.clone())),

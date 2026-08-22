@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use glyph_core::ast::{Item, Module};
 use glyph_core::diag::Diagnostic;
-use glyph_core::mir::{BlockId, Local, LocalId, MirBlock, MirInst, MirValue, Rvalue};
+use glyph_core::mir::{BlockId, BorrowKind, Local, LocalId, MirBlock, MirInst, MirValue, Rvalue};
 use glyph_core::span::Span;
 use glyph_core::thread_safety::{
     CallableCaptureProvenance, CallableProvenanceTable, CallableSendProvenance,
@@ -57,6 +57,15 @@ struct MutexGuardBorrow {
     origin: Span,
 }
 
+/// A conservative, whole-local loan held by a lexical MIR local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LexicalLoan {
+    owner: LocalId,
+    kind: BorrowKind,
+    creation_scope: usize,
+    origin: Span,
+}
+
 pub(crate) struct LowerCtx<'a> {
     pub(crate) resolver: &'a ResolverContext,
     pub(crate) module: &'a Module,
@@ -77,6 +86,11 @@ pub(crate) struct LowerCtx<'a> {
     binding_undo: Vec<Vec<(String, Option<LocalId>)>>,
     pub(crate) local_states: Vec<LocalState>,
     local_scope_depths: Vec<usize>,
+    implicit_deref_locals: HashSet<LocalId>,
+    lexical_loans: HashMap<LocalId, Vec<LexicalLoan>>,
+    scoped_loan_reservations: HashMap<LocalId, Vec<LexicalLoan>>,
+    active_scoped_fnmut_tasks: HashMap<LocalId, HashSet<LocalId>>,
+    known_borrowed_callables: HashSet<LocalId>,
     arc_loans: HashMap<LocalId, ArcLoan>,
     mutex_loans: HashMap<LocalId, MutexLoan>,
     mutex_guard_borrows: HashMap<LocalId, MutexGuardBorrow>,
@@ -97,9 +111,16 @@ pub(crate) struct LowerCtx<'a> {
     arc_constructor: CanonicalConstructorId,
     mutex_constructor: CanonicalConstructorId,
     mutex_guard_constructor: CanonicalConstructorId,
+    spsc_sender_constructor: CanonicalConstructorId,
+    spsc_receiver_constructor: CanonicalConstructorId,
     /// Private raw thread slots need nonblocking detach cleanup even though
     /// ordinary RawPtr values have no drop glue.
     thread_handle_locals: std::collections::HashSet<LocalId>,
+    /// Canonical Scope parameters owned by a compiler-generated scope callback.
+    /// They are drained before every lexical cleanup boundary.
+    scoped_callback_scopes: Vec<LocalId>,
+    /// Private and public scoped child tokens need scope-aware drop behavior.
+    scoped_thread_handle_locals: HashSet<LocalId>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -131,6 +152,14 @@ impl<'a> LowerCtx<'a> {
                 arity: 1,
                 reason: "mutex guards are lexical, thread-affine lock tokens".into(),
             },
+        );
+        let spsc_sender_constructor = thread_safety_registry.register_constructor(
+            glyph_core::types::SPSC_SENDER_TYPE_CONSTRUCTOR,
+            CanonicalApplicationPolicy::Sender,
+        );
+        let spsc_receiver_constructor = thread_safety_registry.register_constructor(
+            glyph_core::types::SPSC_RECEIVER_TYPE_CONSTRUCTOR,
+            CanonicalApplicationPolicy::Receiver,
         );
         let mut runtime_nominals = HashMap::new();
         for (name, send, sync, reason) in [
@@ -217,6 +246,11 @@ impl<'a> LowerCtx<'a> {
             binding_undo: vec![Vec::new()],
             local_states: Vec::new(),
             local_scope_depths: Vec::new(),
+            implicit_deref_locals: HashSet::new(),
+            lexical_loans: HashMap::new(),
+            scoped_loan_reservations: HashMap::new(),
+            active_scoped_fnmut_tasks: HashMap::new(),
+            known_borrowed_callables: HashSet::new(),
             arc_loans: HashMap::new(),
             mutex_loans: HashMap::new(),
             mutex_guard_borrows: HashMap::new(),
@@ -235,7 +269,11 @@ impl<'a> LowerCtx<'a> {
             arc_constructor,
             mutex_constructor,
             mutex_guard_constructor,
+            spsc_sender_constructor,
+            spsc_receiver_constructor,
             thread_handle_locals: std::collections::HashSet::new(),
+            scoped_callback_scopes: Vec::new(),
+            scoped_thread_handle_locals: HashSet::new(),
         };
 
         // Preserve a certificate across ordinary calls returning one known
@@ -425,6 +463,23 @@ impl<'a> LowerCtx<'a> {
                     vec![self.thread_safety_type_inner(&args[0], visiting)],
                 )
             }
+            Type::App { base, args }
+                if args.len() == 1 && self.resolves_to_struct(base, "std/sync/spsc", "Sender") =>
+            {
+                ThreadSafetyType::application(
+                    self.spsc_sender_constructor,
+                    vec![self.thread_safety_type_inner(&args[0], visiting)],
+                )
+            }
+            Type::App { base, args }
+                if args.len() == 1
+                    && self.resolves_to_struct(base, "std/sync/spsc", "Receiver") =>
+            {
+                ThreadSafetyType::application(
+                    self.spsc_receiver_constructor,
+                    vec![self.thread_safety_type_inner(&args[0], visiting)],
+                )
+            }
             ty if ty.is_arc() => ThreadSafetyType::application(
                 self.arc_constructor,
                 vec![self.thread_safety_type_inner(
@@ -448,6 +503,26 @@ impl<'a> LowerCtx<'a> {
                     self.thread_safety_type_inner(
                         ty.mutex_guard_inner_type()
                             .expect("is_mutex_guard validated one argument"),
+                        visiting,
+                    ),
+                ],
+            ),
+            ty if ty.is_spsc_sender() => ThreadSafetyType::application(
+                self.spsc_sender_constructor,
+                vec![
+                    self.thread_safety_type_inner(
+                        ty.spsc_sender_inner_type()
+                            .expect("SPSC sender validated one argument"),
+                        visiting,
+                    ),
+                ],
+            ),
+            ty if ty.is_spsc_receiver() => ThreadSafetyType::application(
+                self.spsc_receiver_constructor,
+                vec![
+                    self.thread_safety_type_inner(
+                        ty.spsc_receiver_inner_type()
+                            .expect("SPSC receiver validated one argument"),
                         visiting,
                     ),
                 ],
@@ -494,6 +569,47 @@ impl<'a> LowerCtx<'a> {
         self.locals[local.0 as usize].ty = Some(glyph_core::thread::private_unit_handle_type());
         self.thread_handle_locals.insert(local);
         local
+    }
+
+    pub(crate) fn fresh_scoped_thread_handle_local(&mut self, result: Type) -> LocalId {
+        let local = self.fresh_local(None);
+        self.locals[local.0 as usize].ty = Some(
+            glyph_core::thread::private_scoped_thread_handle_type(result),
+        );
+        self.scoped_thread_handle_locals.insert(local);
+        local
+    }
+
+    pub(crate) fn mark_scoped_thread_handle(&mut self, local: LocalId) {
+        self.scoped_thread_handle_locals.insert(local);
+    }
+
+    pub(crate) fn register_scoped_callback_scope(&mut self, local: LocalId) {
+        if !self.scoped_callback_scopes.contains(&local) {
+            self.scoped_callback_scopes.push(local);
+        }
+    }
+
+    fn drain_scoped_callback_scopes(&mut self) {
+        let scopes = self.scoped_callback_scopes.clone();
+        for scope in scopes {
+            self.scoped_loan_reservations.remove(&scope);
+            self.active_scoped_fnmut_tasks.remove(&scope);
+            let inst = MirInst::DrainThreadScope(scope);
+            let insert_before_terminator =
+                self.current_block_mut().insts.last().is_some_and(|inst| {
+                    matches!(
+                        inst,
+                        MirInst::Return(_) | MirInst::Goto(_) | MirInst::If { .. }
+                    )
+                });
+            if insert_before_terminator {
+                let index = self.current_block_mut().insts.len() - 1;
+                self.current_block_mut().insts.insert(index, inst);
+            } else {
+                self.current_block_mut().insts.push(inst);
+            }
+        }
     }
 
     pub(crate) fn bind_name(&mut self, name: &str, local: LocalId) {
@@ -546,15 +662,43 @@ impl<'a> LowerCtx<'a> {
         match &inst {
             MirInst::Assign { local, value } => {
                 self.reject_arc_loan_storage(value);
+                self.reject_lexical_loan_storage(value);
                 self.reject_mutex_guard_storage(*local, value);
                 self.arc_loans.remove(local);
+                self.release_lexical_loans_for_holder(*local);
                 match value {
-                    Rvalue::FunctionRef { name, .. } => self.callable_provenance.insert(
-                        *local,
-                        CallableSendProvenance::FunctionItem {
-                            symbol: name.clone(),
-                        },
-                    ),
+                    Rvalue::Ref { base, mutability } => {
+                        let kind = if *mutability == glyph_core::types::Mutability::Mutable {
+                            BorrowKind::Mutable
+                        } else {
+                            BorrowKind::Shared
+                        };
+                        self.register_lexical_loan(*local, *base, kind, Span::new(0, 0));
+                    }
+                    Rvalue::MakeBorrowedClosure { captures, .. } => {
+                        self.known_borrowed_callables.insert(*local);
+                        for capture in captures {
+                            self.register_lexical_loan(
+                                *local,
+                                capture.local,
+                                capture.borrow,
+                                Span::new(0, 0),
+                            );
+                        }
+                    }
+                    Rvalue::FunctionRef {
+                        name, signature, ..
+                    } => {
+                        if matches!(signature, Type::BorrowedFunction { .. }) {
+                            self.known_borrowed_callables.insert(*local);
+                        }
+                        self.callable_provenance.insert(
+                            *local,
+                            CallableSendProvenance::FunctionItem {
+                                symbol: name.clone(),
+                            },
+                        )
+                    }
                     Rvalue::MakeClosure {
                         function, captures, ..
                     } => {
@@ -576,6 +720,18 @@ impl<'a> LowerCtx<'a> {
                         );
                     }
                     Rvalue::Move(source) => {
+                        if matches!(
+                            self.local_ty(*source),
+                            Some(Type::BorrowedFunction {
+                                kind: glyph_core::types::BorrowedCallableKind::FnMut,
+                                ..
+                            })
+                        ) {
+                            self.error(
+                                "an FnMut callable cannot be assigned or aliased; pass or call it directly",
+                                None,
+                            );
+                        }
                         self.callable_provenance.move_to(source, *local);
                         if let Some(loan) = self.arc_loans.get(source).copied() {
                             let destination_scope = self
@@ -594,6 +750,7 @@ impl<'a> LowerCtx<'a> {
                             // invalid MIR cannot accidentally look safe.
                             self.arc_loans.insert(*local, loan);
                         }
+                        self.propagate_lexical_loans(*source, *local);
                     }
                     _ => {}
                 }
@@ -652,6 +809,7 @@ impl<'a> LowerCtx<'a> {
             }
             MirInst::AssignField { value, .. } => {
                 self.reject_mutex_guard_field_storage(value);
+                self.reject_lexical_loan_field_storage(value);
                 if let Rvalue::Move(source) = value
                     && let Some(loan) = self.arc_loans.get(source).copied()
                 {
@@ -739,9 +897,11 @@ impl<'a> LowerCtx<'a> {
         if self.scope_stack.len() <= depth {
             return;
         }
+        self.drain_scoped_callback_scopes();
         let scopes = self.scope_stack.clone();
         for scope in scopes.iter().skip(depth) {
             self.release_arc_loans_for_locals(scope);
+            self.release_lexical_loans_for_locals(scope);
         }
         for scope in scopes.iter().skip(depth).rev() {
             for &local in scope.iter().rev() {
@@ -752,6 +912,10 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(crate) fn handle_reassign(&mut self, local: LocalId) {
+        if !self.validate_arc_owner_invalidation(local, "reassign", None) {
+            return;
+        }
+        self.validate_lexical_owner_invalidation(local, "reassign", None);
         if self
             .locals
             .get(local.0 as usize)
@@ -767,8 +931,7 @@ impl<'a> LowerCtx<'a> {
             return;
         }
         if let Some(LocalState::Initialized) = self.local_states.get(local.0 as usize) {
-            if !self.validate_arc_owner_invalidation(local, "reassign", None)
-                || !self.validate_mutex_owner_invalidation(local, "reassign", None)
+            if !self.validate_mutex_owner_invalidation(local, "reassign", None)
                 || !self.validate_mutex_guard_invalidation(local, "reassign", None)
             {
                 return;
@@ -786,8 +949,10 @@ impl<'a> LowerCtx<'a> {
         if self.scope_stack.len() <= 1 {
             return;
         }
+        self.drain_scoped_callback_scopes();
         if let Some(locals) = self.scope_stack.pop() {
             self.release_arc_loans_for_locals(&locals);
+            self.release_lexical_loans_for_locals(&locals);
             for local in locals.into_iter().rev() {
                 self.drop_local_if_needed(local);
                 self.release_mutex_provenance_for_local(local);
@@ -826,6 +991,20 @@ impl<'a> LowerCtx<'a> {
             }
             return;
         }
+        if self.scoped_thread_handle_locals.contains(&local)
+            && matches!(
+                self.local_states.get(local.0 as usize),
+                Some(LocalState::Initialized)
+            )
+        {
+            self.current_block_mut()
+                .insts
+                .push(MirInst::DropScopedThreadHandle(local));
+            if let Some(state) = self.local_states.get_mut(local.0 as usize) {
+                *state = LocalState::Moved;
+            }
+            return;
+        }
         let dominated = self
             .local_ty(local)
             .map(|ty| Self::type_has_drop_glue(ty))
@@ -840,9 +1019,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(crate) fn drop_all_active_locals(&mut self) {
+        self.drain_scoped_callback_scopes();
         let scopes: Vec<Vec<LocalId>> = self.scope_stack.clone();
         for scope in &scopes {
             self.release_arc_loans_for_locals(scope);
+            self.release_lexical_loans_for_locals(scope);
         }
         for scope in scopes.iter().rev() {
             for &local in scope.iter().rev() {
@@ -854,6 +1035,7 @@ impl<'a> LowerCtx<'a> {
 
     pub(crate) fn emit_drop(&mut self, local: LocalId) {
         if !self.validate_arc_owner_invalidation(local, "drop", None)
+            || !self.validate_lexical_owner_invalidation(local, "drop", None)
             || !self.validate_mutex_owner_invalidation(local, "drop", None)
             || !self.validate_mutex_guard_invalidation(local, "drop", None)
         {
@@ -888,6 +1070,356 @@ impl<'a> LowerCtx<'a> {
         self.locals
             .get(local.0 as usize)
             .and_then(|l| l.ty.as_ref())
+    }
+
+    pub(crate) fn mark_implicit_deref(&mut self, local: LocalId) {
+        self.implicit_deref_locals.insert(local);
+    }
+
+    pub(crate) fn implicit_deref_type(&self, local: LocalId) -> Option<&Type> {
+        if !self.implicit_deref_locals.contains(&local) {
+            return None;
+        }
+        match self.local_ty(local) {
+            Some(Type::Ref(inner, _)) => Some(inner),
+            _ => None,
+        }
+    }
+
+    fn lexical_loan_root(&self, local: LocalId) -> LocalId {
+        self.lexical_loans
+            .get(&local)
+            .and_then(|loans| loans.first())
+            .map_or(local, |loan| loan.owner)
+    }
+
+    fn active_lexical_loan(&self, owner: LocalId) -> Option<LexicalLoan> {
+        self.lexical_loans
+            .values()
+            .flatten()
+            .chain(self.scoped_loan_reservations.values().flatten())
+            .find(|loan| loan.owner == owner)
+            .copied()
+    }
+
+    fn active_exclusive_loan(&self, owner: LocalId) -> Option<LexicalLoan> {
+        self.lexical_loans
+            .values()
+            .flatten()
+            .chain(self.scoped_loan_reservations.values().flatten())
+            .find(|loan| loan.owner == owner && loan.kind == BorrowKind::Mutable)
+            .copied()
+    }
+
+    pub(crate) fn validate_scoped_task_captures(&mut self, task: LocalId, span: Span) -> bool {
+        let loans = self.lexical_loans.get(&task).cloned().unwrap_or_default();
+        if loans.is_empty() && !self.known_borrowed_callables.contains(&task) {
+            self.error(
+                "scoped task capture provenance is unavailable; pass a closure literal or function item directly",
+                Some(span),
+            );
+            return false;
+        }
+
+        let mut valid = true;
+        for loan in loans {
+            let owner_ty = self.local_ty(loan.owner).cloned().unwrap_or(Type::Void);
+            let referent = match owner_ty {
+                Type::Ref(inner, _) => *inner,
+                other => other,
+            };
+            if referent == glyph_core::thread::canonical_thread_scope_type()
+                || glyph_core::thread::is_canonical_scoped_thread_handle(&referent)
+            {
+                self.error(
+                    "a scoped task cannot capture Scope or ScopedJoinHandle; nested spawn from a worker is not supported",
+                    Some(span),
+                );
+                valid = false;
+                continue;
+            }
+            let checked = self.thread_safety_type(&referent);
+            let result = match loan.kind {
+                BorrowKind::Shared => self
+                    .thread_safety_registry
+                    .check_sync("shared scoped capture", &checked),
+                BorrowKind::Mutable => self
+                    .thread_safety_registry
+                    .check_send("mutable scoped capture", &checked),
+            };
+            if let Err(error) = result {
+                self.error(error.to_string(), Some(span));
+                valid = false;
+            }
+        }
+        valid
+    }
+
+    pub(crate) fn reserve_scoped_task_loans(
+        &mut self,
+        scope: LocalId,
+        task: LocalId,
+        span: Span,
+    ) -> bool {
+        if matches!(
+            self.local_ty(task),
+            Some(Type::BorrowedFunction {
+                kind: glyph_core::types::BorrowedCallableKind::FnMut,
+                ..
+            })
+        ) && !self
+            .active_scoped_fnmut_tasks
+            .entry(scope)
+            .or_default()
+            .insert(task)
+        {
+            self.error(
+                "an FnMut task cannot have more than one live scoped spawn; the conservative reservation lasts until the next lexical scope drain",
+                Some(span),
+            );
+            return false;
+        }
+        if let Some(loans) = self.lexical_loans.get(&task).cloned() {
+            self.scoped_loan_reservations
+                .entry(scope)
+                .or_default()
+                .extend(loans);
+        }
+        true
+    }
+
+    pub(crate) fn validate_new_lexical_borrow(
+        &mut self,
+        base: LocalId,
+        kind: BorrowKind,
+        span: Span,
+    ) -> bool {
+        let owner = self.lexical_loan_root(base);
+        let conflict = match kind {
+            BorrowKind::Shared => self.active_exclusive_loan(owner),
+            BorrowKind::Mutable => self.active_lexical_loan(owner),
+        };
+        let Some(conflict) = conflict else {
+            return true;
+        };
+        let owner_name = self.local_name(owner).unwrap_or("<temporary>");
+        self.error(
+            match (kind, conflict.kind) {
+                (BorrowKind::Shared, BorrowKind::Mutable) => format!(
+                    "cannot immutably borrow `{owner_name}` while an exclusive loan is active"
+                ),
+                (BorrowKind::Mutable, BorrowKind::Shared) => {
+                    format!("cannot mutably borrow `{owner_name}` while a shared loan is active")
+                }
+                (BorrowKind::Mutable, BorrowKind::Mutable) => format!(
+                    "cannot mutably borrow `{owner_name}` while an exclusive loan is active"
+                ),
+                (BorrowKind::Shared, BorrowKind::Shared) => unreachable!(),
+            },
+            Some(span),
+        );
+        false
+    }
+
+    fn register_lexical_loan(
+        &mut self,
+        holder: LocalId,
+        base: LocalId,
+        kind: BorrowKind,
+        origin: Span,
+    ) {
+        let owner = self.lexical_loan_root(base);
+        if !self.validate_new_lexical_borrow(base, kind, origin) {
+            return;
+        }
+        let creation_scope = self
+            .local_scope_depths
+            .get(holder.0 as usize)
+            .copied()
+            .unwrap_or(0);
+        let owner_scope = self
+            .local_scope_depths
+            .get(owner.0 as usize)
+            .copied()
+            .unwrap_or(0);
+        if owner_scope > creation_scope {
+            self.error(
+                "a borrowed reference or callable cannot escape to an outer lexical scope",
+                Some(origin),
+            );
+        }
+        self.lexical_loans
+            .entry(holder)
+            .or_default()
+            .push(LexicalLoan {
+                owner,
+                kind,
+                creation_scope,
+                origin,
+            });
+    }
+
+    fn propagate_lexical_loans(&mut self, source: LocalId, destination: LocalId) {
+        let Some(loans) = self.lexical_loans.get(&source).cloned() else {
+            return;
+        };
+        let destination_scope = self
+            .local_scope_depths
+            .get(destination.0 as usize)
+            .copied()
+            .unwrap_or(0);
+        for mut loan in loans {
+            if loan.kind == BorrowKind::Mutable {
+                self.error(
+                    "an FnMut or mutable reference cannot be aliased; pass it directly or create a shorter reborrow",
+                    Some(loan.origin),
+                );
+                continue;
+            }
+            if destination_scope < loan.creation_scope {
+                self.error(
+                    "a borrowed reference or callable cannot escape the lexical scope where its loan was created",
+                    Some(loan.origin),
+                );
+            }
+            loan.creation_scope = destination_scope;
+            self.lexical_loans
+                .entry(destination)
+                .or_default()
+                .push(loan);
+        }
+    }
+
+    fn release_lexical_loans_for_holder(&mut self, holder: LocalId) {
+        self.lexical_loans.remove(&holder);
+    }
+
+    pub(crate) fn release_temporary_call_loan(&mut self, holder: LocalId) {
+        self.release_lexical_loans_for_holder(holder);
+        self.arc_loans.remove(&holder);
+    }
+
+    fn release_lexical_loans_for_locals(&mut self, locals: &[LocalId]) {
+        for local in locals {
+            self.release_lexical_loans_for_holder(*local);
+        }
+    }
+
+    fn validate_lexical_owner_read(&mut self, owner: LocalId, span: Option<Span>) -> bool {
+        let Some(loan) = self.active_exclusive_loan(owner) else {
+            return true;
+        };
+        let owner_name = self.local_name(owner).unwrap_or("<temporary>");
+        self.error(
+            format!("cannot use `{owner_name}` while an exclusive loan is active"),
+            span.or(Some(loan.origin)),
+        );
+        false
+    }
+
+    fn validate_lexical_owner_invalidation(
+        &mut self,
+        owner: LocalId,
+        action: &str,
+        span: Option<Span>,
+    ) -> bool {
+        let Some(loan) = self.active_lexical_loan(owner) else {
+            return true;
+        };
+        let owner_name = self.local_name(owner).unwrap_or("<temporary>");
+        let loan_name = if loan.kind == BorrowKind::Mutable {
+            "exclusive"
+        } else {
+            "shared"
+        };
+        self.error(
+            format!("cannot {action} `{owner_name}` while a {loan_name} loan is active"),
+            span.or(Some(loan.origin)),
+        );
+        false
+    }
+
+    fn value_has_lexical_loan(&self, value: &MirValue) -> bool {
+        matches!(value, MirValue::Local(local) if self.lexical_loans.contains_key(local)
+            || matches!(self.local_ty(*local), Some(Type::BorrowedFunction { .. })))
+    }
+
+    fn reject_lexical_loan_value_storage(&mut self, value: &MirValue, destination: &str) {
+        if self.value_has_lexical_loan(value) {
+            self.error(
+                format!(
+                    "a borrowed reference or callable cannot be stored in {destination}; keep it in a direct lexical binding"
+                ),
+                None,
+            );
+        }
+    }
+
+    fn reject_lexical_loan_storage(&mut self, value: &Rvalue) {
+        match value {
+            Rvalue::StructLit { field_values, .. } => {
+                for (_, value) in field_values {
+                    self.reject_lexical_loan_value_storage(value, "an aggregate");
+                }
+            }
+            Rvalue::ArrayLit { elements, .. } => {
+                for value in elements {
+                    self.reject_lexical_loan_value_storage(value, "an array");
+                }
+            }
+            Rvalue::EnumConstruct {
+                payload: Some(value),
+                ..
+            } => self.reject_lexical_loan_value_storage(value, "an enum payload"),
+            Rvalue::VecPush { value, .. } => self.reject_lexical_loan_value_storage(value, "a Vec"),
+            Rvalue::MapAdd { key, value, .. } | Rvalue::MapUpdate { key, value, .. } => {
+                self.reject_lexical_loan_value_storage(key, "a Map");
+                self.reject_lexical_loan_value_storage(value, "a Map");
+            }
+            Rvalue::OwnNew { value, .. } => {
+                self.reject_lexical_loan_value_storage(value, "an Own allocation")
+            }
+            Rvalue::SharedNew { value, .. } => {
+                self.reject_lexical_loan_value_storage(value, "a Shared allocation")
+            }
+            Rvalue::ArcNew { value, .. } => {
+                self.reject_lexical_loan_value_storage(value, "an Arc allocation")
+            }
+            Rvalue::MutexNew { value, .. } => {
+                self.reject_lexical_loan_value_storage(value, "a Mutex allocation")
+            }
+            Rvalue::MakeClosure { captures, .. } => {
+                for capture in captures {
+                    if self.lexical_loans.contains_key(&capture.local)
+                        || matches!(
+                            self.local_ty(capture.local),
+                            Some(Type::BorrowedFunction { .. })
+                        )
+                    {
+                        self.error(
+                            "a borrowed reference or callable cannot be captured by an owned closure",
+                            None,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn reject_lexical_loan_field_storage(&mut self, value: &Rvalue) {
+        if let Rvalue::Move(source) = value {
+            self.reject_lexical_loan_value_storage(&MirValue::Local(*source), "a struct field");
+        }
+    }
+
+    pub(crate) fn reject_lexical_loan_return(&mut self, value: Option<&MirValue>, span: Span) {
+        if value.is_some_and(|value| self.value_has_lexical_loan(value)) {
+            self.error(
+                "a borrowed reference or callable cannot escape through return",
+                Some(span),
+            );
+        }
     }
 
     pub(crate) fn local_needs_drop(&self, local: LocalId) -> bool {
@@ -970,11 +1502,16 @@ impl<'a> LowerCtx<'a> {
             | Type::Enum(_)
             | Type::Function { .. } => true,
             Type::App { base, .. } => {
-                matches!(base.as_str(), "Vec" | "Map" | "Result" | "Option")
-                    || ty.is_arc()
+                matches!(
+                    base.rsplit("::").next().unwrap_or(base),
+                    "Vec" | "Map" | "Result" | "Option" | "TrySendResult" | "TryRecvResult"
+                ) || ty.is_arc()
                     || ty.is_mutex()
                     || ty.is_mutex_guard()
+                    || ty.is_spsc_sender()
+                    || ty.is_spsc_receiver()
                     || glyph_core::thread::is_canonical_thread_handle(ty)
+                    || glyph_core::thread::is_canonical_scoped_thread_handle(ty)
             }
             Type::Named(_) => true,
             _ => false,
@@ -993,11 +1530,16 @@ impl<'a> LowerCtx<'a> {
             | Type::Enum(_)
             | Type::Function { .. } => true,
             Type::App { base, .. } => {
-                matches!(base.as_str(), "Result" | "Option")
-                    || ty.is_arc()
+                matches!(
+                    base.rsplit("::").next().unwrap_or(base),
+                    "Result" | "Option" | "TrySendResult" | "TryRecvResult"
+                ) || ty.is_arc()
                     || ty.is_mutex()
                     || ty.is_mutex_guard()
+                    || ty.is_spsc_sender()
+                    || ty.is_spsc_receiver()
                     || glyph_core::thread::is_canonical_thread_handle(ty)
+                    || glyph_core::thread::is_canonical_scoped_thread_handle(ty)
             }
             _ => false,
         }
@@ -1067,6 +1609,26 @@ impl<'a> LowerCtx<'a> {
                 };
                 format!("FnOnce<{}, {}>", args, Self::type_label(ret))
             }
+            Type::BorrowedFunction { kind, params, ret } => {
+                let args = match params.as_slice() {
+                    [] => "()".to_string(),
+                    [Type::Tuple(_)] => format!("({},)", Self::type_label(&params[0])),
+                    [param] => Self::type_label(param),
+                    params => format!(
+                        "({})",
+                        params
+                            .iter()
+                            .map(Self::type_label)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                let capability = match kind {
+                    glyph_core::types::BorrowedCallableKind::Fn => "Fn",
+                    glyph_core::types::BorrowedCallableKind::FnMut => "FnMut",
+                };
+                format!("{capability}<{}, {}>", args, Self::type_label(ret))
+            }
             Type::Tuple(elements) => {
                 if elements.is_empty() {
                     "()".to_string()
@@ -1095,6 +1657,9 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(crate) fn check_local_available(&mut self, local: LocalId, span: Option<Span>) -> bool {
+        if !self.validate_lexical_owner_read(local, span) {
+            return false;
+        }
         let skip_drop = self
             .locals
             .get(local.0 as usize)
@@ -1185,6 +1750,11 @@ impl<'a> LowerCtx<'a> {
             Rvalue::ArcNew { value, .. } | Rvalue::MutexNew { value, .. } => {
                 self.mark_moved_if_droppable(value);
             }
+            Rvalue::SpscTrySend { value, .. } => {
+                if let Some(state) = self.local_states.get_mut(value.0 as usize) {
+                    *state = LocalState::Moved;
+                }
+            }
             // Closure construction immediately transfers every non-Copy
             // capture into its owned environment.
             Rvalue::MakeClosure { captures, .. } => {
@@ -1249,7 +1819,9 @@ impl<'a> LowerCtx<'a> {
             return false;
         }
 
-        if !self.validate_arc_owner_invalidation(local, "move", span) {
+        if !self.validate_arc_owner_invalidation(local, "move", span)
+            || !self.validate_lexical_owner_invalidation(local, "move", span)
+        {
             return false;
         }
         if !self.validate_mutex_owner_invalidation(local, "move", span)
@@ -1284,6 +1856,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     pub(crate) fn register_arc_borrow(&mut self, reference: LocalId, owner: LocalId, origin: Span) {
+        self.register_lexical_loan(reference, owner, BorrowKind::Shared, origin);
         self.arc_loans.insert(
             reference,
             ArcLoan {
@@ -1501,6 +2074,7 @@ impl<'a> LowerCtx<'a> {
         self.mutex_loans.remove(&local);
         self.mutex_guard_borrows.remove(&local);
         self.mutex_try_option_locals.remove(&local);
+        self.release_lexical_loans_for_holder(local);
     }
 
     fn validate_mutex_owner_invalidation(

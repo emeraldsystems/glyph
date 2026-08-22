@@ -10,6 +10,10 @@ extern "C" {
 
 /** Opaque native-thread state. Its representation is never part of Glyph ABI. */
 typedef struct GlyphThread GlyphThread;
+/** Opaque lexical owner for scoped children. */
+typedef struct GlyphThreadScope GlyphThreadScope;
+/** Opaque non-owning token for one child owned by a scope. */
+typedef struct GlyphScopedThread GlyphScopedThread;
 
 /**
  * Invokes an owned, erased FnOnce environment.
@@ -75,6 +79,45 @@ int32_t glyph_thread_join_result(GlyphThread** handle, void* out_result);
  * succeeds; an error leaves it retryable.
  */
 int32_t glyph_thread_detach(GlyphThread** handle);
+
+/** Allocate an empty lexical thread scope. */
+int32_t glyph_thread_scope_create(GlyphThreadScope** out);
+
+/**
+ * Start a unit child from a borrowed, non-consuming callable environment.
+ * The scope owns the child even when the returned token is discarded.
+ */
+int32_t glyph_thread_scope_spawn(GlyphThreadScope* scope,
+                                 GlyphScopedThread** out,
+                                 GlyphThreadEntry entry,
+                                 void* env);
+
+/** Start a typed child from a borrowed, non-consuming callable. */
+int32_t glyph_thread_scope_spawn_result(GlyphThreadScope* scope,
+                                        GlyphScopedThread** out,
+                                        GlyphThreadResultEntry entry,
+                                        void* invoke,
+                                        void* env,
+                                        size_t result_size,
+                                        GlyphThreadDropResult drop_result);
+
+/** Explicitly join one unit child and unregister it from its scope. */
+int32_t glyph_thread_scope_join(GlyphScopedThread** child);
+
+/** Explicitly join one typed child and transfer its result exactly once. */
+int32_t glyph_thread_scope_join_result(GlyphScopedThread** child,
+                                       void* out_result);
+
+/** Join all children without consuming the scope owner (callback-body exit). */
+int32_t glyph_thread_scope_drain(GlyphThreadScope* scope);
+/** Mandatory fail-stop drain used by compiler-inserted callback cleanup. */
+void glyph_thread_scope_drain_or_abort(GlyphThreadScope* scope);
+
+/**
+ * Join every still-registered child in spawn order, drop unclaimed results,
+ * and consume the scope. There is deliberately no scoped detach operation.
+ */
+int32_t glyph_thread_scope_join_all(GlyphThreadScope** scope);
 
 #if defined(GLYPH_THREAD_ENABLE_TEST_HOOKS)
 

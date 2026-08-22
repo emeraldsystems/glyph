@@ -599,6 +599,8 @@ pub fn std_modules() -> HashMap<String, Module> {
     modules.insert("std/thread".into(), std_thread_module);
     let std_sync_module = parse_std_source("std/sync", include_str!("stdlib/sync.glyph"));
     modules.insert("std/sync".into(), std_sync_module);
+    let std_spsc_module = parse_std_source("std/sync/spsc", include_str!("stdlib/sync/spsc.glyph"));
+    modules.insert("std/sync/spsc".into(), std_spsc_module);
 
     // std/string
     let strdup_extern = ExternFunctionDecl {

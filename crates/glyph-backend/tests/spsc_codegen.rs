@@ -10,7 +10,34 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::{Child, Command, ExitStatus},
+    time::{Duration, Instant},
+};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SPSC_STRESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wait_for_child(child: &mut Child, timeout: Duration, description: &str) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("failed to poll child process") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            child
+                .kill()
+                .expect("failed to terminate timed-out child process");
+            child
+                .wait()
+                .expect("failed to reap timed-out child process");
+            panic!("{description} did not complete within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 fn local(ty: Type) -> Local {
     Local {
@@ -592,7 +619,11 @@ int main(void) {
         "C harness failed:\n{}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    assert!(Command::new(&executable).status().unwrap().success());
+    let mut stress = Command::new(&executable)
+        .spawn()
+        .expect("failed to spawn SPSC stress executable");
+    let status = wait_for_child(&mut stress, SPSC_STRESS_TIMEOUT, "SPSC AOT stress test");
+    assert!(status.success(), "SPSC stress executable failed: {status}");
     let _ = fs::remove_file(object);
     let _ = fs::remove_file(source);
     let _ = fs::remove_file(executable);

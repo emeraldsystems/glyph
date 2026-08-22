@@ -101,6 +101,49 @@ fn main() -> i32 {
     }
 
     #[test]
+    fn valid_borrowed_callables_have_no_lsp_diagnostics() {
+        let source = r#"
+struct Counter { value: i32 }
+
+fn main() -> i32 {
+  let offset: i32 = 40
+  let add: Fn<i32, i32> = (value: i32) -> offset + value
+  let mut counter: Counter = Counter { value: 0 }
+  let mut next: FnMut<(), i32> = () -> {
+    counter.value = counter.value + 1
+    counter.value
+  }
+  ret add(next())
+}
+"#;
+        let diagnostics = compile_diagnostics(source, &build_line_starts(source));
+
+        assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
+    }
+
+    #[test]
+    fn scoped_detach_error_is_published_with_a_source_range() {
+        let source = r#"import ScopedJoinHandle from std/thread
+
+fn invalid(handle: ScopedJoinHandle<i32>) {
+  handle.detach()
+}
+
+fn main() -> i32 { ret 0 }
+"#;
+        let diagnostics = compile_diagnostics(source, &build_line_starts(source));
+
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("cannot be detached"))
+            .expect("expected the scoped detach diagnostic");
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diagnostic.source.as_deref(), Some("glyph"));
+        assert_eq!(diagnostic.range.start.line, 3);
+        assert!(diagnostic.range.end.character > diagnostic.range.start.character);
+    }
+
+    #[test]
     fn closure_error_is_published_with_a_source_range() {
         let source = r#"fn main() -> i32 {
   let add: FnOnce<(i32, i32), i32> = x, y -> x + y

@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-49ba643b.js";
+            window.path_to_searchindex_js = "searchindex-d2c92e95.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-ee24a55e.js"></script>
+        <script src="toc-2dc36abc.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -567,14 +567,15 @@ fn main() -&gt; i32 {
 }
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="owned-closures-and-callable-values"><a class="header" href="#owned-closures-and-callable-values">Owned Closures and Callable Values</a></h1>
-<p>Glyph’s first callable-value model is deliberately small: every closure is an
-owned, move-only <code>FnOnce</code> value. It can be stored, passed, or returned, and it
-can be invoked exactly once.</p>
+<h1 id="closures-and-callable-values"><a class="header" href="#closures-and-callable-values">Closures and Callable Values</a></h1>
+<p>Glyph has three callable capabilities. An owned, move-only <code>FnOnce</code> can be
+stored, passed, or returned and is invoked at most once. A borrowed <code>Fn</code> or
+<code>FnMut</code> can be invoked repeatedly, but remains a direct lexical value and
+cannot escape the scope of the values it captures.</p>
 <p>The normative language and ABI contract is
-<a href="https://github.com/emeraldsystems/glyph/blob/master/docs/plan/CLOSURES_CONCURRENCY.md">Closures and Concurrency v0</a>.
+<a href="https://github.com/emeraldsystems/glyph/blob/master/docs/plan/CLOSURES_CONCURRENCY.md">Closures and Concurrency</a>.
 This chapter is the user guide; if another historical planning page disagrees,
-the v0 contract is authoritative.</p>
+that contract is authoritative.</p>
 <h2 id="arrow-syntax"><a class="header" href="#arrow-syntax">Arrow Syntax</a></h2>
 <p>Closure parameters appear to the left of <code>-&gt;</code>. Zero and multiple parameters
 require parentheses; a single parameter does not.</p>
@@ -587,7 +588,7 @@ let many: FnOnce&lt;(i32, i32), i32&gt; = (left, right) -&gt; left + right
   left + right
 }
 </code></pre>
-<p>Parameter annotations are optional when an expected <code>FnOnce</code> type supplies
+<p>Parameter annotations are optional when an expected callable type supplies
 them. Otherwise, annotate the parameter:</p>
 <pre><code class="language-glyph">let contextual: FnOnce&lt;i32, i32&gt; = value -&gt; value + 1
 let explicit = (value: i32) -&gt; value + 1
@@ -598,9 +599,9 @@ let explicit = (value: i32) -&gt; value + 1
 </code></pre>
 <p>For this release, bind a closure before calling it. Immediate invocation such
 as <code>((value: i32) -&gt; value + 1)(41)</code> is not yet supported.</p>
-<h2 id="the-fnonce-type"><a class="header" href="#the-fnonce-type">The <code>FnOnce</code> Type</a></h2>
-<p><code>FnOnce&lt;Args, Return&gt;</code> always has exactly two type arguments. <code>Args</code> encodes
-arity:</p>
+<h2 id="callable-capabilities"><a class="header" href="#callable-capabilities">Callable Capabilities</a></h2>
+<p><code>FnOnce&lt;Args, Return&gt;</code>, <code>Fn&lt;Args, Return&gt;</code>, and <code>FnMut&lt;Args, Return&gt;</code> always
+have exactly two type arguments. <code>Args</code> encodes arity:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -616,7 +617,7 @@ arity:</p>
 </div>
 <p>The extra one-element tuple in the last row distinguishes one tuple parameter
 from two scalar parameters.</p>
-<p>Calling a callable consumes it:</p>
+<p>Calling an <code>FnOnce</code> consumes it:</p>
 <pre><code class="language-glyph">let answer: FnOnce&lt;(), i32&gt; = () -&gt; 42
 let first = answer()
 // answer()  // error: use of moved value `answer`
@@ -634,14 +635,37 @@ fn main() -&gt; i32 {
   ret apply(increment, 41)
 }
 </code></pre>
-<p>One-shot callbacks fit operations that invoke the callback once. A conventional
-iterator that repeatedly invokes the same callback requires the deferred
-borrowed <code>Fn</code> or <code>FnMut</code> capabilities.</p>
+<p>Use <code>Fn</code> for a repeatedly called environment that only reads its captures:</p>
+<pre><code class="language-glyph">fn apply_twice(callback: Fn&lt;i32, i32&gt;, value: i32) -&gt; i32 {
+  let first: i32 = callback(value)
+  ret first + callback(value)
+}
+
+let offset: i32 = 1
+let add: Fn&lt;i32, i32&gt; = (value: i32) -&gt; offset + value
+</code></pre>
+<p>Use <code>FnMut</code> when repeated calls mutate a captured binding. The callable and
+the captured binding must both be mutable:</p>
+<pre><code class="language-glyph">struct Counter { value: i32 }
+
+let mut counter: Counter = Counter { value: 0 }
+let mut next: FnMut&lt;(), i32&gt; = () -&gt; {
+  counter.value = counter.value + 1
+  counter.value
+}
+let first: i32 = next()
+let second: i32 = next()
+</code></pre>
+<p><code>Fn</code> takes shared capture loans. <code>FnMut</code> takes exclusive loans for captures it
+mutates and cannot be copied, assigned to another local, or aliased through
+multiple arguments. Loans last until the callable’s lexical block ends; use a
+nested block when the owner must be used again sooner. This first loan checker
+is deliberately lexical rather than non-lexical.</p>
 <h2 id="captures-and-move"><a class="header" href="#captures-and-move">Captures and <code>move</code></a></h2>
-<p>A closure owns a self-contained environment. Copy values are copied; owned
-values such as <code>String</code> move into it. The <code>move</code> keyword makes that transfer
-explicit and is the recommended spelling when returning a closure or sending
-one to another thread.</p>
+<p>An owned closure has a self-contained environment. Copy values are copied;
+owned values such as <code>String</code> move into it. The <code>move</code> keyword makes that
+transfer explicit and is the recommended spelling when returning a closure or
+sending one to another thread.</p>
 <pre><code class="language-glyph">fn make_adder(offset: i32) -&gt; FnOnce&lt;i32, i32&gt; {
   ret move value -&gt; offset + value
 }
@@ -651,13 +675,16 @@ one to another thread.</p>
 let length: FnOnce&lt;(), usize&gt; = move () -&gt; message.len()
 // message.len()  // error: `message` moved into the closure
 </code></pre>
-<p>Nested closures carry transitive captures, and an uncalled closure drops its
-owned captures when the closure itself leaves scope.</p>
-<p>Borrowed captures (<code>&amp;T</code>, <code>&amp;mut T</code>, and runtime <code>str</code> views) cannot escape in
-this release. Convert data to an owned value before returning, storing, or
-passing the closure. Recursive closure cycles are also rejected. These rules
-keep the environment valid without a general lifetime/loan system.</p>
-<h2 id="storing-passing-and-returning"><a class="header" href="#storing-passing-and-returning">Storing, Passing, and Returning</a></h2>
+<p>Nested owned closures carry transitive captures, and an uncalled <code>FnOnce</code>
+drops its owned captures when the closure itself leaves scope.</p>
+<p>The expected callable type selects capture behavior. <code>Fn</code> and <code>FnMut</code> closure
+environments are stack-backed borrowed views; a <code>move</code> closure is always an
+owned <code>FnOnce</code>. Borrowed callables may appear only as direct parameters or
+local bindings. They cannot be returned or stored in a struct, enum, tuple,
+array, collection, heap owner, <code>Arc</code>, <code>Mutex</code>, or owned closure. Convert the
+captured state to an owned value and use <code>FnOnce</code> when the callable must
+escape. Recursive closure cycles are also rejected.</p>
+<h2 id="storing-passing-and-returning-owned-callables"><a class="header" href="#storing-passing-and-returning-owned-callables">Storing, Passing, and Returning Owned Callables</a></h2>
 <p>Callable values use ordinary move semantics:</p>
 <pre><code class="language-glyph">fn apply(callback: FnOnce&lt;i32, i32&gt;, value: i32) -&gt; i32 {
   ret callback(value)
@@ -673,24 +700,28 @@ fn main() -&gt; i32 {
 }
 </code></pre>
 <p>Moving <code>stored</code> into <code>apply</code> consumes the local. A callable’s argument count
-and types must exactly match its <code>FnOnce</code> signature. Calling a scalar or other
-non-callable value is a compile error.</p>
+and types must exactly match its signature. Calling a scalar or other
+non-callable value is a compile error. Borrowed <code>Fn</code>/<code>FnMut</code> values may be
+passed to direct borrowed-callback parameters, but the callee cannot retain
+them.</p>
 <h2 id="allocation-ffi-and-audio-code"><a class="header" href="#allocation-ffi-and-audio-code">Allocation, FFI, and Audio Code</a></h2>
-<p>A capturing closure may allocate its environment on the heap. Invocation and
-drop may release that storage and run capture destructors. Callable values are
-therefore not safe to create, invoke, or destroy in a hard real-time audio
+<p>An owned capturing closure may allocate its environment on the heap.
+Invocation and drop may release that storage and run capture destructors.
+Borrowed callables avoid an owned environment allocation, but invoking
+arbitrary Glyph code still has no hard-real-time guarantee. Callable values
+are therefore not safe to create, invoke, or destroy in a hard real-time audio
 callback.</p>
 <p>Construct callbacks on a control or worker thread and keep Glyph code outside
-the device callback. <code>FnOnce</code> values use a Glyph-internal ABI and cannot be
-passed directly through <code>extern "C"</code>; use a purpose-built C trampoline and
-state protocol at an FFI boundary.</p>
+the device callback. All three callable capabilities use a Glyph-internal ABI
+and cannot be passed directly through <code>extern "C"</code>; use a purpose-built C
+trampoline and state protocol at an FFI boundary.</p>
 <p>See the runnable
 <a href="https://github.com/emeraldsystems/glyph/tree/master/examples/closures">owned closure example</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="threads-and-shared-state"><a class="header" href="#threads-and-shared-state">Threads and Shared State</a></h1>
-<p>Glyph’s first concurrency surface uses owned <code>FnOnce</code> tasks, native join
-handles, atomic scalars, <code>Arc&lt;T&gt;</code>, and <code>Mutex&lt;T&gt;</code>. These are intended for
-control and worker threads.</p>
+<p>Glyph’s concurrency surface provides owned <code>FnOnce</code> tasks, lexically scoped
+<code>Fn</code>/<code>FnMut</code> tasks, native join handles, atomic scalars, <code>Arc&lt;T&gt;</code>, <code>Mutex&lt;T&gt;</code>,
+and bounded SPSC channels. These are intended for control and worker threads.</p>
 <pre><code class="language-glyph">import Arc from std/sync
 import Mutex from std/sync
 import spawn from std/thread
@@ -708,6 +739,11 @@ let outcome = spawn(task)
 <p><code>Arc&lt;T&gt;</code> provides atomic shared ownership but only immutable access.
 <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> is the standard way to share mutable worker state. <code>Mutex&lt;T&gt;</code>
 is <code>Send + Sync</code> only when <code>T</code> is <code>Send</code>.</p>
+<p><code>Arc&lt;T&gt;</code> atomically protects the pointee’s lifetime; it is not an atomic raw
+pointer and does not make arbitrary mutation safe. Glyph does not expose a
+safe <code>AtomicPtr&lt;T&gt;</code> in this release. Pointer replacement needs an ownership and
+reclamation protocol beyond an atomic address update, so use <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>,
+an atomic scalar, or message passing instead.</p>
 <p><code>lock()</code> blocks and returns a move-only <code>MutexGuard&lt;T&gt;</code>. <code>try_lock()</code> returns
 <code>Option&lt;MutexGuard&lt;T&gt;&gt;</code> without blocking. A guard supplies exclusive mutable
 access through <code>borrow_mut()</code> and unlocks exactly once when its lexical scope
@@ -718,12 +754,82 @@ array, enum, or collection. The locked <code>Mutex</code> cannot move or be drop
 the guard is live. Use a nested block to make the unlock point explicit.</p>
 <p>Mutexes are non-reentrant and fairness is unspecified. Glyph does not poison a
 mutex because it has no catchable unwind model.</p>
+<h2 id="scoped-threads"><a class="header" href="#scoped-threads">Scoped threads</a></h2>
+<p><code>std/thread::scope</code> permits a child task to borrow local state. It invokes a
+borrowed callback with a lexical <code>Scope</code> token. <code>Scope::spawn</code> accepts a
+zero-argument <code>Fn</code> or <code>FnMut</code> and returns a <code>ScopedJoinHandle&lt;T&gt;</code>:</p>
+<pre><code class="language-glyph">import scope from std/thread
+import Scope from std/thread
+import ScopedJoinHandle from std/thread
+import ThreadError from std/thread
+import Result from std/enums
+
+fn main() -&gt; Result&lt;Result&lt;i32, ThreadError&gt;, ThreadError&gt; {
+  let base: i32 = 40
+  ret scope((thread_scope: Scope) -&gt; {
+    let local: i32 = 2
+    let task: Fn&lt;(), i32&gt; = () -&gt; base + local
+    let handle: ScopedJoinHandle&lt;i32&gt; = thread_scope.spawn(task)?
+    ret handle.join()
+  })
+}
+</code></pre>
+<p>The outer <code>Result</code> reports scope creation or drain failure. An explicit
+<code>join()</code> consumes a handle and reports the child’s result. A handle may also be
+left unjoined: scope exit still joins that child and drops an unclaimed result
+exactly once.</p>
+<p>Every callback exit—including <code>ret</code>, <code>?</code>, <code>break</code>, and <code>cont</code> cleanup—drains
+its children before captured locals are destroyed. <code>Scope</code> and
+<code>ScopedJoinHandle&lt;T&gt;</code> are compiler-issued noescape tokens: they may exist only
+in direct lexical bindings, cannot be returned or stored in aggregates, and a
+scoped handle cannot detach. Nested spawning from a worker by capturing a
+<code>Scope</code> token is not supported.</p>
+<p>A shared capture requires its referent to be <code>Sync</code>; a mutable capture and a
+task result require <code>Send</code>. The current checker conservatively reserves a
+task’s loans until scope drain, even after an explicit join. Consequently one
+<code>FnMut</code> task value cannot have two live spawns. Put shorter-lived work in a
+nested <code>scope</code> when the captured owner must become available earlier.</p>
+<h2 id="bounded-spsc-channels"><a class="header" href="#bounded-spsc-channels">Bounded SPSC channels</a></h2>
+<p><code>std/sync/spsc</code> provides a bounded, nonblocking channel for exactly one
+producer and one consumer. Construct it with a positive capacity:</p>
+<pre><code class="language-glyph">from std/sync/spsc import channel, Sender, Receiver, TrySendResult, TryRecvResult
+
+let mut receiver: Receiver&lt;i32&gt;
+let sender: Sender&lt;i32&gt; = channel(256, &amp;mut receiver)
+</code></pre>
+<p>The two-argument form above is convenient until Glyph gains tuple
+destructuring. The canonical one-argument form is also available when the
+pair can be passed or stored as a tuple:</p>
+<pre><code class="language-glyph">let pair: (Sender&lt;i32&gt;, Receiver&lt;i32&gt;) = channel(256)
+</code></pre>
+<p><code>sender.try_send(value)</code> returns <code>Sent</code>, <code>Full(value)</code>, or
+<code>Disconnected(value)</code>. Both failure variants return the unsent value to the
+caller, so sending never silently destroys ownership. <code>receiver.try_recv()</code>
+returns <code>Value(value)</code>, <code>Empty</code>, or <code>Disconnected</code>.</p>
+<p>Endpoints are move-only: cloning either endpoint is rejected, preserving the
+single-producer/single-consumer invariant. <code>Sender&lt;T&gt;</code> and <code>Receiver&lt;T&gt;</code> may
+cross a thread boundary only when <code>T</code> is <code>Send</code>. Dropping an endpoint closes
+its side; the last endpoint destroys every queued value exactly once.</p>
+<p>Construction makes one fixed-capacity allocation. After that, <code>try_send</code> and
+<code>try_recv</code> use acquire/release atomics and perform no allocation, locking, or
+system call per message. They are therefore the intended primitive for a
+pre-allocated sequencer-to-render event path. Endpoint destruction can drain
+values and free memory, so arrange for final endpoint drops on an ordinary
+control or render thread.</p>
+<p>The tracked sequencer acceptance example and its metric definitions are in
+<a href="../../../examples/sequencer/README.html"><code>examples/sequencer</code></a>. Its offline
+golden uses sample-frame timestamps for deterministic rendering; its opt-in
+live producer uses absolute monotonic <code>sleep_until_ns</code> deadlines and reports
+scheduler jitter without ever running Glyph code in the device callback.</p>
 <h2 id="hard-real-time-boundary"><a class="header" href="#hard-real-time-boundary">Hard real-time boundary</a></h2>
 <p>Do not use <code>Mutex</code>, <code>Arc</code>, thread creation/join, or closure allocation and drop
-on an audio render/device callback. Mutex operations may block in the kernel;
+on a hard-real-time device callback. Mutex operations may block in the kernel;
 Arc destruction and callable cleanup may free memory or run arbitrary drop
-glue. Prepare immutable state on a control thread and communicate with the
-callback through the sequencer’s dedicated bounded real-time protocol.</p>
+glue. In the current audio architecture, SPSC connects ordinary Glyph control,
+sequencer, and render loops. Glyph submits prefilled native buffers through the
+blocking audio API; the native device callback only consumes those buffers and
+never invokes Glyph code. Running Glyph DSP or SPSC operations directly in
+that callback is a future protocol, not a current guarantee.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="imports-1"><a class="header" href="#imports-1">Imports</a></h1>
 <p>Glyph uses file-based modules. Each <code>.glyph</code> file is a module, and you import

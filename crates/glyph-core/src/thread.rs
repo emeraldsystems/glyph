@@ -6,7 +6,12 @@
 //! user-visible `Result` layout. Only lowering may create raw handle locals.
 
 use crate::thread_safety::{ThreadSafetyError, ThreadSafetyRegistry, ThreadSafetyType};
-use crate::types::Type;
+use crate::types::{BorrowedCallableKind, Type};
+
+pub const SCOPED_THREAD_SCOPE_TYPE: &str = "std::thread::Scope";
+pub const SCOPED_THREAD_HANDLE_TYPE: &str = "std::thread::ScopedJoinHandle";
+pub const PRIVATE_THREAD_SCOPE_TYPE: &str = "$glyph::thread::ScopeRaw";
+pub const PRIVATE_SCOPED_THREAD_HANDLE_TYPE: &str = "$glyph::thread::ScopedJoinHandleRaw";
 
 /// The only callable signature accepted by the GLYPH-42 spawn primitive.
 pub fn unit_task_type() -> Type {
@@ -16,6 +21,15 @@ pub fn unit_task_type() -> Type {
 /// Concrete compiler-intrinsic task signature for `spawn<T>`.
 pub fn task_type(result: Type) -> Type {
     Type::Function {
+        params: Vec::new(),
+        ret: Box::new(result),
+    }
+}
+
+/// Concrete borrowed callable signature accepted by a scoped spawn.
+pub fn scoped_task_type(kind: BorrowedCallableKind, result: Type) -> Type {
+    Type::BorrowedFunction {
+        kind,
         params: Vec::new(),
         ret: Box::new(result),
     }
@@ -31,6 +45,30 @@ pub fn private_unit_handle_type() -> Type {
 /// Private low-level representation shared by every `JoinHandle<T>`.
 pub fn private_thread_handle_type() -> Type {
     Type::RawPtr(Box::new(Type::I8))
+}
+
+/// Private opaque pointer used while lowering a lexical scope.
+pub fn private_thread_scope_type() -> Type {
+    Type::Named(PRIVATE_THREAD_SCOPE_TYPE.into())
+}
+
+/// Private opaque pointer used while lowering a scope-owned child token.
+pub fn private_scoped_thread_handle_type(result: Type) -> Type {
+    Type::App {
+        base: PRIVATE_SCOPED_THREAD_HANDLE_TYPE.into(),
+        args: vec![result],
+    }
+}
+
+pub fn private_scoped_thread_handle_result(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::App { base, args }
+            if base == PRIVATE_SCOPED_THREAD_HANDLE_TYPE && args.len() == 1 =>
+        {
+            args.first()
+        }
+        _ => None,
+    }
 }
 
 /// Resolver-issued public identity for the unit join handle.
@@ -53,6 +91,19 @@ pub fn canonical_thread_handle_type(result: Type) -> Type {
 /// Resolver-issued public identity for native thread errors.
 pub fn canonical_thread_error_type() -> Type {
     Type::Named("std::thread::ThreadError".into())
+}
+
+/// Resolver-issued identity for the lexical scope token.
+pub fn canonical_thread_scope_type() -> Type {
+    Type::Named(SCOPED_THREAD_SCOPE_TYPE.into())
+}
+
+/// Resolver-issued identity for a scope-owned typed child token.
+pub fn canonical_scoped_thread_handle_type(result: Type) -> Type {
+    Type::App {
+        base: SCOPED_THREAD_HANDLE_TYPE.into(),
+        args: vec![result],
+    }
 }
 
 /// Public result returned by the unit-only spawn primitive.
@@ -104,6 +155,19 @@ pub fn is_canonical_thread_handle(ty: &Type) -> bool {
 
 pub fn is_canonical_thread_error(ty: &Type) -> bool {
     ty == &canonical_thread_error_type()
+}
+
+pub fn canonical_scoped_thread_handle_result(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::App { base, args } if base == SCOPED_THREAD_HANDLE_TYPE && args.len() == 1 => {
+            args.first()
+        }
+        _ => None,
+    }
+}
+
+pub fn is_canonical_scoped_thread_handle(ty: &Type) -> bool {
+    canonical_scoped_thread_handle_result(ty).is_some()
 }
 
 /// Validate the complete thread transfer before emitting spawn MIR.
@@ -178,5 +242,37 @@ mod tests {
             base: "user::JoinHandle".into(),
             args: vec![result],
         }));
+    }
+
+    #[test]
+    fn scoped_identities_are_canonical_and_keep_the_result_type() {
+        let result = Type::Tuple(vec![Type::I32, Type::String]);
+        let handle = canonical_scoped_thread_handle_type(result.clone());
+
+        assert_eq!(
+            canonical_thread_scope_type(),
+            Type::Named(SCOPED_THREAD_SCOPE_TYPE.into())
+        );
+        assert!(is_canonical_scoped_thread_handle(&handle));
+        assert_eq!(
+            canonical_scoped_thread_handle_result(&handle),
+            Some(&result)
+        );
+        assert!(!is_canonical_scoped_thread_handle(&Type::App {
+            base: "user::ScopedJoinHandle".into(),
+            args: vec![result.clone()],
+        }));
+        assert_eq!(
+            private_thread_scope_type(),
+            Type::Named(PRIVATE_THREAD_SCOPE_TYPE.into())
+        );
+        assert_ne!(
+            private_thread_scope_type(),
+            private_scoped_thread_handle_type(Type::Void)
+        );
+        assert_eq!(
+            private_scoped_thread_handle_result(&private_scoped_thread_handle_type(result.clone())),
+            Some(&result)
+        );
     }
 }

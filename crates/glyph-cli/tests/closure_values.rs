@@ -57,6 +57,49 @@ fn main() -> i32 {
     );
 }
 
+#[test]
+fn borrowed_fn_source_callback_is_repeatable_in_jit() {
+    assert_eq!(
+        compile_and_run(
+            r#"
+fn apply_twice(function: Fn<i32, i32>, value: i32) -> i32 {
+  let first: i32 = function(value)
+  ret first + function(value)
+}
+
+fn main() -> i32 {
+  let base: i32 = 1
+  let add: Fn<i32, i32> = (value: i32) -> base + value
+  ret apply_twice(add, 20)
+}
+"#,
+        ),
+        42
+    );
+}
+
+#[test]
+fn borrowed_fnmut_source_callback_mutates_once_per_jit_call() {
+    assert_eq!(
+        compile_and_run(
+            r#"
+struct Counter { value: i32 }
+
+fn main() -> i32 {
+  let mut state: Counter = Counter { value: 0 }
+  let mut next: FnMut<(), i32> = () -> {
+    state.value = state.value + 1
+    state.value
+  }
+  let first: i32 = next()
+  ret first + next()
+}
+"#,
+        ),
+        3
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn capturing_closure_links_and_executes_as_a_native_object() {
@@ -67,6 +110,29 @@ fn main() -> i32 {
   ret add(2)
 }
 "#;
+    compile_and_run_native(source, "closure_source_object", "closure");
+}
+
+#[cfg(unix)]
+#[test]
+fn borrowed_fn_links_and_executes_as_a_native_object() {
+    let source = r#"
+fn apply_twice(function: Fn<i32, i32>, value: i32) -> i32 {
+  let first: i32 = function(value)
+  ret first + function(value)
+}
+
+fn main() -> i32 {
+  let base: i32 = 1
+  let add: Fn<i32, i32> = (value: i32) -> base + value
+  ret apply_twice(add, 20)
+}
+"#;
+    compile_and_run_native(source, "borrowed_fn_source_object", "borrowed_fn");
+}
+
+#[cfg(unix)]
+fn compile_and_run_native(source: &str, module_name: &str, artifact_name: &str) {
     let output = compile_source(
         source,
         FrontendOptions {
@@ -77,9 +143,9 @@ fn main() -> i32 {
     assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
 
     let temp = tempfile::TempDir::new().unwrap();
-    let object = temp.path().join("closure.o");
-    let executable = temp.path().join("closure");
-    let mut codegen = CodegenContext::new("closure_source_object").unwrap();
+    let object = temp.path().join(format!("{artifact_name}.o"));
+    let executable = temp.path().join(artifact_name);
+    let mut codegen = CodegenContext::new(module_name).unwrap();
     codegen.codegen_module(&output.mir).unwrap();
     codegen.emit_object_file(&object).unwrap();
     Linker::new()

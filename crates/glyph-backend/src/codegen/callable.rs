@@ -332,6 +332,61 @@ impl CodegenContext {
         func: &MirFunction,
         local_map: &HashMap<LocalId, LLVMValueRef>,
     ) -> Result<LLVMValueRef> {
+        if !matches!(signature, Type::Function { .. }) {
+            bail!("CallIndirect requires an owned FnOnce signature, found {signature:?}");
+        }
+        self.codegen_call_indirect_impl(callee, signature, args, func, local_map, true)
+    }
+
+    pub(super) fn codegen_call_indirect_shared(
+        &mut self,
+        callee: LocalId,
+        signature: &Type,
+        args: &[MirValue],
+        func: &MirFunction,
+        local_map: &HashMap<LocalId, LLVMValueRef>,
+    ) -> Result<LLVMValueRef> {
+        if !matches!(
+            signature,
+            Type::BorrowedFunction {
+                kind: BorrowedCallableKind::Fn,
+                ..
+            }
+        ) {
+            bail!("CallIndirectShared requires a borrowed Fn signature, found {signature:?}");
+        }
+        self.codegen_call_indirect_impl(callee, signature, args, func, local_map, false)
+    }
+
+    pub(super) fn codegen_call_indirect_mut(
+        &mut self,
+        callee: LocalId,
+        signature: &Type,
+        args: &[MirValue],
+        func: &MirFunction,
+        local_map: &HashMap<LocalId, LLVMValueRef>,
+    ) -> Result<LLVMValueRef> {
+        if !matches!(
+            signature,
+            Type::BorrowedFunction {
+                kind: BorrowedCallableKind::FnMut,
+                ..
+            }
+        ) {
+            bail!("CallIndirectMut requires a borrowed FnMut signature, found {signature:?}");
+        }
+        self.codegen_call_indirect_impl(callee, signature, args, func, local_map, false)
+    }
+
+    fn codegen_call_indirect_impl(
+        &mut self,
+        callee: LocalId,
+        signature: &Type,
+        args: &[MirValue],
+        func: &MirFunction,
+        local_map: &HashMap<LocalId, LLVMValueRef>,
+        consuming: bool,
+    ) -> Result<LLVMValueRef> {
         let (params, ret) = self.callable_signature(signature)?;
         let params = params.to_vec();
         let ret = ret.clone();
@@ -373,18 +428,21 @@ impl CodegenContext {
             )
         };
 
-        // CallIndirect is consuming. Clear storage before invoking so generic
-        // scope cleanup cannot run the callable's drop thunk a second time.
-        let callee_slot = local_map
-            .get(&callee)
-            .copied()
-            .ok_or_else(|| anyhow!("missing storage for indirect callee {:?}", callee))?;
-        unsafe {
-            LLVMBuildStore(
-                self.builder,
-                LLVMConstNull(self.get_llvm_type(signature)?),
-                callee_slot,
-            );
+        if consuming {
+            // Owned CallIndirect is consuming. Clear storage before invoking so
+            // generic scope cleanup cannot run the callable's drop thunk a
+            // second time. Borrowed calls deliberately leave the carrier live.
+            let callee_slot = local_map
+                .get(&callee)
+                .copied()
+                .ok_or_else(|| anyhow!("missing storage for indirect callee {:?}", callee))?;
+            unsafe {
+                LLVMBuildStore(
+                    self.builder,
+                    LLVMConstNull(self.get_llvm_type(signature)?),
+                    callee_slot,
+                );
+            }
         }
 
         let (invoke_ty, uses_sret) = self.callable_invoke_type(signature)?;

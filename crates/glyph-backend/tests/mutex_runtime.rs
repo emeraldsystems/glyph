@@ -1,7 +1,31 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
+use std::process::{Child, Command, ExitStatus};
 use std::ptr;
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
+
+const CONTENTION_CHILD_ENV: &str = "GLYPH_MUTEX_RUNTIME_CONTENTION_CHILD";
+const CONTENTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn wait_for_child(child: &mut Child, timeout: Duration, description: &str) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("failed to poll child process") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            child
+                .kill()
+                .expect("failed to terminate timed-out child process");
+            child
+                .wait()
+                .expect("failed to reap timed-out child process");
+            panic!("{description} did not complete within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 #[repr(C)]
 struct GlyphMutex {
@@ -19,6 +43,21 @@ unsafe extern "C" {
 
 #[test]
 fn runtime_mutex_protects_a_contended_counter_and_publishes_visibility() {
+    if std::env::var_os(CONTENTION_CHILD_ENV).is_none() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_mutex_protects_a_contended_counter_and_publishes_visibility",
+                "--nocapture",
+            ])
+            .env(CONTENTION_CHILD_ENV, "1")
+            .spawn()
+            .expect("failed to spawn isolated mutex contention test");
+        let status = wait_for_child(&mut child, CONTENTION_TIMEOUT, "mutex contention test");
+        assert!(status.success(), "mutex contention child failed: {status}");
+        return;
+    }
+
     const THREADS: usize = 8;
     const INCREMENTS: usize = 20_000;
     let mut mutex = ptr::null_mut();

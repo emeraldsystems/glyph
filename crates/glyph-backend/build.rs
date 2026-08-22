@@ -22,6 +22,8 @@ fn main() {
     let runtime_lib = out_dir.join("libglyph_runtime.a");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let profile = env::var("PROFILE").unwrap_or_default();
+    let runtime_sanitizer = env::var("GLYPH_RUNTIME_SANITIZER").ok();
+    println!("cargo:rerun-if-env-changed=GLYPH_RUNTIME_SANITIZER");
 
     let mut objects = Vec::new();
     for name in RUNTIME_SOURCES {
@@ -39,6 +41,17 @@ fn main() {
             "-fPIC", // Position-independent code for shared libraries
             "-Wall", // Enable warnings
         ]);
+        if let Some(sanitizer) = runtime_sanitizer.as_deref() {
+            match sanitizer {
+                "address" | "thread" => {
+                    cc.arg(format!("-fsanitize={sanitizer}"));
+                    cc.arg("-fno-omit-frame-pointer");
+                }
+                _ => panic!(
+                    "unsupported GLYPH_RUNTIME_SANITIZER={sanitizer:?}; expected `address` or `thread`"
+                ),
+            }
+        }
         if matches!(*name, "glyph_thread" | "glyph_mutex") {
             if matches!(target_os.as_str(), "macos" | "linux") {
                 cc.arg("-pthread");

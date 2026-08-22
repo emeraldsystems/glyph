@@ -28,10 +28,16 @@ unsafe extern "C" fn increment_i32(value: *mut i32) {
 }
 
 static FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static UNLOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn tracked_free(pointer: *mut c_void) {
     FREE_CALLS.fetch_add(1, Ordering::SeqCst);
     unsafe { libc::free(pointer) };
+}
+
+unsafe extern "C" fn tracked_mutex_unlock(mutex: *mut GlyphMutex) -> i32 {
+    UNLOCK_CALLS.fetch_add(1, Ordering::SeqCst);
+    unsafe { glyph_mutex_unlock(mutex) }
 }
 
 fn runtime_symbols() -> HashMap<String, u64> {
@@ -197,6 +203,64 @@ fn lock_borrow_and_guard_drop_unlock_the_typed_payload() {
     assert!(ir.contains("call i32 @glyph_mutex_unlock"), "{ir}");
     assert!(ir.contains("call i32 @glyph_mutex_destroy"), "{ir}");
     assert!(ir.contains("mutex.guard.drop.isnull"), "{ir}");
+}
+
+#[test]
+fn duplicate_guard_drop_is_idempotent_and_unlocks_only_once() {
+    let mutex = Type::mutex(Type::I32);
+    let guard = Type::mutex_guard(Type::I32);
+    let main = MirFunction {
+        name: "main".into(),
+        ret_type: Some(Type::I32),
+        params: vec![],
+        locals: vec![local(mutex), local(guard)],
+        blocks: vec![MirBlock {
+            insts: vec![
+                MirInst::Assign {
+                    local: LocalId(0),
+                    value: Rvalue::MutexNew {
+                        value: MirValue::Int(7),
+                        elem_type: Type::I32,
+                    },
+                },
+                MirInst::Assign {
+                    local: LocalId(1),
+                    value: Rvalue::MutexLock {
+                        base: LocalId(0),
+                        elem_type: Type::I32,
+                    },
+                },
+                MirInst::Drop(LocalId(1)),
+                MirInst::Drop(LocalId(1)),
+                MirInst::Drop(LocalId(0)),
+                MirInst::Return(Some(MirValue::Int(42))),
+            ],
+        }],
+    };
+    let mut context = CodegenContext::new("mutex_duplicate_guard_drop").unwrap();
+    context
+        .codegen_module(&MirModule {
+            functions: vec![main],
+            ..MirModule::default()
+        })
+        .unwrap();
+    UNLOCK_CALLS.store(0, Ordering::SeqCst);
+    let mut symbols = runtime_symbols();
+    symbols.insert(
+        "glyph_mutex_unlock".into(),
+        tracked_mutex_unlock as *const () as usize as u64,
+    );
+    assert_eq!(
+        context
+            .jit_execute_i32_with_symbols("main", &symbols)
+            .unwrap(),
+        42
+    );
+    assert_eq!(
+        UNLOCK_CALLS.load(Ordering::SeqCst),
+        1,
+        "the first drop nulls the guard slot, so duplicate cleanup must not unlock twice"
+    );
 }
 
 #[test]

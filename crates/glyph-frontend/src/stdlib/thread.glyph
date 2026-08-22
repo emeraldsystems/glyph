@@ -7,4 +7,24 @@ import Result from std/enums
 struct JoinHandle<T> {}
 struct ThreadError {}
 
+// `Scope` is a non-owning lexical view. The compiler creates its private
+// owner around `scope`, drains children before callback locals disappear, and
+// destroys the owner before `scope` returns.
+struct Scope {
+  // The unit signature is a resolver placeholder. Intrinsic lowering
+  // specializes both the task result and the scoped handle result.
+  fn spawn(self: &Scope, task: Fn<(), ()>) -> Result<ScopedJoinHandle<()>, ThreadError> {}
+}
+
+// Dropping this token only gives up explicit access to the child; the
+// enclosing Scope remains responsible for joining it.
+struct ScopedJoinHandle<T> {
+  // Unit is a resolver placeholder; intrinsic lowering substitutes T.
+  fn join(self: ScopedJoinHandle) -> Result<(), ThreadError> {}
+}
+
 fn spawn(task: FnOnce<(), ()>) -> Result<JoinHandle<()>, ThreadError> {}
+
+// As with `spawn`, the unit result is specialized from the callback's
+// concrete result type by intrinsic lowering.
+fn scope(body: FnMut<(Scope,), ()>) -> Result<(), ThreadError> {}

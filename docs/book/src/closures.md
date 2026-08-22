@@ -1,13 +1,14 @@
-# Owned Closures and Callable Values
+# Closures and Callable Values
 
-Glyph's first callable-value model is deliberately small: every closure is an
-owned, move-only `FnOnce` value. It can be stored, passed, or returned, and it
-can be invoked exactly once.
+Glyph has three callable capabilities. An owned, move-only `FnOnce` can be
+stored, passed, or returned and is invoked at most once. A borrowed `Fn` or
+`FnMut` can be invoked repeatedly, but remains a direct lexical value and
+cannot escape the scope of the values it captures.
 
 The normative language and ABI contract is
-[Closures and Concurrency v0](https://github.com/emeraldsystems/glyph/blob/master/docs/plan/CLOSURES_CONCURRENCY.md).
+[Closures and Concurrency](https://github.com/emeraldsystems/glyph/blob/master/docs/plan/CLOSURES_CONCURRENCY.md).
 This chapter is the user guide; if another historical planning page disagrees,
-the v0 contract is authoritative.
+that contract is authoritative.
 
 ## Arrow Syntax
 
@@ -28,7 +29,7 @@ let add: FnOnce<(i32, i32), i32> = (left, right) -> {
 }
 ```
 
-Parameter annotations are optional when an expected `FnOnce` type supplies
+Parameter annotations are optional when an expected callable type supplies
 them. Otherwise, annotate the parameter:
 
 ```glyph
@@ -46,10 +47,10 @@ let nested: FnOnce<i32, FnOnce<i32, i32>> =
 For this release, bind a closure before calling it. Immediate invocation such
 as `((value: i32) -> value + 1)(41)` is not yet supported.
 
-## The `FnOnce` Type
+## Callable Capabilities
 
-`FnOnce<Args, Return>` always has exactly two type arguments. `Args` encodes
-arity:
+`FnOnce<Args, Return>`, `Fn<Args, Return>`, and `FnMut<Args, Return>` always
+have exactly two type arguments. `Args` encodes arity:
 
 | Parameters | Callable type |
 |---|---|
@@ -61,7 +62,7 @@ arity:
 The extra one-element tuple in the last row distinguishes one tuple parameter
 from two scalar parameters.
 
-Calling a callable consumes it:
+Calling an `FnOnce` consumes it:
 
 ```glyph
 let answer: FnOnce<(), i32> = () -> 42
@@ -85,16 +86,45 @@ fn main() -> i32 {
 }
 ```
 
-One-shot callbacks fit operations that invoke the callback once. A conventional
-iterator that repeatedly invokes the same callback requires the deferred
-borrowed `Fn` or `FnMut` capabilities.
+Use `Fn` for a repeatedly called environment that only reads its captures:
+
+```glyph
+fn apply_twice(callback: Fn<i32, i32>, value: i32) -> i32 {
+  let first: i32 = callback(value)
+  ret first + callback(value)
+}
+
+let offset: i32 = 1
+let add: Fn<i32, i32> = (value: i32) -> offset + value
+```
+
+Use `FnMut` when repeated calls mutate a captured binding. The callable and
+the captured binding must both be mutable:
+
+```glyph
+struct Counter { value: i32 }
+
+let mut counter: Counter = Counter { value: 0 }
+let mut next: FnMut<(), i32> = () -> {
+  counter.value = counter.value + 1
+  counter.value
+}
+let first: i32 = next()
+let second: i32 = next()
+```
+
+`Fn` takes shared capture loans. `FnMut` takes exclusive loans for captures it
+mutates and cannot be copied, assigned to another local, or aliased through
+multiple arguments. Loans last until the callable's lexical block ends; use a
+nested block when the owner must be used again sooner. This first loan checker
+is deliberately lexical rather than non-lexical.
 
 ## Captures and `move`
 
-A closure owns a self-contained environment. Copy values are copied; owned
-values such as `String` move into it. The `move` keyword makes that transfer
-explicit and is the recommended spelling when returning a closure or sending
-one to another thread.
+An owned closure has a self-contained environment. Copy values are copied;
+owned values such as `String` move into it. The `move` keyword makes that
+transfer explicit and is the recommended spelling when returning a closure or
+sending one to another thread.
 
 ```glyph
 fn make_adder(offset: i32) -> FnOnce<i32, i32> {
@@ -110,15 +140,18 @@ let length: FnOnce<(), usize> = move () -> message.len()
 // message.len()  // error: `message` moved into the closure
 ```
 
-Nested closures carry transitive captures, and an uncalled closure drops its
-owned captures when the closure itself leaves scope.
+Nested owned closures carry transitive captures, and an uncalled `FnOnce`
+drops its owned captures when the closure itself leaves scope.
 
-Borrowed captures (`&T`, `&mut T`, and runtime `str` views) cannot escape in
-this release. Convert data to an owned value before returning, storing, or
-passing the closure. Recursive closure cycles are also rejected. These rules
-keep the environment valid without a general lifetime/loan system.
+The expected callable type selects capture behavior. `Fn` and `FnMut` closure
+environments are stack-backed borrowed views; a `move` closure is always an
+owned `FnOnce`. Borrowed callables may appear only as direct parameters or
+local bindings. They cannot be returned or stored in a struct, enum, tuple,
+array, collection, heap owner, `Arc`, `Mutex`, or owned closure. Convert the
+captured state to an owned value and use `FnOnce` when the callable must
+escape. Recursive closure cycles are also rejected.
 
-## Storing, Passing, and Returning
+## Storing, Passing, and Returning Owned Callables
 
 Callable values use ordinary move semantics:
 
@@ -138,20 +171,24 @@ fn main() -> i32 {
 ```
 
 Moving `stored` into `apply` consumes the local. A callable's argument count
-and types must exactly match its `FnOnce` signature. Calling a scalar or other
-non-callable value is a compile error.
+and types must exactly match its signature. Calling a scalar or other
+non-callable value is a compile error. Borrowed `Fn`/`FnMut` values may be
+passed to direct borrowed-callback parameters, but the callee cannot retain
+them.
 
 ## Allocation, FFI, and Audio Code
 
-A capturing closure may allocate its environment on the heap. Invocation and
-drop may release that storage and run capture destructors. Callable values are
-therefore not safe to create, invoke, or destroy in a hard real-time audio
+An owned capturing closure may allocate its environment on the heap.
+Invocation and drop may release that storage and run capture destructors.
+Borrowed callables avoid an owned environment allocation, but invoking
+arbitrary Glyph code still has no hard-real-time guarantee. Callable values
+are therefore not safe to create, invoke, or destroy in a hard real-time audio
 callback.
 
 Construct callbacks on a control or worker thread and keep Glyph code outside
-the device callback. `FnOnce` values use a Glyph-internal ABI and cannot be
-passed directly through `extern "C"`; use a purpose-built C trampoline and
-state protocol at an FFI boundary.
+the device callback. All three callable capabilities use a Glyph-internal ABI
+and cannot be passed directly through `extern "C"`; use a purpose-built C
+trampoline and state protocol at an FFI boundary.
 
 See the runnable
 [owned closure example](https://github.com/emeraldsystems/glyph/tree/master/examples/closures).

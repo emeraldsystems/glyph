@@ -7,8 +7,8 @@
 /// - Droppable pass-by-value ownership
 /// - Vec growth and element ownership
 ///
-/// Tests that exercise leak bugs pass silently (exit 0) but leak memory.
-/// Tests that exercise crash bugs are #[ignore].
+/// Historical crash probes have been converted to deterministic regressions;
+/// this file contains no ignored safety tests.
 
 #[cfg(all(feature = "codegen", unix))]
 use glyph_backend::{

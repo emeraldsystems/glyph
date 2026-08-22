@@ -203,3 +203,23 @@ fn std_time_monotonic_is_nondecreasing() {
 
     assert_eq!(build_and_run_exit_code(source), 0);
 }
+
+#[cfg(all(feature = "codegen", unix))]
+#[test]
+fn std_time_absolute_sleep_reaches_deadline_and_accepts_past_deadline() {
+    let source = r#"
+        from std/time import Instant, now_monotonic, sleep_until_ns
+
+        fn main() -> i32 {
+          let start = now_monotonic()
+          let deadline = start.as_nanos() + 5000000
+          let first = sleep_until_ns(deadline)
+          let after = now_monotonic()
+          if after.as_nanos() < deadline { ret 1 }
+          let second = sleep_until_ns(deadline)
+          ret 0
+        }
+    "#;
+
+    assert_eq!(build_and_run_exit_code(source), 0);
+}

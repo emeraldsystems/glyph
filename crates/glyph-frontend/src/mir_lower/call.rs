@@ -1,22 +1,26 @@
+use std::collections::HashSet;
+
 use glyph_core::ast::{Expr, Ident};
-use glyph_core::mir::{MirInst, MirValue, Rvalue};
+use glyph_core::mir::{LocalId, MirInst, MirValue, Rvalue};
 use glyph_core::span::Span;
 use glyph_core::types::{Mutability, Type};
 
 use crate::resolver::SelfKind;
 
 use super::builtins::{
-    is_canonical_arc_new, is_canonical_mutex_new, is_canonical_spawn, lower_arc_method,
-    lower_arc_new, lower_atomic_constructor, lower_atomic_method, lower_file_close,
-    lower_file_open, lower_file_read_to_string, lower_file_write_string, lower_map_add,
-    lower_map_del, lower_map_get, lower_map_has, lower_map_keys, lower_map_static_new,
+    is_canonical_arc_new, is_canonical_channel, is_canonical_mutex_new, is_canonical_scope,
+    is_canonical_spawn, lower_arc_method, lower_arc_new, lower_atomic_constructor,
+    lower_atomic_method, lower_channel, lower_file_close, lower_file_open,
+    lower_file_read_to_string, lower_file_write_string, lower_map_add, lower_map_del,
+    lower_map_get, lower_map_has, lower_map_keys, lower_map_static_new,
     lower_map_static_with_capacity, lower_map_update, lower_map_vals, lower_mutex_method,
     lower_mutex_new, lower_own_from_raw, lower_own_into_raw, lower_own_new, lower_print_builtin,
-    lower_shared_clone, lower_shared_new, lower_string_as_str, lower_string_clone,
-    lower_string_concat, lower_string_ends_with, lower_string_from, lower_string_len,
-    lower_string_slice, lower_string_split, lower_string_starts_with, lower_string_trim,
-    lower_term_stdout, lower_thread_method, lower_thread_spawn, lower_vec_get, lower_vec_len,
-    lower_vec_pop, lower_vec_push, lower_vec_static_new, lower_vec_static_with_capacity,
+    lower_shared_clone, lower_shared_new, lower_spsc_method, lower_string_as_str,
+    lower_string_clone, lower_string_concat, lower_string_ends_with, lower_string_from,
+    lower_string_len, lower_string_slice, lower_string_split, lower_string_starts_with,
+    lower_string_trim, lower_term_stdout, lower_thread_method, lower_thread_scope,
+    lower_thread_spawn, lower_vec_get, lower_vec_len, lower_vec_pop, lower_vec_push,
+    lower_vec_static_new, lower_vec_static_with_capacity,
 };
 use super::context::{LocalState, LowerCtx};
 use super::expr::{lower_array_len, lower_ref_expr, lower_value, lower_value_with_expected};
@@ -50,6 +54,46 @@ pub(crate) fn call_types_compatible(actual: &Type, expected: &Type) -> bool {
             Type::Function {
                 params: expected_params,
                 ret: expected_ret,
+            },
+        ) => {
+            actual_params.len() == expected_params.len()
+                && actual_params
+                    .iter()
+                    .zip(expected_params)
+                    .all(|(actual, expected)| call_types_compatible(actual, expected))
+                && call_types_compatible(actual_ret, expected_ret)
+        }
+        (
+            Type::BorrowedFunction {
+                kind: actual_kind,
+                params: actual_params,
+                ret: actual_ret,
+            },
+            Type::BorrowedFunction {
+                kind: expected_kind,
+                params: expected_params,
+                ret: expected_ret,
+            },
+        ) => {
+            (*actual_kind == *expected_kind
+                || (*actual_kind == glyph_core::types::BorrowedCallableKind::Fn
+                    && *expected_kind == glyph_core::types::BorrowedCallableKind::FnMut))
+                && actual_params.len() == expected_params.len()
+                && actual_params
+                    .iter()
+                    .zip(expected_params)
+                    .all(|(actual, expected)| call_types_compatible(actual, expected))
+                && call_types_compatible(actual_ret, expected_ret)
+        }
+        (
+            Type::Function {
+                params: actual_params,
+                ret: actual_ret,
+            },
+            Type::BorrowedFunction {
+                params: expected_params,
+                ret: expected_ret,
+                ..
             },
         ) => {
             actual_params.len() == expected_params.len()
@@ -100,6 +144,47 @@ fn validate_call_argument(
     false
 }
 
+fn validate_unique_fnmut_argument(
+    ctx: &mut LowerCtx<'_>,
+    seen: &mut HashSet<LocalId>,
+    value: &MirValue,
+    expected: &Type,
+    span: Span,
+) -> bool {
+    if !matches!(
+        expected,
+        Type::BorrowedFunction {
+            kind: glyph_core::types::BorrowedCallableKind::FnMut,
+            ..
+        }
+    ) {
+        return true;
+    }
+
+    let MirValue::Local(local) = value else {
+        return true;
+    };
+    if seen.insert(*local) {
+        return true;
+    }
+
+    ctx.error(
+        "an FnMut callable cannot be aliased across multiple arguments in one call",
+        Some(span),
+    );
+    false
+}
+
+fn temporary_call_loan(arg: &Expr, value: &MirValue) -> Option<LocalId> {
+    if !matches!(arg, Expr::Ref { .. }) {
+        return None;
+    }
+    match value {
+        MirValue::Local(local) => Some(*local),
+        _ => None,
+    }
+}
+
 fn lower_indirect_call<'a>(
     ctx: &mut LowerCtx<'a>,
     callee: glyph_core::mir::LocalId,
@@ -112,7 +197,7 @@ fn lower_indirect_call<'a>(
     if !ctx.check_local_available(callee, Some(span)) {
         return None;
     }
-    let Type::Function { params, ret } = &signature else {
+    let Some((params, ret)) = signature.function_signature() else {
         ctx.error(
             format!(
                 "value '{}' of type '{}' is not callable",
@@ -151,27 +236,58 @@ fn lower_indirect_call<'a>(
     }
 
     let mut lowered_args = Vec::with_capacity(args.len());
+    let mut temporary_argument_loans = Vec::new();
+    let mut fnmut_arguments = HashSet::new();
     for (index, (arg, expected)) in args.iter().zip(params).enumerate() {
         let value = lower_value_with_expected(ctx, arg, Some(expected))?;
         if !validate_call_argument(ctx, &value, expected, index, callee_name, span) {
             return None;
         }
+        if !validate_unique_fnmut_argument(ctx, &mut fnmut_arguments, &value, expected, span) {
+            return None;
+        }
         if !consume_call_local(ctx, &value, span, Some(expected)) {
             return None;
+        }
+        if let Some(local) = temporary_call_loan(arg, &value) {
+            temporary_argument_loans.push(local);
         }
         lowered_args.push(value);
     }
 
     let tmp = ctx.fresh_local(None);
-    ctx.locals[tmp.0 as usize].ty = Some(ret.as_ref().clone());
-    ctx.push_inst(MirInst::Assign {
-        local: tmp,
-        value: Rvalue::CallIndirect {
+    ctx.locals[tmp.0 as usize].ty = Some(ret.clone());
+    let call = match &signature {
+        Type::Function { .. } => Rvalue::CallIndirect {
             callee,
             signature,
             args: lowered_args,
         },
+        Type::BorrowedFunction {
+            kind: glyph_core::types::BorrowedCallableKind::Fn,
+            ..
+        } => Rvalue::CallIndirectShared {
+            callee,
+            signature,
+            args: lowered_args,
+        },
+        Type::BorrowedFunction {
+            kind: glyph_core::types::BorrowedCallableKind::FnMut,
+            ..
+        } => Rvalue::CallIndirectMut {
+            callee,
+            signature,
+            args: lowered_args,
+        },
+        _ => unreachable!("function_signature accepted only callable variants"),
+    };
+    ctx.push_inst(MirInst::Assign {
+        local: tmp,
+        value: call,
     });
+    for loan in temporary_argument_loans {
+        ctx.release_temporary_call_loan(loan);
+    }
     Some(Rvalue::Move(tmp))
 }
 
@@ -302,11 +418,27 @@ pub(crate) fn lower_call<'a>(
     }
 
     let mut lowered_args = Vec::new();
+    let mut temporary_argument_loans = Vec::new();
+    let mut fnmut_arguments = HashSet::new();
     for (idx, arg) in args.iter().enumerate() {
         let expected_arg = sig.params.get(idx).and_then(|ty| ty.as_ref());
         let arg_val = lower_value_with_expected(ctx, arg, expected_arg)?;
+        if let Some(expected_arg) = expected_arg {
+            if !validate_unique_fnmut_argument(
+                ctx,
+                &mut fnmut_arguments,
+                &arg_val,
+                expected_arg,
+                span,
+            ) {
+                return None;
+            }
+        }
         if !consume_call_local(ctx, &arg_val, span, expected_arg) {
             return None;
+        }
+        if let Some(local) = temporary_call_loan(arg, &arg_val) {
+            temporary_argument_loans.push(local);
         }
         lowered_args.push(arg_val);
     }
@@ -367,6 +499,9 @@ pub(crate) fn lower_call<'a>(
                 args: lowered_args,
             },
         });
+        for loan in temporary_argument_loans {
+            ctx.release_temporary_call_loan(loan);
+        }
         if matches!(ctx.local_ty(tmp), Some(Type::Function { .. })) {
             if let Some(provenance) = ctx.callable_return_provenance.get(&call_target).cloned() {
                 ctx.callable_provenance.insert(tmp, provenance);
@@ -441,9 +576,9 @@ fn lower_borrowed_method_receiver<'a>(
     receiver_ty: &Type,
     mutability: Mutability,
     span: Span,
-) -> Option<MirValue> {
+) -> Option<(MirValue, bool)> {
     if matches!(receiver_ty, Type::Ref(_, _)) {
-        return lower_value(ctx, receiver);
+        return lower_value(ctx, receiver).map(|value| (value, false));
     }
 
     let rv = lower_ref_expr(ctx, receiver, mutability, span)?;
@@ -453,7 +588,7 @@ fn lower_borrowed_method_receiver<'a>(
         local: tmp,
         value: rv,
     });
-    Some(MirValue::Local(tmp))
+    Some((MirValue::Local(tmp), true))
 }
 
 pub(crate) fn lower_method_call<'a>(
@@ -464,6 +599,9 @@ pub(crate) fn lower_method_call<'a>(
     span: Span,
 ) -> Option<Rvalue> {
     if let Some(result) = lower_thread_method(ctx, receiver, &method.0, args, span) {
+        return result;
+    }
+    if let Some(result) = lower_spsc_method(ctx, receiver, &method.0, args, span) {
         return result;
     }
     if let Some(result) = lower_arc_method(ctx, receiver, &method.0, args, span) {
@@ -652,8 +790,8 @@ pub(crate) fn lower_method_call<'a>(
 
     // 4. Lower receiver value. Borrowed receivers must not flow through
     // lower_value first, because identifiers there use move semantics.
-    let receiver_arg = match self_kind {
-        SelfKind::ByValue => lower_value(ctx, receiver)?,
+    let (receiver_arg, temporary_receiver_loan) = match self_kind {
+        SelfKind::ByValue => (lower_value(ctx, receiver)?, false),
         SelfKind::Ref => lower_borrowed_method_receiver(
             ctx,
             receiver,
@@ -676,7 +814,16 @@ pub(crate) fn lower_method_call<'a>(
     if !consume_call_local(ctx, &receiver_arg, span, receiver_expected.as_ref()) {
         return None;
     }
+    let receiver_loan_local = if temporary_receiver_loan {
+        match &receiver_arg {
+            MirValue::Local(local) => Some(*local),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut all_args = vec![receiver_arg];
+    let mut temporary_argument_loans = Vec::new();
     for (idx, arg) in args.iter().enumerate() {
         let expected_arg = sig
             .as_ref()
@@ -685,6 +832,9 @@ pub(crate) fn lower_method_call<'a>(
         let arg_val = lower_value_with_expected(ctx, arg, expected_arg)?;
         if !consume_call_local(ctx, &arg_val, span, expected_arg) {
             return None;
+        }
+        if let Some(local) = temporary_call_loan(arg, &arg_val) {
+            temporary_argument_loans.push(local);
         }
         all_args.push(arg_val);
     }
@@ -705,6 +855,12 @@ pub(crate) fn lower_method_call<'a>(
             args: all_args,
         },
     });
+    if let Some(receiver) = receiver_loan_local {
+        ctx.release_temporary_call_loan(receiver);
+    }
+    for loan in temporary_argument_loans {
+        ctx.release_temporary_call_loan(loan);
+    }
 
     Some(Rvalue::Move(tmp))
 }
@@ -717,6 +873,9 @@ fn lower_method_builtin<'a>(
 ) -> Option<Option<Rvalue>> {
     if let Expr::FieldAccess { base, field, .. } = callee {
         if let Some(result) = lower_thread_method(ctx, base, &field.0, args, span) {
+            return Some(result);
+        }
+        if let Some(result) = lower_spsc_method(ctx, base, &field.0, args, span) {
             return Some(result);
         }
         if let Some(result) = lower_arc_method(ctx, base, &field.0, args, span) {
@@ -778,6 +937,8 @@ fn lower_static_builtin_with_expected<'a>(
 
     match name.0.as_str() {
         name if is_canonical_spawn(ctx, name) => lower_thread_spawn(ctx, args, span),
+        name if is_canonical_scope(ctx, name) => lower_thread_scope(ctx, args, span, expected_ret),
+        name if is_canonical_channel(ctx, name) => lower_channel(ctx, args, span, expected_ret),
         name if is_canonical_arc_new(ctx, name) => lower_arc_new(ctx, args, span),
         name if is_canonical_mutex_new(ctx, name) => lower_mutex_new(ctx, args, span),
         "Own::new" => lower_own_new(ctx, args, span),

@@ -40,6 +40,35 @@ pub struct MirCapture {
     pub transfer: CaptureTransfer,
 }
 
+/// Access granted to a borrowed closure environment field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BorrowKind {
+    Shared,
+    Mutable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BorrowCaptureSource {
+    /// Store the address of an ordinary local.
+    Local,
+    /// Forward the reference value already stored in a reference local.
+    Reborrow,
+}
+
+/// One non-owning field in a compiler-generated borrowed closure environment.
+///
+/// `ty` is the referent type of the source local. The environment stores its
+/// address and the lifted body receives `&ty` or `&mut ty` according to
+/// `borrow`. The frontend must prove that the source outlives the environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirBorrowCapture {
+    pub name: String,
+    pub local: LocalId,
+    pub ty: Type,
+    pub borrow: BorrowKind,
+    pub source: BorrowCaptureSource,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MirModule {
     pub struct_types: HashMap<String, StructType>,
@@ -111,6 +140,18 @@ pub enum MirInst {
     /// surface language must expose a canonical nominal `JoinHandle<()>`
     /// instead of allowing this raw representation to be named or forged.
     DropThreadHandle(LocalId),
+    /// Mandatory lexical cleanup for a private scoped-thread owner.
+    ///
+    /// Codegen joins every registered child before this instruction returns.
+    /// A persistent runtime failure is fail-stop: compiled code must never
+    /// continue and drop stack storage still borrowed by a child.
+    DropThreadScope(LocalId),
+    /// Mandatory callback-body cleanup: drain children while borrowed frame
+    /// locals are still alive, retrying once and aborting on persistent error.
+    DrainThreadScope(LocalId),
+    /// Discard explicit access to a scope-owned child without detaching it.
+    /// The enclosing scope remains the owner and will join the child.
+    DropScopedThreadHandle(LocalId),
     Nop,
 }
 
@@ -120,6 +161,11 @@ pub enum Rvalue {
     ConstFloat(f64),
     ConstBool(bool),
     Move(LocalId),
+    /// Load the referent of a typed reference local.
+    Deref {
+        base: LocalId,
+        ty: Type,
+    },
     StringLit {
         content: String,
         global_name: String,
@@ -157,8 +203,34 @@ pub enum Rvalue {
         signature: Type,
         captures: Vec<MirCapture>,
     },
+    /// Construct a non-owning, repeatable callable around a lifted body.
+    ///
+    /// Unlike [`Rvalue::MakeClosure`], capture fields point at source locals,
+    /// the environment does not own their values, and invocation never frees
+    /// or consumes the environment. Escape and loan validity are frontend
+    /// invariants.
+    MakeBorrowedClosure {
+        function: String,
+        signature: Type,
+        captures: Vec<MirBorrowCapture>,
+    },
     /// Consume an owned callable and invoke it once.
     CallIndirect {
+        callee: LocalId,
+        signature: Type,
+        args: Vec<MirValue>,
+    },
+    /// Invoke a borrowed `Fn` without consuming its carrier.
+    CallIndirectShared {
+        callee: LocalId,
+        signature: Type,
+        args: Vec<MirValue>,
+    },
+    /// Invoke a borrowed `FnMut` without consuming its carrier.
+    ///
+    /// The frontend must prove exclusive environment access for the duration
+    /// of this call.
+    CallIndirectMut {
         callee: LocalId,
         signature: Type,
         args: Vec<MirValue>,
@@ -215,6 +287,57 @@ pub enum Rvalue {
     /// Wrap a negative runtime status in canonical `ThreadError` storage.
     ThreadErrorFromStatus {
         status: MirValue,
+    },
+    /// Allocate an empty lexical thread scope into private raw storage.
+    ThreadScopeCreate {
+        out_scope: LocalId,
+    },
+    /// Join all registered children in spawn order and consume the scope.
+    ThreadScopeExit {
+        scope: LocalId,
+    },
+    /// Produce a non-owning public `Scope` view without consuming raw storage.
+    ThreadScopeFromRaw {
+        raw: LocalId,
+    },
+    /// Join every current child without consuming the owner. Scope callback
+    /// bodies emit this on every exit before their borrowed local frames drop.
+    ThreadScopeDrain {
+        scope: LocalId,
+    },
+    /// Spawn a scope-owned unit child from a borrowed Fn/FnMut carrier.
+    /// Neither success nor failure consumes the carrier or its environment.
+    ScopedThreadSpawnUnit {
+        scope: LocalId,
+        task: LocalId,
+        out_handle: LocalId,
+    },
+    /// Spawn a scope-owned typed child from a borrowed Fn/FnMut carrier.
+    ScopedThreadSpawnResult {
+        scope: LocalId,
+        task: LocalId,
+        out_handle: LocalId,
+        result_type: Type,
+    },
+    /// Explicitly join and unregister a scope-owned unit child.
+    ScopedThreadJoinUnit {
+        handle: LocalId,
+    },
+    /// Explicitly join a typed child and transfer its result exactly once.
+    ScopedThreadJoinResult {
+        handle: LocalId,
+        out_result: LocalId,
+        result_type: Type,
+    },
+    /// Wrap a private child token in canonical public storage.
+    ScopedThreadHandleFromRaw {
+        raw: LocalId,
+        result_type: Type,
+    },
+    /// Consume a canonical public child token into private raw storage.
+    ScopedThreadHandleIntoRaw {
+        handle: LocalId,
+        result_type: Type,
     },
     StructLit {
         struct_name: String,
@@ -540,7 +663,10 @@ pub enum MirValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureTransfer, LocalId, MirCapture, MirValue, Rvalue};
+    use super::{
+        BorrowKind, CaptureTransfer, LocalId, MirBorrowCapture, MirCapture, MirInst, MirValue,
+        Rvalue,
+    };
     use crate::atomic::{AtomicOrdering, AtomicRmwOp, AtomicScalar};
     use crate::types::Type;
 
@@ -576,6 +702,99 @@ mod tests {
             let encoded = serde_json::to_string(&rvalue).unwrap();
             let decoded: Rvalue = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, rvalue);
+        }
+    }
+
+    #[test]
+    fn borrowed_callable_mir_round_trips_through_json() {
+        let shared_signature = Type::BorrowedFunction {
+            kind: crate::types::BorrowedCallableKind::Fn,
+            params: vec![Type::I32],
+            ret: Box::new(Type::I32),
+        };
+        let mutable_signature = Type::BorrowedFunction {
+            kind: crate::types::BorrowedCallableKind::FnMut,
+            params: vec![],
+            ret: Box::new(Type::Void),
+        };
+        let rvalues = [
+            Rvalue::MakeBorrowedClosure {
+                function: "main::__closure_0".into(),
+                signature: shared_signature.clone(),
+                captures: vec![MirBorrowCapture {
+                    name: "offset".into(),
+                    local: LocalId(2),
+                    ty: Type::I32,
+                    borrow: BorrowKind::Shared,
+                    source: BorrowCaptureSource::Local,
+                }],
+            },
+            Rvalue::CallIndirectShared {
+                callee: LocalId(4),
+                signature: shared_signature,
+                args: vec![MirValue::Int(3)],
+            },
+            Rvalue::CallIndirectMut {
+                callee: LocalId(5),
+                signature: mutable_signature,
+                args: vec![],
+            },
+        ];
+
+        for rvalue in rvalues {
+            let encoded = serde_json::to_string(&rvalue).unwrap();
+            let decoded: Rvalue = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, rvalue);
+        }
+    }
+
+    #[test]
+    fn scoped_thread_mir_round_trips_through_json() {
+        let rvalues = [
+            Rvalue::ThreadScopeCreate {
+                out_scope: LocalId(0),
+            },
+            Rvalue::ThreadScopeExit { scope: LocalId(0) },
+            Rvalue::ThreadScopeFromRaw { raw: LocalId(0) },
+            Rvalue::ThreadScopeDrain { scope: LocalId(1) },
+            Rvalue::ScopedThreadSpawnUnit {
+                scope: LocalId(0),
+                task: LocalId(1),
+                out_handle: LocalId(2),
+            },
+            Rvalue::ScopedThreadSpawnResult {
+                scope: LocalId(0),
+                task: LocalId(1),
+                out_handle: LocalId(2),
+                result_type: Type::String,
+            },
+            Rvalue::ScopedThreadJoinUnit { handle: LocalId(2) },
+            Rvalue::ScopedThreadJoinResult {
+                handle: LocalId(2),
+                out_result: LocalId(3),
+                result_type: Type::String,
+            },
+            Rvalue::ScopedThreadHandleFromRaw {
+                raw: LocalId(2),
+                result_type: Type::String,
+            },
+            Rvalue::ScopedThreadHandleIntoRaw {
+                handle: LocalId(4),
+                result_type: Type::String,
+            },
+        ];
+        for rvalue in rvalues {
+            let encoded = serde_json::to_string(&rvalue).unwrap();
+            assert_eq!(serde_json::from_str::<Rvalue>(&encoded).unwrap(), rvalue);
+        }
+
+        for inst in [
+            MirInst::DropThreadScope(LocalId(0)),
+            MirInst::DrainThreadScope(LocalId(1)),
+            MirInst::DropScopedThreadHandle(LocalId(2)),
+        ] {
+            let encoded = serde_json::to_string(&inst).unwrap();
+            assert_eq!(serde_json::from_str::<MirInst>(&encoded).unwrap(), inst);
         }
     }
 

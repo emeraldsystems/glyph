@@ -16,7 +16,13 @@ fn format_source(source: &str) -> Result<&str> {
     // glyphfmt is deliberately syntax-preserving until the AST printer lands.
     // Compiling here ensures new syntax is never silently damaged or emitted
     // when it is invalid.
-    let output = compile_source(source, FrontendOptions::default());
+    let output = compile_source(
+        source,
+        FrontendOptions {
+            include_std: true,
+            ..Default::default()
+        },
+    );
     if output.diagnostics.is_empty() {
         Ok(source)
     } else {
@@ -65,6 +71,47 @@ mod tests {
     move (left: i32) -> (right: i32) -> base + left + right
   let inner = outer(1)
   ret inner(1)
+}
+"#;
+
+        assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
+    fn borrowed_callable_golden_is_preserved_exactly() {
+        let source = r#"struct Counter { value: i32 }
+
+fn main() -> i32 {
+  let offset: i32 = 40
+  let add: Fn<i32, i32> = (value: i32) -> offset + value
+  let mut counter: Counter = Counter { value: 0 }
+  let mut next: FnMut<(), i32> = () -> {
+    counter.value = counter.value + 1
+    counter.value
+  }
+  ret add(next())
+}
+"#;
+
+        let once = format_source(source).expect("borrowed callable source should format");
+        assert_eq!(format_source(once).unwrap(), source);
+    }
+
+    #[test]
+    fn scoped_thread_golden_is_preserved_exactly() {
+        let source = r#"import scope from std/thread
+import Scope from std/thread
+import ScopedJoinHandle from std/thread
+import ThreadError from std/thread
+import Result from std/enums
+
+fn run() -> Result<Result<i32, ThreadError>, ThreadError> {
+  let value: i32 = 42
+  ret scope((thread_scope: Scope) -> {
+    let task: Fn<(), i32> = () -> value
+    let handle: ScopedJoinHandle<i32> = thread_scope.spawn(task)?
+    ret handle.join()
+  })
 }
 "#;
 

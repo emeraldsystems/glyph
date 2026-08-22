@@ -1,0 +1,23 @@
+// Canonical compiler-owned bounded SPSC channel surface. These declarations
+// carry resolver identities only; operations are specialized for concrete T
+// and lower directly to SPSC MIR.
+
+struct Sender<T> {}
+struct Receiver<T> {}
+
+enum TrySendResult<T> {
+  Sent,
+  Full(T),
+  Disconnected(T),
+}
+
+enum TryRecvResult<T> {
+  Value(T),
+  Empty,
+  Disconnected,
+}
+
+// The placeholder signature is specialized from the expected source type.
+// A second intrinsic-only `&mut Receiver<T>` output argument is accepted for
+// separately movable endpoint bindings until tuple destructuring is added.
+fn channel(capacity: usize) -> i32 { 0 }

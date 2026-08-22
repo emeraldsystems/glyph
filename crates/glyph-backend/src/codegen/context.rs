@@ -26,6 +26,7 @@ impl CodegenContext {
                 function_types: HashMap::new(),
                 function_ref_thunks: HashMap::new(),
                 closure_artifacts: HashMap::new(),
+                borrowed_closure_artifacts: HashMap::new(),
                 sret_functions: HashMap::new(),
                 target_data: None,
                 requested_target_triple: None,

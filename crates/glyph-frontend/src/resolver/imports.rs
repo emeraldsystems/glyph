@@ -41,6 +41,23 @@ pub fn populate_imported_types(ctx: &mut ResolverContext) {
                 );
             }
         }
+        if source_module == "std/thread" && original_name == "scope" {
+            for (dependency_module, dependency_name) in [
+                ("std/thread", "Scope"),
+                ("std/thread", "ScopedJoinHandle"),
+                ("std/thread", "ThreadError"),
+                ("std/enums", "Result"),
+            ] {
+                import_named_type(
+                    ctx,
+                    &all_modules,
+                    dependency_module,
+                    dependency_name,
+                    None,
+                    &mut visited,
+                );
+            }
+        }
         if source_module == "std/sync" && original_name == "Mutex" {
             for (dependency_module, dependency_name) in
                 [("std/sync", "MutexGuard"), ("std/enums", "Option")]

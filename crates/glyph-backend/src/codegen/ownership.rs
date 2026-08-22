@@ -104,6 +104,12 @@ impl CodegenContext {
                     .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
                 self.codegen_drop_thread_handle_slot(*slot)
             }
+            ty if glyph_core::thread::is_canonical_scoped_thread_handle(ty) => {
+                let slot = local_map
+                    .get(&local)
+                    .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
+                self.codegen_forget_scoped_thread_handle_slot(*slot)
+            }
             Type::Named(name) => {
                 let slot = local_map
                     .get(&local)
@@ -626,6 +632,13 @@ impl CodegenContext {
     }
 
     pub(super) fn field_type_has_drop_glue(ty: &Type) -> bool {
+        if ty == &glyph_core::thread::canonical_thread_scope_type()
+            || ty == &glyph_core::thread::private_thread_scope_type()
+            || glyph_core::thread::is_canonical_scoped_thread_handle(ty)
+            || glyph_core::thread::private_scoped_thread_handle_result(ty).is_some()
+        {
+            return false;
+        }
         matches!(
             ty,
             Type::Own(_)
@@ -711,6 +724,9 @@ impl CodegenContext {
             }
             ty if glyph_core::thread::is_canonical_thread_handle(ty) => {
                 self.codegen_drop_thread_handle_slot(slot)
+            }
+            ty if glyph_core::thread::is_canonical_scoped_thread_handle(ty) => {
+                self.codegen_forget_scoped_thread_handle_slot(slot)
             }
             _ => Ok(()),
         }

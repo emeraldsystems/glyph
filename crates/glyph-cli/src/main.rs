@@ -321,47 +321,69 @@ fn run(path: &PathBuf) -> Result<()> {
         // Provide runtime symbols that are normally supplied by the AOT runtime library.
         // When running via JIT, we need to make them available in-process.
         let mut symbols = HashMap::new();
-        symbols.insert("glyph_byte_at".to_string(), glyph_byte_at as usize as u64);
-        symbols.insert("glyph_time_now".to_string(), glyph_time_now as usize as u64);
+        symbols.insert(
+            "glyph_byte_at".to_string(),
+            glyph_byte_at as *const () as usize as u64,
+        );
+        symbols.insert(
+            "glyph_time_now".to_string(),
+            glyph_time_now as *const () as usize as u64,
+        );
+        symbols.insert(
+            "glyph_time_monotonic_ns".to_string(),
+            glyph_time_monotonic_ns as *const () as usize as u64,
+        );
+        symbols.insert(
+            "glyph_time_sleep_ms".to_string(),
+            glyph_time_sleep_ms as *const () as usize as u64,
+        );
+        symbols.insert(
+            "glyph_time_sleep_us".to_string(),
+            glyph_time_sleep_us as *const () as usize as u64,
+        );
+        symbols.insert(
+            "glyph_time_sleep_until_ns".to_string(),
+            glyph_time_sleep_until_ns as *const () as usize as u64,
+        );
         symbols.insert(
             "glyph_time_to_human_readable".to_string(),
-            glyph_time_to_human_readable as usize as u64,
+            glyph_time_to_human_readable as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_process_run".to_string(),
-            glyph_process_run as usize as u64,
+            glyph_process_run as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_term_stdout".to_string(),
-            glyph_term_stdout as usize as u64,
+            glyph_term_stdout as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_term_enter_ui_session".to_string(),
-            glyph_term_enter_ui_session as usize as u64,
+            glyph_term_enter_ui_session as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_term_session_end".to_string(),
-            glyph_term_session_end as usize as u64,
+            glyph_term_session_end as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_term_move_to".to_string(),
-            glyph_term_move_to as usize as u64,
+            glyph_term_move_to as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_term_clear_line".to_string(),
-            glyph_term_clear_line as usize as u64,
+            glyph_term_clear_line as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_term_write_str".to_string(),
-            glyph_term_write_str as usize as u64,
+            glyph_term_write_str as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_term_flush".to_string(),
-            glyph_term_flush as usize as u64,
+            glyph_term_flush as *const () as usize as u64,
         );
         symbols.insert(
             "glyph_term_poll_event".to_string(),
-            glyph_term_poll_event as usize as u64,
+            glyph_term_poll_event as *const () as usize as u64,
         );
         thread_runtime::register_symbols(&mut symbols);
 
@@ -405,16 +427,19 @@ pub extern "C" fn glyph_byte_at(s: *const std::ffi::c_char, index: usize) -> u8 
 }
 
 #[cfg(feature = "codegen")]
-static mut GLYPH_TIME_BUFFER: [u8; 20] = [0; 20];
+std::thread_local! {
+    static GLYPH_TIME_BUFFER: std::cell::UnsafeCell<[u8; 20]> =
+        const { std::cell::UnsafeCell::new([0; 20]) };
+}
 
 #[cfg(feature = "codegen")]
 fn glyph_time_buffer_ptr() -> *const std::ffi::c_char {
-    std::ptr::addr_of!(GLYPH_TIME_BUFFER) as *const u8 as *const std::ffi::c_char
+    GLYPH_TIME_BUFFER.with(|buffer| buffer.get().cast::<u8>().cast::<std::ffi::c_char>())
 }
 
 #[cfg(feature = "codegen")]
 unsafe fn glyph_time_buffer_mut_ptr() -> *mut u8 {
-    std::ptr::addr_of_mut!(GLYPH_TIME_BUFFER) as *mut u8
+    GLYPH_TIME_BUFFER.with(|buffer| buffer.get().cast::<u8>())
 }
 
 #[cfg(feature = "codegen")]
@@ -422,6 +447,99 @@ unsafe fn glyph_time_buffer_mut_ptr() -> *mut u8 {
 pub extern "C" fn glyph_time_now() -> u64 {
     let t = unsafe { libc::time(std::ptr::null_mut()) };
     if t == -1 { 0 } else { t as u64 }
+}
+
+#[cfg(all(feature = "codegen", unix))]
+#[unsafe(no_mangle)]
+pub extern "C" fn glyph_time_monotonic_ns() -> u64 {
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return 0;
+    }
+    (now.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(now.tv_nsec as u64)
+}
+
+#[cfg(all(feature = "codegen", unix))]
+fn glyph_time_sleep_duration(seconds: libc::time_t, nanos: libc::c_long) -> i32 {
+    let requested = libc::timespec {
+        tv_sec: seconds,
+        tv_nsec: nanos,
+    };
+    if unsafe { libc::nanosleep(&requested, std::ptr::null_mut()) } == 0 {
+        0
+    } else {
+        -1
+    }
+}
+
+#[cfg(all(feature = "codegen", unix))]
+#[unsafe(no_mangle)]
+pub extern "C" fn glyph_time_sleep_ms(ms: u32) -> i32 {
+    glyph_time_sleep_duration(
+        (ms / 1_000) as libc::time_t,
+        ((ms % 1_000) * 1_000_000) as _,
+    )
+}
+
+#[cfg(all(feature = "codegen", unix))]
+#[unsafe(no_mangle)]
+pub extern "C" fn glyph_time_sleep_us(us: u32) -> i32 {
+    glyph_time_sleep_duration(
+        (us / 1_000_000) as libc::time_t,
+        ((us % 1_000_000) * 1_000) as _,
+    )
+}
+
+#[cfg(all(feature = "codegen", unix))]
+#[unsafe(no_mangle)]
+pub extern "C" fn glyph_time_sleep_until_ns(deadline_ns: u64) -> i32 {
+    loop {
+        let now = glyph_time_monotonic_ns();
+        if now == 0 {
+            return -1;
+        }
+        if now >= deadline_ns {
+            return 0;
+        }
+        let remaining = deadline_ns - now;
+        let rc = glyph_time_sleep_duration(
+            (remaining / 1_000_000_000) as libc::time_t,
+            (remaining % 1_000_000_000) as libc::c_long,
+        );
+        if rc == 0 {
+            return 0;
+        }
+        let interrupted = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+        if !interrupted {
+            return -1;
+        }
+    }
+}
+
+#[cfg(all(feature = "codegen", not(unix)))]
+#[unsafe(no_mangle)]
+pub extern "C" fn glyph_time_monotonic_ns() -> u64 {
+    0
+}
+
+#[cfg(all(feature = "codegen", not(unix)))]
+#[unsafe(no_mangle)]
+pub extern "C" fn glyph_time_sleep_ms(_ms: u32) -> i32 {
+    -1
+}
+
+#[cfg(all(feature = "codegen", not(unix)))]
+#[unsafe(no_mangle)]
+pub extern "C" fn glyph_time_sleep_us(_us: u32) -> i32 {
+    -1
+}
+
+#[cfg(all(feature = "codegen", not(unix)))]
+#[unsafe(no_mangle)]
+pub extern "C" fn glyph_time_sleep_until_ns(_deadline_ns: u64) -> i32 {
+    -1
 }
 
 #[cfg(all(feature = "codegen", unix))]
@@ -649,5 +767,41 @@ mod tests {
         assert!(modules.contains_key("main"));
         assert!(modules.contains_key("utils"));
         assert!(modules.contains_key("math/geometry"));
+    }
+
+    #[cfg(all(feature = "codegen", unix))]
+    #[test]
+    fn jit_time_format_buffer_is_thread_local() {
+        use std::ffi::CStr;
+        use std::sync::{Arc, Barrier};
+
+        let first_formatted = Arc::new(Barrier::new(2));
+        let second_formatted = Arc::new(Barrier::new(2));
+
+        let first_ready = Arc::clone(&first_formatted);
+        let second_ready = Arc::clone(&second_formatted);
+        let first = std::thread::spawn(move || {
+            let view = glyph_time_to_human_readable(0);
+            first_ready.wait();
+            second_ready.wait();
+            unsafe { CStr::from_ptr(view) }
+                .to_string_lossy()
+                .into_owned()
+        });
+
+        let first_ready = Arc::clone(&first_formatted);
+        let second_ready = Arc::clone(&second_formatted);
+        let second = std::thread::spawn(move || {
+            first_ready.wait();
+            let view = glyph_time_to_human_readable(86_400);
+            let value = unsafe { CStr::from_ptr(view) }
+                .to_string_lossy()
+                .into_owned();
+            second_ready.wait();
+            value
+        });
+
+        assert_eq!(first.join().unwrap(), "01/01/1970 00:00:00");
+        assert_eq!(second.join().unwrap(), "02/01/1970 00:00:00");
     }
 }

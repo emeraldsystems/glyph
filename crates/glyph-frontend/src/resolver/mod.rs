@@ -129,8 +129,11 @@ pub fn resolve_type_expr_to_type(ty: &TypeExpr, ctx: &ResolverContext) -> Option
                 if let Some(ResolvedSymbol::Struct(module, symbol)) = ctx.resolve_symbol(&ty_str) {
                     let audited_runtime_type = matches!(
                         (module.as_str(), symbol.as_str()),
-                        ("std/thread", "JoinHandle" | "ThreadError")
-                            | ("std/sync", "Arc" | "Mutex" | "MutexGuard")
+                        (
+                            "std/thread",
+                            "JoinHandle" | "ThreadError" | "Scope" | "ScopedJoinHandle"
+                        ) | ("std/sync", "Arc" | "Mutex" | "MutexGuard")
+                            | ("std/sync/spsc", "Sender" | "Receiver")
                             | ("std/io", "Stdout" | "File")
                             | ("std/net", "TcpStream" | "TcpListener" | "UdpSocket")
                             | ("std/term", "Terminal" | "UiSessionGuard")
@@ -171,6 +174,16 @@ pub fn resolve_type_expr_to_type(ty: &TypeExpr, ctx: &ResolverContext) -> Option
                 {
                     return Some(Type::mutex_guard(rendered_args[0].clone()));
                 }
+                if name == glyph_core::types::SPSC_SENDER_TYPE_CONSTRUCTOR
+                    && rendered_args.len() == 1
+                {
+                    return Some(Type::spsc_sender(rendered_args[0].clone()));
+                }
+                if name == glyph_core::types::SPSC_RECEIVER_TYPE_CONSTRUCTOR
+                    && rendered_args.len() == 1
+                {
+                    return Some(Type::spsc_receiver(rendered_args[0].clone()));
+                }
                 if name == "RawPtr" && rendered_args.len() == 1 {
                     return Some(Type::RawPtr(Box::new(rendered_args[0].clone())));
                 }
@@ -180,7 +193,7 @@ pub fn resolve_type_expr_to_type(ty: &TypeExpr, ctx: &ResolverContext) -> Option
                 if name == "Shared" && rendered_args.len() == 1 {
                     return Some(Type::Shared(Box::new(rendered_args[0].clone())));
                 }
-                if name == "FnOnce" {
+                if matches!(name.as_str(), "FnOnce" | "Fn" | "FnMut") {
                     if rendered_args.len() != 2 {
                         return None;
                     }
@@ -190,9 +203,22 @@ pub fn resolve_type_expr_to_type(ty: &TypeExpr, ctx: &ResolverContext) -> Option
                         Type::Tuple(params) => params,
                         param => vec![param],
                     };
-                    return Some(Type::Function {
-                        params,
-                        ret: Box::new(ret),
+                    return Some(match name.as_str() {
+                        "FnOnce" => Type::Function {
+                            params,
+                            ret: Box::new(ret),
+                        },
+                        "Fn" => Type::BorrowedFunction {
+                            kind: glyph_core::types::BorrowedCallableKind::Fn,
+                            params,
+                            ret: Box::new(ret),
+                        },
+                        "FnMut" => Type::BorrowedFunction {
+                            kind: glyph_core::types::BorrowedCallableKind::FnMut,
+                            params,
+                            ret: Box::new(ret),
+                        },
+                        _ => unreachable!(),
                     });
                 }
             }
@@ -906,6 +932,10 @@ fn canonical_runtime_struct_leaf(name: &str) -> Option<&str> {
     matches!(
         name,
         "std::io::Stdout"
+            | "std::thread::JoinHandle"
+            | "std::thread::ThreadError"
+            | "std::thread::Scope"
+            | "std::thread::ScopedJoinHandle"
             | "std::io::File"
             | "std::net::TcpStream"
             | "std::net::TcpListener"

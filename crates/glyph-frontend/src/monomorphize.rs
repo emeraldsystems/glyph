@@ -127,6 +127,22 @@ fn type_expr_to_type(expr: &TypeExpr, param_set: &HashSet<String>) -> Type {
                         ret: Box::new(ret),
                     }
                 }
+                "Fn" | "FnMut" if arg_tys.len() == 2 => {
+                    let ret = arg_tys.pop().unwrap();
+                    let args = arg_tys.pop().unwrap();
+                    Type::BorrowedFunction {
+                        kind: if base_name == "Fn" {
+                            glyph_core::types::BorrowedCallableKind::Fn
+                        } else {
+                            glyph_core::types::BorrowedCallableKind::FnMut
+                        },
+                        params: match args {
+                            Type::Tuple(params) => params,
+                            param => vec![param],
+                        },
+                        ret: Box::new(ret),
+                    }
+                }
                 _ => Type::App {
                     base: base_name,
                     args: arg_tys,
@@ -187,6 +203,23 @@ fn type_key(ty: &Type) -> String {
                 type_key(ret)
             )
         }
+        Type::BorrowedFunction { kind, params, ret } => {
+            let capability = match kind {
+                glyph_core::types::BorrowedCallableKind::Fn => "fn_ref",
+                glyph_core::types::BorrowedCallableKind::FnMut => "fn_mut",
+            };
+            let params: Vec<String> = params.iter().map(type_key).collect();
+            format!(
+                "{}_{}_to_{}",
+                capability,
+                if params.is_empty() {
+                    "unit".to_string()
+                } else {
+                    params.join("__")
+                },
+                type_key(ret)
+            )
+        }
         Type::App { base, args } => {
             let args: Vec<String> = args.iter().map(type_key).collect();
             format!("app_{}_{}", sanitize(base), args.join("__"))
@@ -217,6 +250,14 @@ fn substitute(ty: &Type, subst: &HashMap<String, Type>) -> Type {
         Type::RawPtr(inner) => Type::RawPtr(Box::new(substitute(inner, subst))),
         Type::Shared(inner) => Type::Shared(Box::new(substitute(inner, subst))),
         Type::Function { params, ret } => Type::Function {
+            params: params
+                .iter()
+                .map(|param| substitute(param, subst))
+                .collect(),
+            ret: Box::new(substitute(ret, subst)),
+        },
+        Type::BorrowedFunction { kind, params, ret } => Type::BorrowedFunction {
+            kind: *kind,
             params: params
                 .iter()
                 .map(|param| substitute(param, subst))
@@ -261,6 +302,14 @@ fn normalize_enum_named_types(ty: &Type, enum_names: &HashSet<String>) -> Type {
                 .collect(),
             ret: Box::new(normalize_enum_named_types(ret, enum_names)),
         },
+        Type::BorrowedFunction { kind, params, ret } => Type::BorrowedFunction {
+            kind: *kind,
+            params: params
+                .iter()
+                .map(|param| normalize_enum_named_types(param, enum_names))
+                .collect(),
+            ret: Box::new(normalize_enum_named_types(ret, enum_names)),
+        },
         Type::App { base, args } => Type::App {
             base: base.clone(),
             args: args
@@ -285,6 +334,24 @@ fn rewrite_type(
     worklist: &mut VecDeque<Type>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Type {
+    if let Some(result) = glyph_core::thread::private_scoped_thread_handle_result(ty) {
+        return glyph_core::thread::private_scoped_thread_handle_type(rewrite_type(
+            result,
+            templates,
+            instantiations,
+            worklist,
+            diagnostics,
+        ));
+    }
+    if let Some(result) = glyph_core::thread::canonical_scoped_thread_handle_result(ty) {
+        return glyph_core::thread::canonical_scoped_thread_handle_type(rewrite_type(
+            result,
+            templates,
+            instantiations,
+            worklist,
+            diagnostics,
+        ));
+    }
     if let Some(inner) = ty.arc_inner_type() {
         return Type::arc(rewrite_type(
             inner,
@@ -305,6 +372,24 @@ fn rewrite_type(
     }
     if let Some(inner) = ty.mutex_guard_inner_type() {
         return Type::mutex_guard(rewrite_type(
+            inner,
+            templates,
+            instantiations,
+            worklist,
+            diagnostics,
+        ));
+    }
+    if let Some(inner) = ty.spsc_sender_inner_type() {
+        return Type::spsc_sender(rewrite_type(
+            inner,
+            templates,
+            instantiations,
+            worklist,
+            diagnostics,
+        ));
+    }
+    if let Some(inner) = ty.spsc_receiver_inner_type() {
+        return Type::spsc_receiver(rewrite_type(
             inner,
             templates,
             instantiations,
@@ -425,6 +510,20 @@ fn rewrite_type(
                 diagnostics,
             )),
         },
+        Type::BorrowedFunction { kind, params, ret } => Type::BorrowedFunction {
+            kind: *kind,
+            params: params
+                .iter()
+                .map(|param| rewrite_type(param, templates, instantiations, worklist, diagnostics))
+                .collect(),
+            ret: Box::new(rewrite_type(
+                ret,
+                templates,
+                instantiations,
+                worklist,
+                diagnostics,
+            )),
+        },
         Type::Param(p) => {
             diagnostics.push(Diagnostic::error(
                 format!("unresolved generic parameter '{}'", p),
@@ -448,6 +547,16 @@ fn rewrite_type_with_instantiations(
     templates: &HashMap<String, Template>,
     instantiations: &HashMap<(String, Vec<Type>), String>,
 ) -> Type {
+    if let Some(result) = glyph_core::thread::private_scoped_thread_handle_result(ty) {
+        return glyph_core::thread::private_scoped_thread_handle_type(
+            rewrite_type_with_instantiations(result, templates, instantiations),
+        );
+    }
+    if let Some(result) = glyph_core::thread::canonical_scoped_thread_handle_result(ty) {
+        return glyph_core::thread::canonical_scoped_thread_handle_type(
+            rewrite_type_with_instantiations(result, templates, instantiations),
+        );
+    }
     if let Some(inner) = ty.arc_inner_type() {
         return Type::arc(rewrite_type_with_instantiations(
             inner,
@@ -521,6 +630,18 @@ fn rewrite_type_with_instantiations(
             instantiations,
         ))),
         Type::Function { params, ret } => Type::Function {
+            params: params
+                .iter()
+                .map(|param| rewrite_type_with_instantiations(param, templates, instantiations))
+                .collect(),
+            ret: Box::new(rewrite_type_with_instantiations(
+                ret,
+                templates,
+                instantiations,
+            )),
+        },
+        Type::BorrowedFunction { kind, params, ret } => Type::BorrowedFunction {
+            kind: *kind,
             params: params
                 .iter()
                 .map(|param| rewrite_type_with_instantiations(param, templates, instantiations))
@@ -620,8 +741,14 @@ fn rewrite_rvalue(
         | Rvalue::MutexLock { elem_type, .. }
         | Rvalue::MutexTryLock { elem_type, .. }
         | Rvalue::MutexGuardIsAcquired { elem_type, .. }
-        | Rvalue::MutexGuardBorrow { elem_type, .. } => {
+        | Rvalue::MutexGuardBorrow { elem_type, .. }
+        | Rvalue::SpscChannelNew { elem_type, .. }
+        | Rvalue::SpscTrySend { elem_type, .. }
+        | Rvalue::SpscTryRecv { elem_type, .. } => {
             *elem_type = rewrite_type(elem_type, templates, instantiations, worklist, diagnostics);
+        }
+        Rvalue::Deref { ty, .. } => {
+            *ty = rewrite_type(ty, templates, instantiations, worklist, diagnostics);
         }
         Rvalue::EnumPayload { payload_type, .. } => {
             *payload_type = rewrite_type(
@@ -644,10 +771,29 @@ fn rewrite_rvalue(
                 *struct_name = name.clone();
             }
         }
-        Rvalue::FunctionRef { signature, .. } | Rvalue::CallIndirect { signature, .. } => {
+        Rvalue::FunctionRef { signature, .. }
+        | Rvalue::CallIndirect { signature, .. }
+        | Rvalue::CallIndirectShared { signature, .. }
+        | Rvalue::CallIndirectMut { signature, .. } => {
             *signature = rewrite_type(signature, templates, instantiations, worklist, diagnostics);
         }
         Rvalue::MakeClosure {
+            signature,
+            captures,
+            ..
+        } => {
+            *signature = rewrite_type(signature, templates, instantiations, worklist, diagnostics);
+            for capture in captures {
+                capture.ty = rewrite_type(
+                    &capture.ty,
+                    templates,
+                    instantiations,
+                    worklist,
+                    diagnostics,
+                );
+            }
+        }
+        Rvalue::MakeBorrowedClosure {
             signature,
             captures,
             ..

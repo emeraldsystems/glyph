@@ -5,6 +5,7 @@ extern "C" fn glyph_time_monotonic_ns() -> u64;
 extern "C" fn glyph_time_to_human_readable(ts: u64) -> str;
 extern "C" fn glyph_time_sleep_ms(ms: u32) -> i32;
 extern "C" fn glyph_time_sleep_us(us: u32) -> i32;
+extern "C" fn glyph_time_sleep_until_ns(deadline_ns: u64) -> i32;
 
 struct Error {
   message: String
@@ -76,4 +77,15 @@ struct Instant {
 
 fn now_monotonic() -> Instant {
   ret Instant { nanos: glyph_time_monotonic_ns() }
+}
+
+// Sleep to an absolute monotonic deadline. Scheduling each sequencer tick
+// from one fixed timeline avoids the cumulative drift of repeated relative
+// sleeps. A deadline in the past succeeds immediately.
+fn sleep_until_ns(deadline_ns: u64) -> Result<(), Error> {
+  let rc = glyph_time_sleep_until_ns(deadline_ns)
+  if rc == 0 {
+    ret Ok(())
+  }
+  ret Err(Error { message: String::from_str("sleep_until_ns failed") })
 }
