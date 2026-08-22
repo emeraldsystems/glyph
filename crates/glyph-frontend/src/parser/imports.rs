@@ -153,17 +153,39 @@ impl<'a> Parser<'a> {
 
     pub(super) fn lookahead_for_from(&self) -> bool {
         let mut pos = self.pos;
+        let mut prev_end: Option<u32> = None;
         while pos < self.tokens.len() {
-            match self.tokens[pos].kind {
+            let tok = &self.tokens[pos];
+
+            // Imports are line-oriented: a `from` on a later line belongs to
+            // the NEXT import statement, not to this `import ...` form.
+            // Without this, `import std` followed by `from std/x import Y`
+            // was misparsed as `import std from std/x` and the trailing
+            // `import Y` became a bogus wildcard import of module 'Y'.
+            if let Some(end) = prev_end {
+                let gap = self
+                    .source
+                    .get(end as usize..tok.span.start as usize)
+                    .unwrap_or("");
+                if gap.contains('\n') {
+                    return false;
+                }
+            }
+
+            match tok.kind {
                 TokenKind::From => return true,
                 TokenKind::Semicolon
                 | TokenKind::Eof
+                | TokenKind::Import
                 | TokenKind::Const
                 | TokenKind::Struct
                 | TokenKind::Fn
                 | TokenKind::Interface
                 | TokenKind::Impl => return false,
-                _ => pos += 1,
+                _ => {
+                    prev_end = Some(tok.span.end);
+                    pos += 1;
+                }
             }
         }
         false

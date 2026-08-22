@@ -246,6 +246,10 @@ pub(crate) fn lower_expr_with_expected<'a>(
                 }
             } else if let Some(value) = lookup_const_value(ctx, ident.0.as_str(), *span) {
                 lower_const_rvalue(ctx, value)
+            } else if is_unit_enum_ctor(ctx, ident.0.as_str()) {
+                // Bare unit-variant paths (`Val::Nil`, `None`) construct the
+                // variant; delegate to call lowering with zero arguments.
+                lower_call(ctx, expr, &[], *span, false, expected)
             } else {
                 None
             }
@@ -366,6 +370,14 @@ fn lower_cast<'a>(
         },
     });
     Some(Rvalue::Move(tmp))
+}
+
+/// True when `name` resolves to a zero-parameter enum variant constructor,
+/// so a bare identifier like `Val::Nil` or `None` builds that variant.
+fn is_unit_enum_ctor(ctx: &LowerCtx<'_>, name: &str) -> bool {
+    ctx.fn_sigs
+        .get(name)
+        .map_or(false, |sig| sig.enum_ctor.is_some() && sig.params.is_empty())
 }
 
 fn lookup_const_value<'a>(ctx: &mut LowerCtx<'a>, name: &str, span: Span) -> Option<ConstValue> {
@@ -1796,6 +1808,10 @@ pub(crate) fn lower_value_with_expected<'a>(
                 }
             } else if let Some(value) = lookup_const_value(ctx, ident.0.as_str(), *span) {
                 lower_const_value(ctx, value)
+            } else if is_unit_enum_ctor(ctx, ident.0.as_str()) {
+                // Bare unit-variant paths (`Val::Nil`, `None`) construct the
+                // variant; delegate to call lowering with zero arguments.
+                lower_call(ctx, expr, &[], *span, false, expected).and_then(rvalue_to_value)
             } else {
                 None
             }
