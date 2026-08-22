@@ -156,3 +156,50 @@ fn std_time_sleep_us_small() {
 
     assert_eq!(build_and_run_exit_code(source), 0);
 }
+
+#[cfg(all(feature = "codegen", unix))]
+#[test]
+fn std_time_monotonic_clock_measures_sleep() {
+    let source = r#"
+        from std/time import Instant, now_monotonic, sleep_ms
+
+        fn main() -> i32 {
+          let start = now_monotonic()
+          let _ = sleep_ms(50)
+          let elapsed = start.elapsed_ms()
+          if elapsed < 45 { ret 1 }
+          if elapsed > 5000 { ret 2 }
+          let ns = start.elapsed_ns()
+          if ns < 45000000 { ret 3 }
+          let us = start.elapsed_us()
+          if us < 45000 { ret 4 }
+          ret 0
+        }
+    "#;
+
+    assert_eq!(build_and_run_exit_code(source), 0);
+}
+
+#[cfg(all(feature = "codegen", unix))]
+#[test]
+fn std_time_monotonic_is_nondecreasing() {
+    let source = r#"
+        from std/time import Instant, now_monotonic
+
+        fn main() -> i32 {
+          let a = now_monotonic()
+          let mut i: i32 = 0
+          let mut spin: u64 = 0
+          while i < 1000 {
+            spin = spin + 1
+            i = i + 1
+          }
+          let b = now_monotonic()
+          if b.as_nanos() < a.as_nanos() { ret 1 }
+          if a.as_nanos() == 0 { ret 2 }
+          ret 0
+        }
+    "#;
+
+    assert_eq!(build_and_run_exit_code(source), 0);
+}

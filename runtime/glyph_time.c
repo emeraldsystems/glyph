@@ -55,6 +55,17 @@ const char* glyph_time_to_human_readable(uint64_t ts) {
     return buffer;
 }
 
+// Monotonic clock in nanoseconds. Unaffected by wall-clock adjustments;
+// only differences between two readings are meaningful. This is the timing
+// source for sequencer ticks and latency measurement.
+uint64_t glyph_time_monotonic_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 int32_t glyph_time_sleep_ms(uint32_t ms) {
     struct timespec ts;
     ts.tv_sec = ms / 1000;

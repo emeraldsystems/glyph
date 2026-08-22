@@ -1,6 +1,7 @@
 from std/enums import Result
 
 extern "C" fn glyph_time_now() -> u64;
+extern "C" fn glyph_time_monotonic_ns() -> u64;
 extern "C" fn glyph_time_to_human_readable(ts: u64) -> str;
 extern "C" fn glyph_time_sleep_ms(ms: u32) -> i32;
 extern "C" fn glyph_time_sleep_us(us: u32) -> i32;
@@ -44,4 +45,35 @@ fn sleep_us(us: u32) -> Result<(), Error> {
     ret Ok(())
   }
   ret Err(Error { message: String::from_str("sleep_us failed") })
+}
+
+// Monotonic high-resolution clock: unaffected by wall-clock changes; only
+// the difference between two readings is meaningful. This is the timing
+// source for sequencer ticks, audio scheduling, and latency measurement.
+struct Instant {
+  nanos: u64
+
+  fn as_nanos(self: &Instant) -> u64 {
+    ret self.nanos
+  }
+
+  fn elapsed_ns(self: &Instant) -> u64 {
+    let now = glyph_time_monotonic_ns()
+    if now < self.nanos {
+      ret 0
+    }
+    ret now - self.nanos
+  }
+
+  fn elapsed_us(self: &Instant) -> u64 {
+    ret self.elapsed_ns() / 1000
+  }
+
+  fn elapsed_ms(self: &Instant) -> u64 {
+    ret self.elapsed_ns() / 1000000
+  }
+}
+
+fn now_monotonic() -> Instant {
+  ret Instant { nanos: glyph_time_monotonic_ns() }
 }

@@ -742,6 +742,7 @@ mod tests {
                 },
             ],
             dependencies: HashMap::new(),
+            link: LinkSection::default(),
         };
         let err = select_bin(&manifest, None).unwrap_err();
         assert_eq!(err.code, EXIT_USAGE);
@@ -762,6 +763,7 @@ mod tests {
                 path: "../a.glyph".into(),
             }],
             dependencies: HashMap::new(),
+            link: LinkSection::default(),
         };
         // Need the file to exist to reach traversal check; create placeholder in root/.. not possible
         // Instead, expect traversal rejection before file existence is checked.
