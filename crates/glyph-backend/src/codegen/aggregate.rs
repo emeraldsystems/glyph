@@ -189,7 +189,7 @@ impl CodegenContext {
             let value = value_map.get(field_name.as_str()).ok_or_else(|| {
                 anyhow!("missing field {} for struct {}", field_name, struct_name)
             })?;
-            let mut llvm_field_val = self.codegen_value(value, func, local_map)?;
+            let mut llvm_field_val = self.codegen_value_owned(value, field_ty, func, local_map)?;
             let gep_name = CString::new(format!("{}.{}", struct_name, field_name))?;
             let field_ptr = unsafe {
                 LLVMBuildStructGEP2(

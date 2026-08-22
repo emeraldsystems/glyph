@@ -341,7 +341,7 @@ impl CodegenContext {
             let key_len = self.codegen_string_len_value(key_val, functions)?;
             key_val = self.codegen_string_copy_from_ptr_len(key_val, key_len, functions)?;
         }
-        let value_val = self.codegen_value(value, func, local_map)?;
+        let value_val = self.codegen_value_owned(value, value_type, func, local_map)?;
 
         let cap_val_cont = unsafe {
             LLVMBuildLoad2(
@@ -957,7 +957,7 @@ impl CodegenContext {
             }
             _ => None,
         };
-        let value_val = self.codegen_value(value, func, local_map)?;
+        let value_val = self.codegen_value_owned(value, value_type, func, local_map)?;
 
         let check_bb = unsafe {
             LLVMAppendBasicBlockInContext(

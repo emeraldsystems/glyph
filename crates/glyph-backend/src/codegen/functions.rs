@@ -377,9 +377,24 @@ impl CodegenContext {
                     }
                 }
                 MirInst::Return(val) => {
+                    // Returning a non-owning view (skip_drop) hands ownership
+                    // to the caller; deep-clone so the caller's drop doesn't
+                    // free container-owned data.
+                    let returns_view = |func: &MirFunction, v: &Option<MirValue>| {
+                        matches!(v, Some(MirValue::Local(id))
+                            if func.locals.get(id.0 as usize).map_or(false, |l| l.skip_drop))
+                    };
                     if let Some(sret_ptr) = sret_ptr {
                         if let Some(v) = val {
-                            let ret_val = self.codegen_value(v, func, local_map)?;
+                            let mut ret_val = self.codegen_value(v, func, local_map)?;
+                            if returns_view(func, val) {
+                                if let Some(ret_ty) = func.ret_type.as_ref() {
+                                    if Self::type_needs_clone(ret_ty) {
+                                        ret_val =
+                                            self.codegen_deep_clone_value(ret_ty, ret_val)?;
+                                    }
+                                }
+                            }
                             LLVMBuildStore(self.builder, ret_val, sret_ptr);
                         } else if let Some(ret_ty) = func.ret_type.as_ref() {
                             let llvm_ret_ty = self.get_llvm_type(ret_ty)?;
@@ -389,6 +404,13 @@ impl CodegenContext {
                         LLVMBuildRetVoid(self.builder);
                     } else if let Some(v) = val {
                         let mut ret_val = self.codegen_value(v, func, local_map)?;
+                        if returns_view(func, val) {
+                            if let Some(ret_ty) = func.ret_type.as_ref() {
+                                if Self::type_needs_clone(ret_ty) {
+                                    ret_val = self.codegen_deep_clone_value(ret_ty, ret_val)?;
+                                }
+                            }
+                        }
                         if let Some(ret_ty) = func.ret_type.as_ref() {
                             let llvm_ret_ty = self.get_llvm_type(ret_ty)?;
                             let signed = matches!(ret_ty, Type::I8 | Type::I32 | Type::I64);

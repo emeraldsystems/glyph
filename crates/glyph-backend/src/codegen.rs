@@ -34,10 +34,12 @@ pub struct CodegenContext {
     argc_global: Option<LLVMValueRef>,
     argv_vec_global: Option<LLVMValueRef>,
     drop_in_progress: std::collections::HashSet<String>,
+    clone_fns: HashMap<String, LLVMValueRef>,
 }
 
 mod aggregate;
 mod array;
+mod clone;
 mod context;
 mod emit;
 mod entry;

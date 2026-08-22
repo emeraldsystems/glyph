@@ -864,7 +864,7 @@ impl CodegenContext {
                 CString::new("vec.push.dest")?.as_ptr(),
             )
         };
-        let value_val = self.codegen_value(value, func, local_map)?;
+        let value_val = self.codegen_value_owned(value, elem_type, func, local_map)?;
         unsafe { LLVMBuildStore(self.builder, value_val, elem_ptr) };
         let new_len = unsafe {
             LLVMBuildAdd(

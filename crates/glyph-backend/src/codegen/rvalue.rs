@@ -547,8 +547,16 @@ impl CodegenContext {
                     variant_index,
                     payload,
                 } => {
+                    let payload_ty = self
+                        .enum_layouts
+                        .get(enum_name)
+                        .and_then(|l| l.variants.get(*variant_index as usize))
+                        .and_then(|v| v.payload.clone());
                     let payload_val = match payload {
-                        Some(val) => Some(self.codegen_value(val, func, local_map)?),
+                        Some(val) => Some(match payload_ty.as_ref() {
+                            Some(ty) => self.codegen_value_owned(val, ty, func, local_map)?,
+                            None => self.codegen_value(val, func, local_map)?,
+                        }),
                         None => None,
                     };
                     self.codegen_enum_value(enum_name, *variant_index, payload_val)
@@ -717,6 +725,27 @@ impl CodegenContext {
 
                         if let Some(Some(param_ty)) = param_types.get(idx) {
                             let arg_ty = self.mir_value_type(arg, func);
+
+                            // A non-owning view (skip_drop) passed by value
+                            // transfers ownership to the callee, which will
+                            // drop it; deep-clone so the container's original
+                            // is not freed twice. By-reference params borrow
+                            // and extern "C" callees don't run drop glue, so
+                            // neither needs a clone.
+                            if !is_extern && !matches!(param_ty, Type::Ref(_, _)) {
+                                if let MirValue::Local(arg_local) = arg {
+                                    let is_view = func
+                                        .locals
+                                        .get(arg_local.0 as usize)
+                                        .map_or(false, |l| l.skip_drop);
+                                    if is_view && Self::type_needs_clone(param_ty) {
+                                        let clone_ty =
+                                            arg_ty.clone().unwrap_or_else(|| param_ty.clone());
+                                        arg_val =
+                                            self.codegen_deep_clone_value(&clone_ty, arg_val)?;
+                                    }
+                                }
+                            }
 
                             if let Some(Type::Ref(inner, _)) = arg_ty.as_ref() {
                                 if inner.as_ref() == param_ty {

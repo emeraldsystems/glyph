@@ -30,6 +30,7 @@ impl CodegenContext {
                 argc_global: None,
                 argv_vec_global: None,
                 drop_in_progress: std::collections::HashSet::new(),
+                clone_fns: HashMap::new(),
             })
         }
     }

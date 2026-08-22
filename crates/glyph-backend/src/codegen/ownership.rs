@@ -488,7 +488,7 @@ impl CodegenContext {
         Ok(())
     }
 
-    fn field_type_has_drop_glue(ty: &Type) -> bool {
+    pub(super) fn field_type_has_drop_glue(ty: &Type) -> bool {
         matches!(
             ty,
             Type::Own(_)
@@ -500,7 +500,7 @@ impl CodegenContext {
         )
     }
 
-    fn type_display_for_mono(ty: &Type) -> String {
+    pub(super) fn type_display_for_mono(ty: &Type) -> String {
         match ty {
             Type::String => "String".to_string(),
             Type::I8 => "i8".to_string(),
