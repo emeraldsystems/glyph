@@ -97,7 +97,13 @@ This TODO is based on the repo’s FFI boundary requirements (see `NETWORKING_AP
 - [x] Extend symbol resolution (`resolve_symbol`) to also resolve extern functions
 - [x] Add resolver tests:
   - [x] Extern function appears as `ResolvedSymbol::Function(...)`
-  - [ ] Diagnostics for invalid extern parameter types
+  - [x] Diagnostics for invalid extern parameter types
+
+Extern ownership rule: parameters may use ABI-safe scalars, `str`,
+`RawPtr<T>`, or references. Glyph-owned values that require drop glue are
+rejected by value because a foreign callee cannot participate in Glyph's drop
+contract. References are call-scoped and must not be retained. Supported owned
+return types transfer a fresh owner into Glyph.
 
 ## Phase 6: MIR Representation
 - [x] Decide how MIR represents extern functions:

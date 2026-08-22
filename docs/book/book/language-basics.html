@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d2c92e95.js";
+            window.path_to_searchindex_js = "searchindex-52de4e19.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-2dc36abc.js"></script>
@@ -300,6 +300,18 @@ fn main() -&gt; i32 {
 payload extraction are not independent owners. The compiler suppresses drops for
 these snapshots to avoid freeing data still owned elsewhere. Prefer borrowing or
 an explicit clone/deep-copy operation when an API needs to keep a value.</p>
+<h3 id="extern-ownership-boundary"><a class="header" href="#extern-ownership-boundary">Extern ownership boundary</a></h3>
+<p>An <code>extern "C"</code> parameter cannot take a Glyph-owned droppable value by value.
+Types such as <code>String</code>, <code>Own&lt;T&gt;</code>, <code>Shared&lt;T&gt;</code>, <code>Vec&lt;T&gt;</code>, <code>Map&lt;K, V&gt;</code>, owned
+structs/enums, callable values, and concurrency handles require Glyph drop glue
+that a C callee cannot run safely.</p>
+<p>Pass an ABI-safe scalar, <code>str</code>, or <code>RawPtr&lt;T&gt;</code>, or borrow the value with <code>&amp;T</code>
+or <code>&amp;mut T</code>. An extern reference is valid only for the duration of the call;
+the callee must not retain it. Converting <code>Own&lt;T&gt;</code> into <code>RawPtr&lt;T&gt;</code> is an
+explicit ownership escape, and the foreign API must document who eventually
+reclaims that allocation.</p>
+<p>Owned extern return values remain supported by the declared ABI. Once returned,
+the result is a normal Glyph owner and is dropped by Glyph.</p>
 <h2 id="methods"><a class="header" href="#methods">Methods</a></h2>
 <p>Structs can have methods defined directly inside the struct body. The first
 parameter must be named <code>self</code> with an explicit type annotation.</p>

@@ -64,16 +64,22 @@ import File from std/io
 
 fn main() -> i32 {
   let base: i32 = 40
-  let joined_scope: Result<Result<i32, std::thread::ThreadError>, std::thread::ThreadError> =
+  let joined_scope: Result<Result<String, std::thread::ThreadError>, std::thread::ThreadError> =
     scope((thread_scope: Scope) -> {
     let local: i32 = 1
-    let joined_task: Fn<(), i32> = () -> base + local + 1
-    let joined_handle: ScopedJoinHandle<i32> = thread_scope.spawn(joined_task)?
+    let joined_task: Fn<(), String> = () -> {
+      if base + local + 1 == 42 {
+        String::from_str("joined")
+      } else {
+        String::from_str("wrong")
+      }
+    }
+    let joined_handle: ScopedJoinHandle<String> = thread_scope.spawn(joined_task)?
     ret joined_handle.join()
   })
   let joined: i32 = match joined_scope {
     Ok(result) => match result {
-      Ok(value) => value,
+      Ok(value) => if value.len() == 6 { 42 } else { 12 },
       Err(_error) => { ret 11 },
     },
     Err(_error) => { ret 10 },
@@ -81,9 +87,9 @@ fn main() -> i32 {
 
   let drained = scope((thread_scope: Scope) -> {
     let expected: i32 = 42
-    let unjoined_task: Fn<(), i32> = () -> {
-      if expected != 42 { ret 0 }
-      ret match File::create("__MARKER_PATH__") {
+    let unjoined_task: Fn<(), String> = () -> {
+      if expected != 42 { ret String::from_str("wrong") }
+      let status = match File::create("__MARKER_PATH__") {
         Ok(file) => {
           let written = file.write_string(String::from_str("drained"))
           let closed = file.close()
@@ -91,8 +97,13 @@ fn main() -> i32 {
         },
         Err(_error) => 0,
       }
+      ret if status == 42 {
+        String::from_str("unclaimed")
+      } else {
+        String::from_str("wrong")
+      }
     }
-    let pending: Result<ScopedJoinHandle<i32>, ThreadError> =
+    let pending: Result<ScopedJoinHandle<String>, ThreadError> =
       thread_scope.spawn(unjoined_task)
     ret 42
   })

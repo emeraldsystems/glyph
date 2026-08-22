@@ -165,6 +165,22 @@ payload extraction are not independent owners. The compiler suppresses drops for
 these snapshots to avoid freeing data still owned elsewhere. Prefer borrowing or
 an explicit clone/deep-copy operation when an API needs to keep a value.
 
+### Extern ownership boundary
+
+An `extern "C"` parameter cannot take a Glyph-owned droppable value by value.
+Types such as `String`, `Own<T>`, `Shared<T>`, `Vec<T>`, `Map<K, V>`, owned
+structs/enums, callable values, and concurrency handles require Glyph drop glue
+that a C callee cannot run safely.
+
+Pass an ABI-safe scalar, `str`, or `RawPtr<T>`, or borrow the value with `&T`
+or `&mut T`. An extern reference is valid only for the duration of the call;
+the callee must not retain it. Converting `Own<T>` into `RawPtr<T>` is an
+explicit ownership escape, and the foreign API must document who eventually
+reclaims that allocation.
+
+Owned extern return values remain supported by the declared ABI. Once returned,
+the result is a normal Glyph owner and is dropped by Glyph.
+
 ## Methods
 
 Structs can have methods defined directly inside the struct body. The first

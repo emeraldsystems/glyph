@@ -490,7 +490,33 @@ pub fn resolve_types(module: &Module) -> (ResolverContext, Vec<Diagnostic>) {
                     };
 
                     let ty_rendered = type_expr_to_string(ty_ident);
-                    if let Some(resolved) = resolve_ffi_type(&ty_rendered) {
+                    let language_type = resolve_type_expr_to_type(ty_ident, &ctx);
+                    let ffi_type = resolve_ffi_type(&ty_rendered);
+                    if ffi_type
+                        .as_ref()
+                        .or(language_type.as_ref())
+                        .is_some_and(extern_parameter_takes_glyph_ownership)
+                    {
+                        diagnostics.push(Diagnostic::error(
+                            format!(
+                                "extern function '{}' parameter '{}' cannot take ownership of Glyph droppable type '{}' by value; pass a reference or an ABI-safe scalar/RawPtr instead",
+                                f.name.0, param.name.0, ty_rendered
+                            ),
+                            Some(param.span),
+                        ));
+                        has_error = true;
+                        continue;
+                    }
+                    if matches!(language_type, Some(Type::Ref(_, _))) {
+                        let resolved = if ty_rendered == "&str" {
+                            Type::Str
+                        } else {
+                            language_type.expect("matched a resolved reference type")
+                        };
+                        params.push(resolved);
+                        continue;
+                    }
+                    if let Some(resolved) = ffi_type {
                         params.push(resolved);
                     } else {
                         diagnostics.push(Diagnostic::error(
@@ -591,6 +617,38 @@ pub fn resolve_types(module: &Module) -> (ResolverContext, Vec<Diagnostic>) {
     methods::collect_interface_impls(module, &mut ctx, &mut diagnostics);
 
     (ctx, diagnostics)
+}
+
+fn extern_parameter_takes_glyph_ownership(ty: &Type) -> bool {
+    match ty {
+        Type::String
+        | Type::Named(_)
+        | Type::Enum(_)
+        | Type::App { .. }
+        | Type::Own(_)
+        | Type::Shared(_)
+        | Type::Atomic(_)
+        | Type::Function { .. } => true,
+        Type::Array(element, _) => extern_parameter_takes_glyph_ownership(element),
+        Type::Tuple(elements) => elements.iter().any(extern_parameter_takes_glyph_ownership),
+        Type::I8
+        | Type::I32
+        | Type::I64
+        | Type::U8
+        | Type::U32
+        | Type::U64
+        | Type::Usize
+        | Type::F32
+        | Type::F64
+        | Type::Bool
+        | Type::Char
+        | Type::Str
+        | Type::Void
+        | Type::Param(_)
+        | Type::Ref(_, _)
+        | Type::RawPtr(_)
+        | Type::BorrowedFunction { .. } => false,
+    }
 }
 
 pub fn expr_span(expr: &Expr) -> Span {

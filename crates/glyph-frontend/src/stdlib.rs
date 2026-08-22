@@ -143,7 +143,7 @@ pub fn std_modules() -> HashMap<String, Module> {
         params: vec![
             Param {
                 name: Ident("buf".into()),
-                ty: Some(tp("String", span)),
+                ty: Some(tp("str", span)),
                 span,
             },
             Param {
@@ -323,7 +323,7 @@ pub fn std_modules() -> HashMap<String, Module> {
         abi: Some("C".into()),
         params: vec![Param {
             name: Ident("msg".into()),
-            ty: Some(tp("String", span)),
+            ty: Some(tp("str", span)),
             span,
         }],
         ret_type: Some(tp("i32", span)),
@@ -375,7 +375,7 @@ pub fn std_modules() -> HashMap<String, Module> {
         abi: Some("C".into()),
         params: vec![Param {
             name: Ident("msg".into()),
-            ty: Some(tp("String", span)),
+            ty: Some(tp("str", span)),
             span,
         }],
         ret_type: Some(tp("i32", span)),

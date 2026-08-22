@@ -62,9 +62,15 @@ unsafe extern "C" {
 const TEST_FAIL_CREATE: i32 = 2;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static OWN_RESULT_FREES: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn record_invocation() {
     INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn counting_result_free(pointer: *mut c_void) {
+    OWN_RESULT_FREES.fetch_add(1, Ordering::SeqCst);
+    unsafe { libc::free(pointer) };
 }
 
 fn runtime_symbols() -> HashMap<String, u64> {
@@ -409,6 +415,134 @@ fn jit_explicit_typed_join_moves_result_then_scope_exits_empty() {
     let ir = context.dump_ir();
     assert!(ir.contains("@glyph_thread_scope_spawn_result"));
     assert!(ir.contains("@glyph_thread_scope_join_result"));
+}
+
+fn owned_result_module(explicit_join: bool) -> MirModule {
+    let owned = Type::Own(Box::new(Type::I32));
+    let signature = scoped_task_type(BorrowedCallableKind::Fn, owned.clone());
+    let mut main_locals = vec![
+        local(private_thread_scope_type(), "scope"),
+        local(signature.clone(), "task"),
+        local(private_scoped_thread_handle_type(owned.clone()), "child"),
+        local(Type::I32, "status"),
+    ];
+    let mut main_insts = vec![
+        MirInst::Assign {
+            local: LocalId(3),
+            value: Rvalue::ThreadScopeCreate {
+                out_scope: LocalId(0),
+            },
+        },
+        MirInst::Assign {
+            local: LocalId(1),
+            value: Rvalue::FunctionRef {
+                name: "owned_answer".into(),
+                signature,
+            },
+        },
+        MirInst::Assign {
+            local: LocalId(3),
+            value: Rvalue::ScopedThreadSpawnResult {
+                scope: LocalId(0),
+                task: LocalId(1),
+                out_handle: LocalId(2),
+                result_type: owned.clone(),
+            },
+        },
+    ];
+    if explicit_join {
+        main_locals.push(local(owned.clone(), "result"));
+        main_insts.push(MirInst::Assign {
+            local: LocalId(3),
+            value: Rvalue::ScopedThreadJoinResult {
+                handle: LocalId(2),
+                out_result: LocalId(4),
+                result_type: owned.clone(),
+            },
+        });
+    } else {
+        main_insts.push(MirInst::DropScopedThreadHandle(LocalId(2)));
+    }
+    main_insts.extend([
+        MirInst::Assign {
+            local: LocalId(3),
+            value: Rvalue::ThreadScopeExit { scope: LocalId(0) },
+        },
+        MirInst::DropThreadScope(LocalId(0)),
+    ]);
+    if explicit_join {
+        main_insts.push(MirInst::Drop(LocalId(4)));
+    }
+    main_insts.push(MirInst::Return(Some(MirValue::Local(LocalId(3)))));
+
+    MirModule {
+        functions: vec![
+            MirFunction {
+                name: "owned_answer".into(),
+                ret_type: Some(owned.clone()),
+                params: vec![],
+                locals: vec![local(owned, "answer")],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::OwnNew {
+                                value: MirValue::Int(42),
+                                elem_type: Type::I32,
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(0)))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: main_locals,
+                blocks: vec![MirBlock { insts: main_insts }],
+            },
+        ],
+        ..MirModule::default()
+    }
+}
+
+#[test]
+fn scoped_owned_result_is_dropped_once_after_join_or_unclaimed_scope_exit() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for (name, explicit_join) in [
+        ("scoped_owned_join", true),
+        ("scoped_owned_unclaimed", false),
+    ] {
+        OWN_RESULT_FREES.store(0, Ordering::SeqCst);
+        let mut context = CodegenContext::new(name).unwrap();
+        context
+            .codegen_module(&owned_result_module(explicit_join))
+            .unwrap();
+        let mut symbols = runtime_symbols();
+        symbols.insert(
+            "free".into(),
+            counting_result_free as *const () as usize as u64,
+        );
+        assert_eq!(
+            context
+                .jit_execute_i32_with_symbols("main", &symbols)
+                .unwrap(),
+            0,
+            "{name}"
+        );
+        assert_eq!(
+            OWN_RESULT_FREES.load(Ordering::SeqCst),
+            1,
+            "{name}: owned payload must be freed exactly once"
+        );
+        assert!(
+            context
+                .dump_ir()
+                .contains("__glyph_thread_result_drop_own_i32"),
+            "{name}: missing generated result drop thunk"
+        );
+    }
 }
 
 #[test]

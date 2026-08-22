@@ -511,9 +511,15 @@ fn typed_local(ty: Type) -> Local {
 }
 
 static CLOSURE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static INVOKED_CLOSURE_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn counting_closure_free(pointer: *mut c_void) {
     CLOSURE_FREE_COUNT.fetch_add(1, Ordering::SeqCst);
+    unsafe { libc::free(pointer) };
+}
+
+unsafe extern "C" fn counting_invoked_closure_free(pointer: *mut c_void) {
+    INVOKED_CLOSURE_FREE_COUNT.fetch_add(1, Ordering::SeqCst);
     unsafe { libc::free(pointer) };
 }
 
@@ -1342,6 +1348,99 @@ fn jit_drops_uncalled_closure_owned_capture_exactly_once() {
     let ir = ctx.dump_ir();
     assert!(ir.contains("closure.drop.capture.0"));
     assert!(ir.contains("callable.drop.call"));
+}
+
+#[test]
+fn jit_invoked_closure_drops_owned_capture_and_environment_exactly_once() {
+    let signature = Type::Function {
+        params: vec![],
+        ret: Box::new(Type::I32),
+    };
+    let mut ctx = CodegenContext::new("closure_invoked_owned_drop").unwrap();
+    let owned_i32 = Type::Own(Box::new(Type::I32));
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "main::__closure_0".into(),
+                ret_type: Some(Type::I32),
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(owned_i32.clone())],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Drop(LocalId(0)),
+                        MirInst::Return(Some(MirValue::Int(42))),
+                    ],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    typed_local(owned_i32.clone()),
+                    typed_local(signature.clone()),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::OwnNew {
+                                value: MirValue::Int(7),
+                                elem_type: Type::I32,
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::MakeClosure {
+                                function: "main::__closure_0".into(),
+                                signature: signature.clone(),
+                                captures: vec![MirCapture {
+                                    name: "payload".into(),
+                                    local: LocalId(0),
+                                    ty: owned_i32,
+                                    transfer: CaptureTransfer::Move,
+                                }],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::CallIndirect {
+                                callee: LocalId(1),
+                                signature,
+                                args: vec![],
+                            },
+                        },
+                        // Scope cleanup still visits the consumed callable. The
+                        // consuming call must have cleared its carrier so this
+                        // post-call drop cannot free the environment twice.
+                        MirInst::Drop(LocalId(1)),
+                        MirInst::Return(Some(MirValue::Local(LocalId(2)))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    INVOKED_CLOSURE_FREE_COUNT.store(0, Ordering::SeqCst);
+    let symbols = HashMap::from([(
+        "free".to_string(),
+        counting_invoked_closure_free as *const () as u64,
+    )]);
+    assert_eq!(
+        ctx.jit_execute_i32_with_symbols("main", &symbols).unwrap(),
+        42,
+        "the owned FnOnce body must run before its environment is released"
+    );
+    assert_eq!(
+        INVOKED_CLOSURE_FREE_COUNT.load(Ordering::SeqCst),
+        2,
+        "the invoked closure must free its owned payload and environment exactly once"
+    );
 }
 
 #[test]
