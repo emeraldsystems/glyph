@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod atomic;
 pub mod diag;
 pub mod mir;
 pub mod span;

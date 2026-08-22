@@ -242,6 +242,10 @@ pub(crate) fn infer_rvalue_type(rv: &Rvalue, ctx: &LowerCtx) -> Option<Type> {
         Rvalue::RawPtrNull { elem_type } => Some(Type::RawPtr(Box::new(elem_type.clone()))),
         Rvalue::SharedNew { elem_type, .. } => Some(Type::Shared(Box::new(elem_type.clone()))),
         Rvalue::SharedClone { elem_type, .. } => Some(Type::Shared(Box::new(elem_type.clone()))),
+        Rvalue::FunctionRef { signature, .. } => Some(signature.clone()),
+        Rvalue::CallIndirect { signature, .. } => {
+            signature.function_signature().map(|(_, ret)| ret.clone())
+        }
         Rvalue::EnumConstruct { enum_name, .. } => Some(Type::Enum(enum_name.clone())),
         Rvalue::EnumTag { .. } => Some(Type::I32),
         Rvalue::EnumPayload { payload_type, .. } => Some(payload_type.clone()),
@@ -295,6 +299,7 @@ pub(crate) fn expr_span(expr: &Expr) -> Option<Span> {
         Expr::Tuple { span, .. } => Some(*span),
         Expr::Try { span, .. } => Some(*span),
         Expr::Cast { span, .. } => Some(*span),
+        Expr::Closure { span, .. } => Some(*span),
         Expr::ForIn { span, .. } => Some(*span),
     }
 }

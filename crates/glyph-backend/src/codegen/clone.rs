@@ -29,6 +29,9 @@ impl CodegenContext {
         ty: &Type,
         val: LLVMValueRef,
     ) -> Result<LLVMValueRef> {
+        if matches!(ty, Type::Function { .. }) {
+            bail!("FnOnce callable values cannot be cloned");
+        }
         if !Self::type_needs_clone(ty) {
             return Ok(val);
         }
@@ -55,6 +58,9 @@ impl CodegenContext {
         src: LLVMValueRef,
         ty: &Type,
     ) -> Result<()> {
+        if matches!(ty, Type::Function { .. }) {
+            bail!("FnOnce callable values cannot be cloned");
+        }
         if !Self::type_needs_clone(ty) {
             // Plain bit copy for non-droppable types.
             let llvm_ty = self.get_llvm_type(ty)?;
@@ -188,6 +194,7 @@ impl CodegenContext {
             }
             Type::Named(name) => self.emit_clone_named(dst, src, name),
             Type::Tuple(elem_types) => self.emit_clone_tuple(dst, src, elem_types),
+            Type::Function { .. } => bail!("FnOnce callable values cannot be cloned"),
             // Remaining droppable classifications have no structured clone;
             // fall back to a bit copy (RawPtr/Ref/scalars never reach here).
             _ => {

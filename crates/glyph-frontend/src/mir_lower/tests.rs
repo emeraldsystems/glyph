@@ -1099,6 +1099,22 @@ fn compile_ok(src: &str) {
 }
 
 #[test]
+fn closure_lowering_reports_the_staged_feature_boundary() {
+    let out = compile_source(
+        "fn main() { let callback = (x: i32) -> x + 1 }",
+        FrontendOptions {
+            emit_mir: true,
+            include_std: true,
+        },
+    );
+
+    assert!(out.diagnostics.iter().any(|diag| {
+        diag.message
+            .contains("closure conversion is not implemented yet")
+    }));
+}
+
+#[test]
 fn borrow_string_field_is_ok() {
     let src = r#"
         struct Session {

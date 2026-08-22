@@ -28,6 +28,7 @@ pub struct CodegenContext {
     strdup_fn: Option<LLVMValueRef>,
     string_globals: HashMap<String, LLVMValueRef>,
     function_types: HashMap<String, LLVMTypeRef>,
+    function_ref_thunks: HashMap<String, LLVMValueRef>,
     sret_functions: HashMap<String, Type>,
     target_data: Option<LLVMTargetDataRef>,
     argv_global: Option<LLVMValueRef>,
@@ -39,6 +40,7 @@ pub struct CodegenContext {
 
 mod aggregate;
 mod array;
+mod callable;
 mod clone;
 mod context;
 mod emit;
@@ -106,6 +108,18 @@ fn type_key_simple_codegen(ty: &Type) -> String {
         Type::Own(inner) => format!("own_{}", type_key_simple_codegen(inner)),
         Type::RawPtr(inner) => format!("rawptr_{}", type_key_simple_codegen(inner)),
         Type::Shared(inner) => format!("shared_{}", type_key_simple_codegen(inner)),
+        Type::Function { params, ret } => {
+            let params: Vec<String> = params.iter().map(type_key_simple_codegen).collect();
+            format!(
+                "fn_{}_to_{}",
+                if params.is_empty() {
+                    "unit".to_string()
+                } else {
+                    params.join("__")
+                },
+                type_key_simple_codegen(ret)
+            )
+        }
         Type::App { base, args } => {
             let args: Vec<String> = args.iter().map(type_key_simple_codegen).collect();
             format!("app_{}_{}", base.replace("::", "_"), args.join("__"))

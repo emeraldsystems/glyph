@@ -487,3 +487,275 @@ fn jit_hello_world_with_puts_literal() {
     let result = ctx.jit_execute_i32_with_symbols("main", &symbols).unwrap();
     assert_eq!(result, 5);
 }
+
+fn typed_local(ty: Type) -> Local {
+    Local {
+        name: None,
+        ty: Some(ty),
+        mutable: false,
+        skip_drop: false,
+    }
+}
+
+#[test]
+fn jit_calls_non_capturing_function_value_with_scalar_result() {
+    let signature = Type::Function {
+        params: vec![Type::I32],
+        ret: Box::new(Type::I32),
+    };
+    let mut ctx = CodegenContext::new("callable_scalar").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "identity".into(),
+                ret_type: Some(Type::I32),
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(Type::I32)],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Return(Some(MirValue::Local(LocalId(0))))],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![typed_local(signature.clone()), typed_local(Type::I32)],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::FunctionRef {
+                                name: "identity".into(),
+                                signature: signature.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::CallIndirect {
+                                callee: LocalId(0),
+                                signature,
+                                args: vec![MirValue::Int(42)],
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(1)))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 42);
+    let ir = ctx.dump_ir();
+    assert!(ir.contains("__glyph_fnref_identity_"));
+    assert!(ir.contains("call.indirect"));
+}
+
+#[test]
+fn jit_calls_zero_argument_unit_function_value() {
+    let signature = Type::Function {
+        params: vec![],
+        ret: Box::new(Type::Void),
+    };
+    let mut ctx = CodegenContext::new("callable_unit").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "ping".into(),
+                ret_type: None,
+                params: vec![],
+                locals: vec![],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Return(None)],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![typed_local(signature.clone()), typed_local(Type::Void)],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::FunctionRef {
+                                name: "ping".into(),
+                                signature: signature.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::CallIndirect {
+                                callee: LocalId(0),
+                                signature,
+                                args: vec![],
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Int(7))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 7);
+}
+
+#[test]
+fn jit_calls_function_value_with_large_sret_result() {
+    let big_ty = Type::Named("Big".into());
+    let signature = Type::Function {
+        params: vec![big_ty.clone()],
+        ret: Box::new(big_ty.clone()),
+    };
+    let mut struct_types = HashMap::new();
+    struct_types.insert(
+        "Big".into(),
+        StructType {
+            name: "Big".into(),
+            fields: (0..5)
+                .map(|index| (format!("f{}", index), Type::I32))
+                .collect(),
+        },
+    );
+    let mut ctx = CodegenContext::new("callable_sret").unwrap();
+    let mir = MirModule {
+        struct_types,
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "identity_big".into(),
+                ret_type: Some(big_ty.clone()),
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(big_ty.clone())],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Return(Some(MirValue::Local(LocalId(0))))],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![
+                    typed_local(signature.clone()),
+                    typed_local(big_ty.clone()),
+                    typed_local(big_ty),
+                    typed_local(Type::I32),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::FunctionRef {
+                                name: "identity_big".into(),
+                                signature: signature.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::StructLit {
+                                struct_name: "Big".into(),
+                                field_values: (0..5)
+                                    .map(|index| (format!("f{}", index), MirValue::Int(index + 1)))
+                                    .collect(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::CallIndirect {
+                                callee: LocalId(0),
+                                signature,
+                                args: vec![MirValue::Local(LocalId(1))],
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(3),
+                            value: Rvalue::FieldAccess {
+                                base: LocalId(2),
+                                field_name: "f4".into(),
+                                field_index: 4,
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Local(LocalId(3)))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 5);
+    let ir = ctx.dump_ir();
+    assert!(ir.contains("sret(%Big)"));
+}
+
+#[test]
+fn dropping_non_capturing_function_value_is_a_safe_noop() {
+    let signature = Type::Function {
+        params: vec![],
+        ret: Box::new(Type::I32),
+    };
+    let mut ctx = CodegenContext::new("callable_drop").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "answer".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Return(Some(MirValue::Int(42)))],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                locals: vec![typed_local(signature.clone())],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::FunctionRef {
+                                name: "answer".into(),
+                                signature,
+                            },
+                        },
+                        MirInst::Drop(LocalId(0)),
+                        MirInst::Return(Some(MirValue::Int(9))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    assert_eq!(ctx.jit_execute_i32("main").unwrap(), 9);
+    assert!(ctx.dump_ir().contains("callable.drop.isnull"));
+}
+
+#[test]
+fn callable_views_are_never_silently_cloned() {
+    let signature = Type::Function {
+        params: vec![Type::I32],
+        ret: Box::new(Type::I32),
+    };
+    let mut ctx = CodegenContext::new("callable_clone_rejection").unwrap();
+
+    assert!(CodegenContext::type_needs_clone(&signature));
+    let error = ctx
+        .codegen_deep_clone_value(&signature, std::ptr::null_mut())
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot be cloned"));
+}

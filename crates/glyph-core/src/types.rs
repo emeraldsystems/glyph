@@ -31,6 +31,15 @@ pub enum Type {
     Own(Box<Type>),
     RawPtr(Box<Type>),
     Shared(Box<Type>),
+    /// An owned, once-callable value.
+    ///
+    /// The backend represents this as an erased `{ env, invoke, drop }`
+    /// carrier. `invoke` receives the hidden environment pointer before the
+    /// declared parameters (after an ABI-mandated sret pointer, when present).
+    Function {
+        params: Vec<Type>,
+        ret: Box<Type>,
+    },
     Tuple(Vec<Type>),
 }
 
@@ -142,6 +151,13 @@ impl Type {
     pub fn shared_inner_type(&self) -> Option<&Type> {
         match self {
             Type::Shared(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    pub fn function_signature(&self) -> Option<(&[Type], &Type)> {
+        match self {
+            Type::Function { params, ret } => Some((params, ret)),
             _ => None,
         }
     }

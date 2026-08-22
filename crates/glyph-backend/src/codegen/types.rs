@@ -139,6 +139,18 @@ impl CodegenContext {
             Type::Own(inner) => format!("own_{}", self.type_key(inner)),
             Type::RawPtr(inner) => format!("rawptr_{}", self.type_key(inner)),
             Type::Shared(inner) => format!("shared_{}", self.type_key(inner)),
+            Type::Function { params, ret } => {
+                let params: Vec<String> = params.iter().map(|p| self.type_key(p)).collect();
+                format!(
+                    "fn_{}_to_{}",
+                    if params.is_empty() {
+                        "unit".to_string()
+                    } else {
+                        params.join("__")
+                    },
+                    self.type_key(ret)
+                )
+            }
             Type::App { base, args } => {
                 let args: Vec<String> = args.iter().map(|a| self.type_key(a)).collect();
                 format!("app_{}_{}", self.sanitize(base), args.join("__"))
@@ -192,7 +204,8 @@ impl CodegenContext {
             | Type::Tuple(_)
             | Type::Enum(_)
             | Type::Array(_, _)
-            | Type::App { .. } => {}
+            | Type::App { .. }
+            | Type::Function { .. } => {}
             _ => return Ok(false),
         }
 
@@ -251,6 +264,16 @@ impl CodegenContext {
                 Type::Own(inner) | Type::RawPtr(inner) | Type::Shared(inner) => {
                     let elem_ty = self.get_llvm_type(&inner)?;
                     LLVMPointerType(elem_ty, 0)
+                }
+                Type::Function { .. } => {
+                    let ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(self.context), 0);
+                    let mut fields = [ptr_ty, ptr_ty, ptr_ty];
+                    LLVMStructTypeInContext(
+                        self.context,
+                        fields.as_mut_ptr(),
+                        fields.len() as u32,
+                        0,
+                    )
                 }
                 Type::Tuple(elem_types) => {
                     if elem_types.is_empty() {

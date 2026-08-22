@@ -83,7 +83,11 @@ fn type_expr_to_string(ty: &TypeExpr) -> String {
         TypeExpr::Array { elem, size, .. } => format!("[{}; {}]", type_expr_to_string(elem), size),
         TypeExpr::Tuple { elements, .. } => {
             let elem_strs: Vec<String> = elements.iter().map(type_expr_to_string).collect();
-            format!("({})", elem_strs.join(", "))
+            if elem_strs.len() == 1 {
+                format!("({},)", elem_strs[0])
+            } else {
+                format!("({})", elem_strs.join(", "))
+            }
         }
     }
 }
@@ -147,6 +151,21 @@ pub fn resolve_type_expr_to_type(ty: &TypeExpr, ctx: &ResolverContext) -> Option
                 }
                 if name == "Shared" && rendered_args.len() == 1 {
                     return Some(Type::Shared(Box::new(rendered_args[0].clone())));
+                }
+                if name == "FnOnce" {
+                    if rendered_args.len() != 2 {
+                        return None;
+                    }
+                    let ret = rendered_args.pop().unwrap();
+                    let args = rendered_args.pop().unwrap();
+                    let params = match args {
+                        Type::Tuple(params) => params,
+                        param => vec![param],
+                    };
+                    return Some(Type::Function {
+                        params,
+                        ret: Box::new(ret),
+                    });
                 }
             }
 
@@ -542,6 +561,7 @@ pub fn expr_span(expr: &Expr) -> Span {
         Expr::Tuple { span, .. } => *span,
         Expr::Try { span, .. } => *span,
         Expr::Cast { span, .. } => *span,
+        Expr::Closure { span, .. } => *span,
         Expr::ForIn { span, .. } => *span,
     }
 }
@@ -869,6 +889,58 @@ mod tests {
             segments: vec![name.to_string()],
             span: make_span(),
         }
+    }
+
+    #[test]
+    fn resolves_fnonce_signature_with_tuple_arguments() {
+        let span = make_span();
+        let ty = TypeExpr::App {
+            base: Box::new(path_ty("FnOnce")),
+            args: vec![
+                TypeExpr::Tuple {
+                    elements: vec![path_ty("i32"), path_ty("bool")],
+                    span,
+                },
+                path_ty("String"),
+            ],
+            span,
+        };
+
+        assert_eq!(
+            resolve_type_expr_to_type(&ty, &ResolverContext::default()),
+            Some(Type::Function {
+                params: vec![Type::I32, Type::Bool],
+                ret: Box::new(Type::String),
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_one_tuple_parameter_without_flattening_it() {
+        let span = make_span();
+        let ty = TypeExpr::App {
+            base: Box::new(path_ty("FnOnce")),
+            args: vec![
+                TypeExpr::Tuple {
+                    elements: vec![TypeExpr::Tuple {
+                        elements: vec![path_ty("i32"), path_ty("bool")],
+                        span,
+                    }],
+                    span,
+                },
+                path_ty("String"),
+            ],
+            span,
+        };
+
+        assert_eq!(
+            resolve_type_expr_to_type(&ty, &ResolverContext::default()),
+            Some(Type::Function {
+                params: vec![Type::Tuple(vec![Type::I32, Type::Bool])],
+                ret: Box::new(Type::String),
+            })
+        );
+        assert_eq!(type_expr_to_string(&ty), "FnOnce<((i32, bool),), String>");
     }
 
     #[test]
@@ -1231,6 +1303,38 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("Map expects 2 type arguments"))
         );
+    }
+
+    #[test]
+    fn fnonce_rejects_wrong_arity() {
+        let callable_ty = TypeExpr::App {
+            base: Box::new(path_ty("FnOnce")),
+            args: vec![path_ty("i32")],
+            span: make_span(),
+        };
+        let module = Module {
+            imports: vec![],
+            items: vec![Item::Struct(StructDef {
+                name: Ident("Holder".into()),
+                generic_params: Vec::new(),
+                fields: vec![FieldDef {
+                    name: Ident("callback".into()),
+                    ty: callable_ty,
+                    span: make_span(),
+                }],
+                interfaces: Vec::new(),
+                methods: Vec::new(),
+                inline_impls: Vec::new(),
+                span: make_span(),
+            })],
+        };
+
+        let (ctx, mut diags) = resolve_types(&module);
+        validate_map_usage(&module, &ctx, &mut diags);
+        assert!(diags.iter().any(|diag| {
+            diag.message
+                .contains("FnOnce expects 2 type arguments but got 1")
+        }));
     }
 
     #[test]

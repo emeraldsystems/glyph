@@ -116,6 +116,17 @@ fn type_expr_to_type(expr: &TypeExpr, param_set: &HashSet<String>) -> Type {
                 "Own" if arg_tys.len() == 1 => Type::Own(Box::new(arg_tys.remove(0))),
                 "RawPtr" if arg_tys.len() == 1 => Type::RawPtr(Box::new(arg_tys.remove(0))),
                 "Shared" if arg_tys.len() == 1 => Type::Shared(Box::new(arg_tys.remove(0))),
+                "FnOnce" if arg_tys.len() == 2 => {
+                    let ret = arg_tys.pop().unwrap();
+                    let args = arg_tys.pop().unwrap();
+                    Type::Function {
+                        params: match args {
+                            Type::Tuple(params) => params,
+                            param => vec![param],
+                        },
+                        ret: Box::new(ret),
+                    }
+                }
                 _ => Type::App {
                     base: base_name,
                     args: arg_tys,
@@ -163,6 +174,18 @@ fn type_key(ty: &Type) -> String {
         Type::Own(inner) => format!("own_{}", type_key(inner)),
         Type::RawPtr(inner) => format!("rawptr_{}", type_key(inner)),
         Type::Shared(inner) => format!("shared_{}", type_key(inner)),
+        Type::Function { params, ret } => {
+            let params: Vec<String> = params.iter().map(type_key).collect();
+            format!(
+                "fn_{}_to_{}",
+                if params.is_empty() {
+                    "unit".to_string()
+                } else {
+                    params.join("__")
+                },
+                type_key(ret)
+            )
+        }
         Type::App { base, args } => {
             let args: Vec<String> = args.iter().map(type_key).collect();
             format!("app_{}_{}", sanitize(base), args.join("__"))
@@ -192,6 +215,19 @@ fn substitute(ty: &Type, subst: &HashMap<String, Type>) -> Type {
         Type::Own(inner) => Type::Own(Box::new(substitute(inner, subst))),
         Type::RawPtr(inner) => Type::RawPtr(Box::new(substitute(inner, subst))),
         Type::Shared(inner) => Type::Shared(Box::new(substitute(inner, subst))),
+        Type::Function { params, ret } => Type::Function {
+            params: params
+                .iter()
+                .map(|param| substitute(param, subst))
+                .collect(),
+            ret: Box::new(substitute(ret, subst)),
+        },
+        Type::Tuple(elements) => Type::Tuple(
+            elements
+                .iter()
+                .map(|element| substitute(element, subst))
+                .collect(),
+        ),
         Type::App { base, args } => Type::App {
             base: base.clone(),
             args: args.iter().map(|a| substitute(a, subst)).collect(),
@@ -217,6 +253,13 @@ fn normalize_enum_named_types(ty: &Type, enum_names: &HashSet<String>) -> Type {
         Type::Shared(inner) => {
             Type::Shared(Box::new(normalize_enum_named_types(inner, enum_names)))
         }
+        Type::Function { params, ret } => Type::Function {
+            params: params
+                .iter()
+                .map(|param| normalize_enum_named_types(param, enum_names))
+                .collect(),
+            ret: Box::new(normalize_enum_named_types(ret, enum_names)),
+        },
         Type::App { base, args } => Type::App {
             base: base.clone(),
             args: args
@@ -333,6 +376,19 @@ fn rewrite_type(
             worklist,
             diagnostics,
         ))),
+        Type::Function { params, ret } => Type::Function {
+            params: params
+                .iter()
+                .map(|param| rewrite_type(param, templates, instantiations, worklist, diagnostics))
+                .collect(),
+            ret: Box::new(rewrite_type(
+                ret,
+                templates,
+                instantiations,
+                worklist,
+                diagnostics,
+            )),
+        },
         Type::Param(p) => {
             diagnostics.push(Diagnostic::error(
                 format!("unresolved generic parameter '{}'", p),
@@ -407,6 +463,23 @@ fn rewrite_type_with_instantiations(
             templates,
             instantiations,
         ))),
+        Type::Function { params, ret } => Type::Function {
+            params: params
+                .iter()
+                .map(|param| rewrite_type_with_instantiations(param, templates, instantiations))
+                .collect(),
+            ret: Box::new(rewrite_type_with_instantiations(
+                ret,
+                templates,
+                instantiations,
+            )),
+        },
+        Type::Tuple(elements) => Type::Tuple(
+            elements
+                .iter()
+                .map(|element| rewrite_type_with_instantiations(element, templates, instantiations))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -505,6 +578,9 @@ fn rewrite_rvalue(
             if let Some(Type::Named(name)) = assigned_ty {
                 *struct_name = name.clone();
             }
+        }
+        Rvalue::FunctionRef { signature, .. } | Rvalue::CallIndirect { signature, .. } => {
+            *signature = rewrite_type(signature, templates, instantiations, worklist, diagnostics);
         }
         _ => {}
     }
@@ -903,6 +979,23 @@ pub fn monomorphize_mir(mir: &mut MirModule, modules: &HashMap<String, Module>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn substitutes_generic_types_inside_callable_signatures() {
+        let signature = Type::Function {
+            params: vec![Type::Param("T".into())],
+            ret: Box::new(Type::Tuple(vec![Type::Param("T".into()), Type::Bool])),
+        };
+        let subst = HashMap::from([("T".to_string(), Type::I64)]);
+
+        assert_eq!(
+            substitute(&signature, &subst),
+            Type::Function {
+                params: vec![Type::I64],
+                ret: Box::new(Type::Tuple(vec![Type::I64, Type::Bool])),
+            }
+        );
+    }
 
     #[test]
     fn monomorphizes_simple_struct_template() {

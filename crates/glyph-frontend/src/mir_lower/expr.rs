@@ -317,7 +317,13 @@ pub(crate) fn lower_expr_with_expected<'a>(
         Expr::Tuple { elements, span } => lower_tuple_expr(ctx, elements, *span),
         Expr::Try { expr, span } => lower_try(ctx, expr, *span),
         Expr::Cast { expr, target, span } => lower_cast(ctx, expr, target, *span),
-        _ => None,
+        Expr::Closure { span, .. } => {
+            ctx.error(
+                "closure syntax is available, but closure conversion is not implemented yet",
+                Some(*span),
+            );
+            None
+        }
     }
 }
 
@@ -1880,6 +1886,13 @@ pub(crate) fn lower_value_with_expected<'a>(
             lower_tuple_expr(ctx, elements, *span).and_then(rvalue_to_value)
         }
         Expr::Try { expr, span } => lower_try(ctx, expr, *span).and_then(rvalue_to_value),
+        Expr::Closure { span, .. } => {
+            ctx.error(
+                "closure syntax is available, but closure conversion is not implemented yet",
+                Some(*span),
+            );
+            None
+        }
         _ => None,
     }
 }

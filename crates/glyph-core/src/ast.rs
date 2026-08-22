@@ -59,6 +59,12 @@ pub enum UnaryOp {
     Neg,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureMode {
+    Inferred,
+    Move,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Lit(Literal, Span),
@@ -148,6 +154,12 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         target: TypeExpr,
+        span: Span,
+    },
+    Closure {
+        capture: CaptureMode,
+        params: Vec<Param>,
+        body: Box<Expr>,
         span: Span,
     },
     ForIn {

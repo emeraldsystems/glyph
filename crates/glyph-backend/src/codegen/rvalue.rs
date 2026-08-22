@@ -45,7 +45,7 @@ impl CodegenContext {
         }
     }
 
-    fn is_float_type_kind(kind: llvm_sys::LLVMTypeKind) -> bool {
+    pub(super) fn is_float_type_kind(kind: llvm_sys::LLVMTypeKind) -> bool {
         matches!(
             kind,
             llvm_sys::LLVMTypeKind::LLVMFloatTypeKind | llvm_sys::LLVMTypeKind::LLVMDoubleTypeKind
@@ -238,6 +238,8 @@ impl CodegenContext {
             Rvalue::StringEndsWith { .. } => "StringEndsWith",
             Rvalue::StringClone { .. } => "StringClone",
             Rvalue::Call { .. } => "Call",
+            Rvalue::FunctionRef { .. } => "FunctionRef",
+            Rvalue::CallIndirect { .. } => "CallIndirect",
             Rvalue::Ref { .. } => "Ref",
             Rvalue::ArrayLit { .. } => "ArrayLit",
             Rvalue::ArrayIndex { .. } => "ArrayIndex",
@@ -448,11 +450,9 @@ impl CodegenContext {
 
                     // Float operands take the FP instruction path; mixed int/float
                     // operands promote the int side to the float type.
-                    let is_float_op = Self::is_float_type_kind(LLVMGetTypeKind(LLVMTypeOf(
-                        lhs_val0,
-                    ))) || Self::is_float_type_kind(
-                        LLVMGetTypeKind(LLVMTypeOf(rhs_val0)),
-                    );
+                    let is_float_op =
+                        Self::is_float_type_kind(LLVMGetTypeKind(LLVMTypeOf(lhs_val0)))
+                            || Self::is_float_type_kind(LLVMGetTypeKind(LLVMTypeOf(rhs_val0)));
                     if is_float_op {
                         let is_unsigned = |ty: Option<&Type>| {
                             matches!(ty, Some(Type::U8 | Type::U32 | Type::U64 | Type::Usize))
@@ -951,6 +951,14 @@ impl CodegenContext {
                         Ok(call_val)
                     }
                 }
+                Rvalue::FunctionRef { name, signature } => {
+                    self.codegen_function_ref(name, signature, functions, mir_module)
+                }
+                Rvalue::CallIndirect {
+                    callee,
+                    signature,
+                    args,
+                } => self.codegen_call_indirect(*callee, signature, args, func, local_map),
                 Rvalue::Ref { base, .. } => {
                     let base_ptr = local_map
                         .get(base)

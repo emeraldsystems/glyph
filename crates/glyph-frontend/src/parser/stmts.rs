@@ -47,6 +47,9 @@ impl<'a> Parser<'a> {
             if self.at(TokenKind::Eq) {
                 self.advance();
                 value = self.parse_expr();
+                if value.is_some() {
+                    self.recover_unparenthesized_multi_closure();
+                }
             }
             let end = value
                 .as_ref()
@@ -69,6 +72,9 @@ impl<'a> Parser<'a> {
             } else {
                 self.parse_expr()
             };
+            if expr.is_some() {
+                self.recover_unparenthesized_multi_closure();
+            }
             let end = expr
                 .as_ref()
                 .map(|e| self.expr_end(e))
@@ -95,6 +101,7 @@ impl<'a> Parser<'a> {
             self.advance(); // consume =
 
             let value = self.parse_expr()?;
+            self.recover_unparenthesized_multi_closure();
             let end = self.expr_end(&value);
             let span = Span::new(start, end);
 
@@ -106,8 +113,61 @@ impl<'a> Parser<'a> {
         }
 
         // Otherwise, it's an expression statement
+        self.recover_unparenthesized_multi_closure();
         let span = Span::new(self.expr_start(&expr), self.expr_end(&expr));
         Some(Stmt::Expr(expr, span))
+    }
+
+    /// Recognize the invalid statement-level spelling `x, y -> body` after
+    /// `x` has already parsed as an expression. This deliberately runs only at
+    /// statement boundaries: a comma inside `call(x, y -> y)` separates valid
+    /// arguments and must remain owned by the call parser.
+    pub(super) fn recover_unparenthesized_multi_closure(&mut self) -> bool {
+        if !self.at(TokenKind::Comma) {
+            return false;
+        }
+
+        let mut index = self.pos;
+        let mut parameter_count = 1usize;
+        while self
+            .tokens
+            .get(index)
+            .is_some_and(|token| token.kind == TokenKind::Comma)
+        {
+            index += 1;
+            if !self
+                .tokens
+                .get(index)
+                .is_some_and(|token| token.kind == TokenKind::Ident)
+            {
+                return false;
+            }
+            parameter_count += 1;
+            index += 1;
+        }
+
+        if parameter_count < 2
+            || !self
+                .tokens
+                .get(index)
+                .is_some_and(|token| token.kind == TokenKind::Arrow)
+        {
+            return false;
+        }
+
+        let start = self.tokens[self.pos].span.start;
+        let arrow = &self.tokens[index];
+        self.diagnostics.push(Diagnostic::error(
+            "multiple closure parameters require parentheses, for example `(x, y) -> ...`",
+            Some(Span::new(start, arrow.span.end)),
+        ));
+        self.pos = index + 1;
+
+        if !self.at(TokenKind::Eof) && !self.at(TokenKind::Semicolon) && !self.at(TokenKind::RBrace)
+        {
+            let _ = self.parse_expr();
+        }
+        true
     }
 
     pub(super) fn parse_if(&mut self, start: u32) -> Option<Expr> {

@@ -15,6 +15,7 @@ pub enum TokenKind {
     Const,
     Let,
     Mut,
+    Move,
     Type,
     Struct,
     Interface,

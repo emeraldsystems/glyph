@@ -27,7 +27,11 @@ pub fn type_expr_to_string(ty: &TypeExpr) -> String {
         TypeExpr::Array { elem, size, .. } => format!("[{}; {}]", type_expr_to_string(elem), size),
         TypeExpr::Tuple { elements, .. } => {
             let elem_strs: Vec<String> = elements.iter().map(type_expr_to_string).collect();
-            format!("({})", elem_strs.join(", "))
+            if elem_strs.len() == 1 {
+                format!("({},)", elem_strs[0])
+            } else {
+                format!("({})", elem_strs.join(", "))
+            }
         }
     }
 }
@@ -65,6 +69,18 @@ pub(crate) fn type_key_simple(ty: &Type) -> String {
         Type::Own(inner) => format!("own_{}", type_key_simple(inner)),
         Type::RawPtr(inner) => format!("rawptr_{}", type_key_simple(inner)),
         Type::Shared(inner) => format!("shared_{}", type_key_simple(inner)),
+        Type::Function { params, ret } => {
+            let params: Vec<String> = params.iter().map(type_key_simple).collect();
+            format!(
+                "fn_{}_to_{}",
+                if params.is_empty() {
+                    "unit".to_string()
+                } else {
+                    params.join("__")
+                },
+                type_key_simple(ret)
+            )
+        }
         Type::App { base, args } => {
             let args: Vec<String> = args.iter().map(type_key_simple).collect();
             format!("app_{}_{}", base.replace("::", "_"), args.join("__"))
@@ -106,6 +122,10 @@ pub(crate) fn resolve_type_name(name: &str, resolver: &ResolverContext) -> Optio
 
     if let Some(primitive) = Type::from_name(trimmed) {
         return Some(primitive);
+    }
+
+    if let Some(tuple) = parse_tuple_type(trimmed, resolver) {
+        return Some(tuple);
     }
 
     if let Some(array) = parse_array_type(trimmed, resolver) {
@@ -161,6 +181,54 @@ pub(crate) fn resolve_type_name(name: &str, resolver: &ResolverContext) -> Optio
         .struct_types
         .contains_key(trimmed)
         .then(|| Type::Named(trimmed.to_string()))
+}
+
+fn parse_tuple_type(name: &str, resolver: &ResolverContext) -> Option<Type> {
+    let trimmed = name.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return None;
+    }
+    let inner = trimmed[1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return Some(Type::Tuple(Vec::new()));
+    }
+
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut saw_comma = false;
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                saw_comma = true;
+                let part = inner[start..index].trim();
+                if !part.is_empty() {
+                    parts.push(resolve_type_name(part, resolver)?);
+                } else if index != inner.len() - 1 {
+                    return None;
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+
+    if !saw_comma {
+        return resolve_type_name(inner, resolver);
+    }
+    let last = inner[start..].trim();
+    if !last.is_empty() {
+        parts.push(resolve_type_name(last, resolver)?);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(Type::Tuple(parts))
 }
 
 pub(crate) fn parse_array_type(name: &str, resolver: &ResolverContext) -> Option<Type> {
@@ -259,8 +327,8 @@ fn parse_type_application(name: &str, resolver: &ResolverContext) -> Option<Type
     let mut depth = 0;
     for (i, ch) in inner.char_indices() {
         match ch {
-            '<' | '[' => depth += 1,
-            '>' | ']' => {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => {
                 if depth > 0 {
                     depth -= 1;
                 }
@@ -287,6 +355,19 @@ fn parse_type_application(name: &str, resolver: &ResolverContext) -> Option<Type
         "Own" if args.len() == 1 => return Some(Type::Own(Box::new(args.remove(0)))),
         "RawPtr" if args.len() == 1 => return Some(Type::RawPtr(Box::new(args.remove(0)))),
         "Shared" if args.len() == 1 => return Some(Type::Shared(Box::new(args.remove(0)))),
+        "FnOnce" if args.len() == 2 => {
+            let ret = args.pop().unwrap();
+            let args = args.pop().unwrap();
+            let params = match args {
+                Type::Tuple(params) => params,
+                param => vec![param],
+            };
+            return Some(Type::Function {
+                params,
+                ret: Box::new(ret),
+            });
+        }
+        "FnOnce" => return None,
         _ => {}
     }
 
@@ -426,5 +507,27 @@ pub(crate) fn struct_name_from_type(ty: &Type) -> Option<String> {
         Type::Shared(inner) => struct_name_from_type(inner),
         Type::Tuple(elem_types) => Some(tuple_struct_name(elem_types)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_type_name;
+    use crate::resolver::ResolverContext;
+    use glyph_core::types::Type;
+
+    #[test]
+    fn parses_callable_arity_and_preserves_one_tuple_parameter() {
+        let resolver = ResolverContext::default();
+
+        assert_eq!(
+            resolve_type_name("FnOnce<((i32, bool),), String>", &resolver),
+            Some(Type::Function {
+                params: vec![Type::Tuple(vec![Type::I32, Type::Bool])],
+                ret: Box::new(Type::String),
+            })
+        );
+        assert_eq!(resolve_type_name("FnOnce<i32>", &resolver), None);
+        assert_eq!(resolve_type_name("FnOnce<i32, i32, i32>", &resolver), None);
     }
 }

@@ -311,12 +311,7 @@ impl<'a> LowerCtx<'a> {
 
     pub(crate) fn local_needs_drop(&self, local: LocalId) -> bool {
         self.local_ty(local)
-            .map(|ty| {
-                matches!(
-                    ty,
-                    Type::Own(_) | Type::Shared(_) | Type::String | Type::Enum(_)
-                )
-            })
+            .map(Self::type_requires_owned_local_tracking)
             .unwrap_or(false)
     }
 
@@ -387,9 +382,27 @@ impl<'a> LowerCtx<'a> {
 
     fn type_has_drop_glue(ty: &Type) -> bool {
         match ty {
-            Type::Own(_) | Type::Shared(_) | Type::String | Type::Enum(_) => true,
+            Type::Own(_)
+            | Type::Shared(_)
+            | Type::String
+            | Type::Enum(_)
+            | Type::Function { .. } => true,
             Type::App { base, .. } => base == "Vec" || base == "Map",
             Type::Named(_) => true,
+            _ => false,
+        }
+    }
+
+    // Keep local move tracking narrower than structural backend drop glue.
+    // Named aggregate field access can borrow from its base; treating every
+    // named aggregate as consumed would incorrectly move the whole value.
+    fn type_requires_owned_local_tracking(ty: &Type) -> bool {
+        match ty {
+            Type::Own(_)
+            | Type::Shared(_)
+            | Type::String
+            | Type::Enum(_)
+            | Type::Function { .. } => true,
             _ => false,
         }
     }
@@ -438,6 +451,22 @@ impl<'a> LowerCtx<'a> {
             Type::Own(inner) => format!("Own<{}>", Self::type_label(inner)),
             Type::RawPtr(inner) => format!("RawPtr<{}>", Self::type_label(inner)),
             Type::Shared(inner) => format!("Shared<{}>", Self::type_label(inner)),
+            Type::Function { params, ret } => {
+                let args = match params.as_slice() {
+                    [] => "()".to_string(),
+                    [Type::Tuple(_)] => format!("({},)", Self::type_label(&params[0])),
+                    [param] => Self::type_label(param),
+                    params => format!(
+                        "({})",
+                        params
+                            .iter()
+                            .map(Self::type_label)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                format!("FnOnce<{}, {}>", args, Self::type_label(ret))
+            }
             Type::Tuple(elements) => {
                 if elements.is_empty() {
                     "()".to_string()

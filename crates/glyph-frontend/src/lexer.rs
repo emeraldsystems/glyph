@@ -157,6 +157,7 @@ fn keyword_or_ident(text: &str) -> TokenKind {
         "const" => Const,
         "let" => Let,
         "mut" => Mut,
+        "move" => Move,
         "type" => Type,
         "struct" => Struct,
         "interface" => Interface,
@@ -355,6 +356,27 @@ mod tests {
                 TokenKind::Eq,
                 TokenKind::Int,
                 TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_move_arrow_closure_tokens() {
+        let out = lex("move (x, y) -> x");
+        assert!(out.diagnostics.is_empty());
+        let kinds: Vec<TokenKind> = out.tokens.into_iter().map(|token| token.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Move,
+                TokenKind::LParen,
+                TokenKind::Ident,
+                TokenKind::Comma,
+                TokenKind::Ident,
+                TokenKind::RParen,
+                TokenKind::Arrow,
+                TokenKind::Ident,
+                TokenKind::Eof,
             ]
         );
     }

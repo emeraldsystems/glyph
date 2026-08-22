@@ -112,6 +112,20 @@ pub enum Rvalue {
         name: String,
         args: Vec<MirValue>,
     },
+    /// Construct a non-capturing callable value for a named function.
+    ///
+    /// The explicit signature keeps serialized MIR self-describing and lets
+    /// the backend validate/reconstruct the erased indirect-call ABI.
+    FunctionRef {
+        name: String,
+        signature: Type,
+    },
+    /// Consume an owned callable and invoke it once.
+    CallIndirect {
+        callee: LocalId,
+        signature: Type,
+        args: Vec<MirValue>,
+    },
     StructLit {
         struct_name: String,
         field_values: Vec<(String, MirValue)>,
@@ -317,4 +331,35 @@ pub enum MirValue {
     Float(f64),
     Bool(bool),
     Local(LocalId),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LocalId, MirValue, Rvalue};
+    use crate::types::Type;
+
+    #[test]
+    fn callable_mir_round_trips_through_json() {
+        let signature = Type::Function {
+            params: vec![Type::I32, Type::Bool],
+            ret: Box::new(Type::String),
+        };
+        let rvalues = [
+            Rvalue::FunctionRef {
+                name: "format_value".into(),
+                signature: signature.clone(),
+            },
+            Rvalue::CallIndirect {
+                callee: LocalId(4),
+                signature,
+                args: vec![MirValue::Int(3), MirValue::Bool(true)],
+            },
+        ];
+
+        for rvalue in rvalues {
+            let encoded = serde_json::to_string(&rvalue).unwrap();
+            let decoded: Rvalue = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, rvalue);
+        }
+    }
 }

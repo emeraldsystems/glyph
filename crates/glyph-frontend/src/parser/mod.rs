@@ -1,9 +1,9 @@
 use glyph_core::{
     ast::{
-        BinaryOp, Block, ConstDef, EnumDef, EnumVariantDef, Expr, ExternFunctionDecl, FieldDef,
-        Function, Ident, ImplBlock, Import, ImportItem, ImportKind, ImportPath, InlineImpl,
-        InterfaceDef, InterfaceMethod, InterpSegment, Item, Literal, MatchArm, MatchPattern,
-        Module, Param, Stmt, StructDef, TypeExpr, UnaryOp,
+        BinaryOp, Block, CaptureMode, ConstDef, EnumDef, EnumVariantDef, Expr, ExternFunctionDecl,
+        FieldDef, Function, Ident, ImplBlock, Import, ImportItem, ImportKind, ImportPath,
+        InlineImpl, InterfaceDef, InterfaceMethod, InterpSegment, Item, Literal, MatchArm,
+        MatchPattern, Module, Param, Stmt, StructDef, TypeExpr, UnaryOp,
     },
     diag::Diagnostic,
     span::Span,
@@ -309,6 +309,7 @@ impl<'a> Parser<'a> {
             Expr::Tuple { span, .. } => span.start,
             Expr::Try { span, .. } => span.start,
             Expr::Cast { span, .. } => span.start,
+            Expr::Closure { span, .. } => span.start,
             Expr::ForIn { span, .. } => span.start,
         }
     }
@@ -335,6 +336,7 @@ impl<'a> Parser<'a> {
             Expr::Tuple { span, .. } => span.end,
             Expr::Try { span, .. } => span.end,
             Expr::Cast { span, .. } => span.end,
+            Expr::Closure { span, .. } => span.end,
             Expr::ForIn { span, .. } => span.end,
         }
     }
@@ -403,7 +405,11 @@ pub fn render_type_expr(ty: &TypeExpr) -> String {
         TypeExpr::Array { elem, size, .. } => format!("[{}; {}]", render_type_expr(elem), size),
         TypeExpr::Tuple { elements, .. } => {
             let elem_strs: Vec<String> = elements.iter().map(render_type_expr).collect();
-            format!("({})", elem_strs.join(", "))
+            if elem_strs.len() == 1 {
+                format!("({},)", elem_strs[0])
+            } else {
+                format!("({})", elem_strs.join(", "))
+            }
         }
     }
 }
@@ -984,5 +990,306 @@ fn main() {
                 .iter()
                 .any(|d| { d.message.contains("requires explicit type annotation") })
         );
+    }
+
+    fn parse_source(source: &str) -> ParseOutput {
+        let lexed = lex(source);
+        assert!(
+            lexed.diagnostics.is_empty(),
+            "unexpected lexer diagnostics: {:?}",
+            lexed.diagnostics
+        );
+        parse(&lexed.tokens, source)
+    }
+
+    fn let_value<'a>(function: &'a Function, index: usize) -> &'a Expr {
+        match &function.body.stmts[index] {
+            Stmt::Let {
+                value: Some(value), ..
+            } => value,
+            other => panic!("expected initialized let statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_arrow_closure_forms_with_precise_spans() {
+        let source = "fn main() { let zero = () -> 1; let one = x -> x; let many = move (x: i32, y) -> { x + y } }";
+        let out = parse_source(source);
+        assert!(out.diagnostics.is_empty(), "diags: {:?}", out.diagnostics);
+        let Item::Function(function) = &out.module.items[0] else {
+            panic!("expected function");
+        };
+
+        let Expr::Closure {
+            capture,
+            params,
+            span,
+            ..
+        } = let_value(function, 0)
+        else {
+            panic!("expected zero-parameter closure");
+        };
+        assert_eq!(*capture, CaptureMode::Inferred);
+        assert!(params.is_empty());
+        assert_eq!(&source[span.start as usize..span.end as usize], "() -> 1");
+
+        let Expr::Closure { params, span, .. } = let_value(function, 1) else {
+            panic!("expected one-parameter closure");
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name.0, "x");
+        assert_eq!(&source[span.start as usize..span.end as usize], "x -> x");
+
+        let Expr::Closure {
+            capture,
+            params,
+            body,
+            span,
+        } = let_value(function, 2)
+        else {
+            panic!("expected move closure");
+        };
+        assert_eq!(*capture, CaptureMode::Move);
+        assert_eq!(params.len(), 2);
+        assert!(params[0].ty.is_some());
+        assert_eq!(
+            &source[params[0].span.start as usize..params[0].span.end as usize],
+            "x: i32"
+        );
+        assert_eq!(
+            &source[span.start as usize..span.end as usize],
+            "move (x: i32, y) -> { x + y }"
+        );
+        assert!(matches!(body.as_ref(), Expr::Block(_)));
+    }
+
+    #[test]
+    fn arrow_closures_are_low_precedence_and_right_associative() {
+        let source = "fn main() { let f = x -> y -> x + y * 2 }";
+        let out = parse_source(source);
+        assert!(out.diagnostics.is_empty(), "diags: {:?}", out.diagnostics);
+        let Item::Function(function) = &out.module.items[0] else {
+            panic!("expected function");
+        };
+        let Expr::Closure { body, .. } = let_value(function, 0) else {
+            panic!("expected outer closure");
+        };
+        let Expr::Closure { body, .. } = body.as_ref() else {
+            panic!("expected right-associated inner closure");
+        };
+        let Expr::Binary {
+            op: BinaryOp::Add,
+            rhs,
+            ..
+        } = body.as_ref()
+        else {
+            panic!("expected addition closure body");
+        };
+        assert!(matches!(
+            rhs.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_closures_in_calls_tuples_blocks_if_and_match() {
+        let source = r#"
+fn main() -> i32 {
+  let called = apply(x -> x + 1, () -> { 2 });
+  let tupled = (move (x: i32, y: i32) -> x + y, 3);
+  let selected = if true { x -> x } else { x -> x + 1 };
+  let matched = match value {
+    Some(v) => x -> x + v,
+    None => () -> 0,
+  };
+  ret 0
+}
+"#;
+        let out = parse_source(source);
+        assert!(out.diagnostics.is_empty(), "diags: {:?}", out.diagnostics);
+        let Item::Function(function) = &out.module.items[0] else {
+            panic!("expected function");
+        };
+        assert!(
+            function.ret_type.is_some(),
+            "function return arrow was lost"
+        );
+
+        let Expr::Call { args, .. } = let_value(function, 0) else {
+            panic!("expected call");
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [Expr::Closure { .. }, Expr::Closure { .. }]
+        ));
+        assert!(matches!(let_value(function, 1), Expr::Tuple { .. }));
+
+        let Expr::If {
+            then_block,
+            else_block,
+            ..
+        } = let_value(function, 2)
+        else {
+            panic!("expected if expression");
+        };
+        assert!(matches!(
+            then_block.stmts[0],
+            Stmt::Expr(Expr::Closure { .. }, _)
+        ));
+        assert!(matches!(
+            else_block.as_ref().unwrap().stmts[0],
+            Stmt::Expr(Expr::Closure { .. }, _)
+        ));
+
+        let Expr::Match { arms, .. } = let_value(function, 3) else {
+            panic!("expected match expression");
+        };
+        assert!(
+            arms.iter()
+                .all(|arm| matches!(arm.expr, Expr::Closure { .. }))
+        );
+    }
+
+    #[test]
+    fn malformed_closures_report_specific_errors_and_recover() {
+        let source = r#"
+fn main() {
+  let bad_params = (x + y) -> x;
+  let missing_params = move -> 1;
+  let missing_body = x ->;
+  let recovered = y -> y;
+}
+"#;
+        let out = parse_source(source);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diag| diag.message.contains("closure parameter")),
+            "expected closure-parameter diagnostic, got {:?}",
+            out.diagnostics
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diag| diag.message.contains("expected closure parameter")),
+            "expected missing-parameter diagnostic, got {:?}",
+            out.diagnostics
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diag| diag.message.contains("after closure `->`")),
+            "expected missing-body diagnostic, got {:?}",
+            out.diagnostics
+        );
+
+        let Item::Function(function) = &out.module.items[0] else {
+            panic!("expected parser to recover the function");
+        };
+        assert!(function.body.stmts.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::Let {
+                name: Ident(name),
+                value: Some(Expr::Closure { .. }),
+                ..
+            } if name == "recovered"
+        )));
+    }
+
+    #[test]
+    fn parses_unparenthesized_typed_single_parameter_closure() {
+        let source = "fn main() { let typed = value: i32 -> value }";
+        let out = parse_source(source);
+        assert!(out.diagnostics.is_empty(), "diags: {:?}", out.diagnostics);
+        let Item::Function(function) = &out.module.items[0] else {
+            panic!("expected function");
+        };
+        let Expr::Closure { params, span, .. } = let_value(function, 0) else {
+            panic!("expected closure");
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name.0, "value");
+        assert!(matches!(
+            params[0].ty,
+            Some(TypeExpr::Path { ref segments, .. }) if segments == &["i32"]
+        ));
+        assert_eq!(
+            &source[params[0].span.start as usize..params[0].span.end as usize],
+            "value: i32"
+        );
+        assert_eq!(
+            &source[span.start as usize..span.end as usize],
+            "value: i32 -> value"
+        );
+    }
+
+    #[test]
+    fn diagnoses_missing_multi_and_zero_parameter_parentheses_and_recovers() {
+        let source = r#"
+fn main() {
+  let multi = x, y -> x + y;
+  let zero = -> 1;
+  let recovered = value -> value;
+}
+"#;
+        let out = parse_source(source);
+        assert_eq!(
+            out.diagnostics
+                .iter()
+                .filter(|diag| diag
+                    .message
+                    .contains("closure parameters require parentheses"))
+                .count(),
+            1,
+            "expected one targeted multi-parameter diagnostic: {:?}",
+            out.diagnostics
+        );
+        assert_eq!(
+            out.diagnostics
+                .iter()
+                .filter(|diag| diag.message.contains("requires `()` before `->`"))
+                .count(),
+            1,
+            "expected one targeted zero-parameter diagnostic: {:?}",
+            out.diagnostics
+        );
+        assert_eq!(
+            out.diagnostics.len(),
+            2,
+            "unexpected cascade: {:?}",
+            out.diagnostics
+        );
+
+        let Item::Function(function) = &out.module.items[0] else {
+            panic!("expected parser to recover the function");
+        };
+        assert!(function.body.stmts.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::Let {
+                name: Ident(name),
+                value: Some(Expr::Closure { .. }),
+                ..
+            } if name == "recovered"
+        )));
+    }
+
+    #[test]
+    fn comma_delimited_argument_before_closure_is_not_misdiagnosed() {
+        let source = "fn main() { let result = apply(value, x -> x) }";
+        let out = parse_source(source);
+        assert!(out.diagnostics.is_empty(), "diags: {:?}", out.diagnostics);
+        let Item::Function(function) = &out.module.items[0] else {
+            panic!("expected function");
+        };
+        let Expr::Call { args, .. } = let_value(function, 0) else {
+            panic!("expected call");
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [Expr::Ident(..), Expr::Closure { .. }]
+        ));
     }
 }

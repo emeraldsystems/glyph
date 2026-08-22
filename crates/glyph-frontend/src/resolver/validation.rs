@@ -230,6 +230,12 @@ fn validate_map_type_expr(
                         ));
                     }
                 }
+                if base_name == "FnOnce" && args.len() != 2 {
+                    diagnostics.push(Diagnostic::error(
+                        format!("FnOnce expects 2 type arguments but got {}", args.len()),
+                        Some(*span),
+                    ));
+                }
             }
             for arg in args {
                 validate_map_type_expr(arg, ctx, generics, module, diagnostics);

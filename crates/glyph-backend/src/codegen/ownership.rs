@@ -59,8 +59,88 @@ impl CodegenContext {
                     .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
                 self.codegen_drop_enum_slot(*slot, name)
             }
+            Type::Function { .. } => {
+                let slot = local_map
+                    .get(&local)
+                    .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
+                self.codegen_drop_callable_slot(*slot, ty)
+            }
             _ => Ok(()),
         }
+    }
+
+    pub(super) fn codegen_drop_callable_slot(
+        &mut self,
+        slot: LLVMValueRef,
+        callable_ty: &Type,
+    ) -> Result<()> {
+        let carrier_ty = self.get_llvm_type(callable_ty)?;
+        unsafe {
+            let carrier = LLVMBuildLoad2(
+                self.builder,
+                carrier_ty,
+                slot,
+                CString::new("callable.drop.load")?.as_ptr(),
+            );
+            let env = LLVMBuildExtractValue(
+                self.builder,
+                carrier,
+                0,
+                CString::new("callable.drop.env")?.as_ptr(),
+            );
+            let drop_fn = LLVMBuildExtractValue(
+                self.builder,
+                carrier,
+                2,
+                CString::new("callable.drop.fn")?.as_ptr(),
+            );
+            // Clear first: a drop thunk that re-enters cleanup cannot observe
+            // an owned callable twice.
+            LLVMBuildStore(self.builder, LLVMConstNull(carrier_ty), slot);
+
+            let parent = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
+            if parent.is_null() {
+                bail!("callable drop parent function missing");
+            }
+            let call_bb = LLVMAppendBasicBlockInContext(
+                self.context,
+                parent,
+                CString::new("callable.drop.call")?.as_ptr(),
+            );
+            let done_bb = LLVMAppendBasicBlockInContext(
+                self.context,
+                parent,
+                CString::new("callable.drop.done")?.as_ptr(),
+            );
+            let is_null = LLVMBuildIsNull(
+                self.builder,
+                drop_fn,
+                CString::new("callable.drop.isnull")?.as_ptr(),
+            );
+            LLVMBuildCondBr(self.builder, is_null, done_bb, call_bb);
+
+            LLVMPositionBuilderAtEnd(self.builder, call_bb);
+            let ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(self.context), 0);
+            let mut drop_params = [ptr_ty];
+            let drop_ty = LLVMFunctionType(
+                LLVMVoidTypeInContext(self.context),
+                drop_params.as_mut_ptr(),
+                1,
+                0,
+            );
+            let mut args = [env];
+            LLVMBuildCall2(
+                self.builder,
+                drop_ty,
+                drop_fn,
+                args.as_mut_ptr(),
+                1,
+                CString::new("")?.as_ptr(),
+            );
+            LLVMBuildBr(self.builder, done_bb);
+            LLVMPositionBuilderAtEnd(self.builder, done_bb);
+        }
+        Ok(())
     }
 
     pub(super) fn codegen_drop_own_slot(&mut self, slot: LLVMValueRef, inner: &Type) -> Result<()> {
@@ -496,6 +576,7 @@ impl CodegenContext {
                 | Type::String
                 | Type::Named(_)
                 | Type::Enum(_)
+                | Type::Function { .. }
                 | Type::App { .. }
         )
     }
@@ -529,6 +610,7 @@ impl CodegenContext {
             Type::String => self.codegen_drop_string_slot(slot),
             Type::Named(name) => self.codegen_drop_named_slot(slot, name),
             Type::Enum(name) => self.codegen_drop_enum_slot(slot, name),
+            Type::Function { .. } => self.codegen_drop_callable_slot(slot, elem_type),
             Type::App { base, args } if base == "Vec" => {
                 let elem = args.first().cloned().unwrap_or(Type::I32);
                 let vec_name = format!("Vec${}", Self::type_display_for_mono(&elem));

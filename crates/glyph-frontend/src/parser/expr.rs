@@ -2,7 +2,207 @@ use super::*;
 
 impl<'a> Parser<'a> {
     pub(super) fn parse_expr(&mut self) -> Option<Expr> {
-        self.parse_match_expr()
+        self.parse_closure_expr()
+    }
+
+    /// Parse an arrow closure. Arrow is the lowest-precedence expression
+    /// operator and is right-associative, so `x -> y -> x` nests in the body.
+    pub(super) fn parse_closure_expr(&mut self) -> Option<Expr> {
+        if self.at(TokenKind::Arrow) {
+            let arrow = self.advance().unwrap();
+            self.diagnostics.push(Diagnostic::error(
+                "zero-parameter closure requires `()` before `->`",
+                Some(arrow.span),
+            ));
+            if !self.at(TokenKind::Eof)
+                && !self.at(TokenKind::Semicolon)
+                && !self.at(TokenKind::RBrace)
+            {
+                let _ = self.parse_expr();
+            }
+            return None;
+        }
+
+        let explicit_move = self.at(TokenKind::Move);
+        if !explicit_move && !self.at_closure_header() {
+            return self.parse_match_expr();
+        }
+
+        let move_tok = if explicit_move {
+            Some(self.advance().unwrap())
+        } else {
+            None
+        };
+        let start = move_tok
+            .map(|tok| tok.span.start)
+            .or_else(|| self.peek().map(|tok| tok.span.start))?;
+
+        let params = if self.at(TokenKind::Ident) {
+            let name_tok = self.advance().unwrap();
+            let ty = if self.at(TokenKind::Colon) {
+                self.advance();
+                Some(self.parse_type_expr()?)
+            } else {
+                None
+            };
+            let end = ty
+                .as_ref()
+                .map(|ty| ty.span().end)
+                .unwrap_or(name_tok.span.end);
+            vec![Param {
+                name: Ident(self.slice(name_tok)),
+                ty,
+                span: Span::new(name_tok.span.start, end),
+            }]
+        } else if self.at(TokenKind::LParen) {
+            self.parse_closure_params()?
+        } else {
+            self.diagnostics.push(Diagnostic::error(
+                "expected closure parameter or parenthesized parameter list",
+                self.peek().map(|tok| tok.span),
+            ));
+            return None;
+        };
+
+        self.consume(TokenKind::Arrow, "expected `->` after closure parameters")?;
+        if self.at(TokenKind::Eof)
+            || self.at(TokenKind::Comma)
+            || self.at(TokenKind::Semicolon)
+            || self.at(TokenKind::RParen)
+            || self.at(TokenKind::RBrace)
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "expected expression or block after closure `->`",
+                self.peek().map(|tok| tok.span),
+            ));
+            return None;
+        }
+        let body = self.parse_expr()?;
+        let span = Span::new(start, self.expr_end(&body));
+        Some(Expr::Closure {
+            capture: if explicit_move {
+                CaptureMode::Move
+            } else {
+                CaptureMode::Inferred
+            },
+            params,
+            body: Box::new(body),
+            span,
+        })
+    }
+
+    /// Detect a closure header without speculatively emitting diagnostics.
+    /// Any balanced `( ... )` immediately followed by `->` is a closure
+    /// attempt; invalid contents then receive a parameter-specific diagnostic.
+    pub(super) fn at_closure_header(&self) -> bool {
+        if self.at(TokenKind::Ident) {
+            if self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|tok| tok.kind == TokenKind::Arrow)
+            {
+                return true;
+            }
+            if !self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|tok| tok.kind == TokenKind::Colon)
+            {
+                return false;
+            }
+
+            let mut paren_depth = 0usize;
+            let mut bracket_depth = 0usize;
+            let mut angle_depth = 0usize;
+            for tok in self.tokens.iter().skip(self.pos + 2) {
+                match tok.kind {
+                    TokenKind::LParen => paren_depth += 1,
+                    TokenKind::RParen if paren_depth > 0 => paren_depth -= 1,
+                    TokenKind::LBracket => bracket_depth += 1,
+                    TokenKind::RBracket if bracket_depth > 0 => bracket_depth -= 1,
+                    TokenKind::Lt => angle_depth += 1,
+                    TokenKind::Gt if angle_depth > 0 => angle_depth -= 1,
+                    TokenKind::Arrow
+                        if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 =>
+                    {
+                        return true;
+                    }
+                    TokenKind::Comma
+                    | TokenKind::Semicolon
+                    | TokenKind::RBrace
+                    | TokenKind::Eof
+                        if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 =>
+                    {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            return false;
+        }
+        if !self.at(TokenKind::LParen) {
+            return false;
+        }
+
+        let mut depth = 0usize;
+        for (index, tok) in self.tokens.iter().enumerate().skip(self.pos) {
+            match tok.kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return self
+                            .tokens
+                            .get(index + 1)
+                            .is_some_and(|next| next.kind == TokenKind::Arrow);
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    pub(super) fn parse_closure_params(&mut self) -> Option<Vec<Param>> {
+        self.consume(TokenKind::LParen, "expected `(` before closure parameters")?;
+        let mut params = Vec::new();
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            let name_tok = self.consume(
+                TokenKind::Ident,
+                "expected parameter name in closure parameter list",
+            )?;
+            let ty = if self.at(TokenKind::Colon) {
+                self.advance();
+                Some(self.parse_type_expr()?)
+            } else {
+                None
+            };
+            let end = ty
+                .as_ref()
+                .map(|ty| ty.span().end)
+                .unwrap_or(name_tok.span.end);
+            params.push(Param {
+                name: Ident(self.slice(name_tok)),
+                ty,
+                span: Span::new(name_tok.span.start, end),
+            });
+
+            if self.at(TokenKind::Comma) {
+                self.advance();
+                if self.at(TokenKind::RParen) {
+                    break;
+                }
+            } else if !self.at(TokenKind::RParen) {
+                self.diagnostics.push(Diagnostic::error(
+                    "expected `,` or `)` after closure parameter",
+                    self.peek().map(|tok| tok.span),
+                ));
+                return None;
+            }
+        }
+        self.consume(TokenKind::RParen, "expected `)` after closure parameters")?;
+        Some(params)
     }
 
     pub(super) fn parse_match_expr(&mut self) -> Option<Expr> {

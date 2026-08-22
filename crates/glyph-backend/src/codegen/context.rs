@@ -24,6 +24,7 @@ impl CodegenContext {
                 strdup_fn: None,
                 string_globals: HashMap::new(),
                 function_types: HashMap::new(),
+                function_ref_thunks: HashMap::new(),
                 sret_functions: HashMap::new(),
                 target_data: None,
                 argv_global: None,
