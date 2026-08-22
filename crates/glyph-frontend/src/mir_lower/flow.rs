@@ -17,6 +17,27 @@ fn is_void_type(ty: &Type) -> bool {
     matches!(ty, Type::Void) || matches!(ty, Type::Tuple(elem_types) if elem_types.is_empty())
 }
 
+/// Lowering failures must never be silent: if an expression failed to lower
+/// and nothing was reported along the way, emit a diagnostic instead of
+/// letting the statement quietly become a Nop (the pattern that let float
+/// and char literals miscompile silently for a long time).
+fn ensure_lowering_reported(
+    ctx: &mut LowerCtx<'_>,
+    diags_before: usize,
+    what: &str,
+    span: Option<Span>,
+) {
+    if ctx.diagnostics.len() == diags_before {
+        ctx.error(
+            format!(
+                "{} could not be lowered to MIR; this expression form is not supported here",
+                what
+            ),
+            span,
+        );
+    }
+}
+
 fn is_void_value(ctx: &LowerCtx<'_>, value: &MirValue) -> bool {
     match value {
         MirValue::Unit => true,
@@ -159,6 +180,7 @@ pub(crate) fn lower_block_with_expected<'a>(
                 }
 
                 let expected = ctx.locals[local.0 as usize].ty.clone();
+                let diags_before = ctx.diagnostics.len();
                 if let Some(mut rv) = value
                     .as_ref()
                     .and_then(|e| lower_expr_with_expected(ctx, e, expected.as_ref()))
@@ -166,14 +188,33 @@ pub(crate) fn lower_block_with_expected<'a>(
                     update_local_type_from_rvalue(ctx, local, &mut rv);
                     ctx.push_inst(MirInst::Assign { local, value: rv });
                 } else {
+                    if let Some(init) = value.as_ref() {
+                        ensure_lowering_reported(
+                            ctx,
+                            diags_before,
+                            "let initializer",
+                            expr_span(init),
+                        );
+                    }
                     ctx.push_inst(MirInst::Nop);
                 }
             }
-            Stmt::Ret(expr, _) => {
+            Stmt::Ret(expr, ret_span) => {
                 let expected = ctx.fn_ret_type.clone();
+                let diags_before = ctx.diagnostics.len();
                 let value = expr
                     .as_ref()
                     .and_then(|e| lower_value_with_expected(ctx, e, expected.as_ref()));
+                if value.is_none() {
+                    if let Some(ret_expr) = expr.as_ref() {
+                        ensure_lowering_reported(
+                            ctx,
+                            diags_before,
+                            "return value",
+                            expr_span(ret_expr).or(Some(*ret_span)),
+                        );
+                    }
+                }
                 if let Some(MirValue::Local(local)) = value.as_ref() {
                     if let Some(state) = ctx.local_states.get_mut(local.0 as usize) {
                         *state = LocalState::Moved;
@@ -289,7 +330,15 @@ pub(crate) fn lower_block_with_expected<'a>(
                             ctx.push_inst(MirInst::Nop);
                         }
                         _ => {
-                            let _ = lower_expr(ctx, expr);
+                            let diags_before = ctx.diagnostics.len();
+                            if lower_expr(ctx, expr).is_none() {
+                                ensure_lowering_reported(
+                                    ctx,
+                                    diags_before,
+                                    "expression statement",
+                                    expr_span(expr),
+                                );
+                            }
                             ctx.push_inst(MirInst::Nop);
                         }
                     }
@@ -300,16 +349,24 @@ pub(crate) fn lower_block_with_expected<'a>(
                 value,
                 span,
             } => {
+                let target_diags_before = ctx.diagnostics.len();
                 if let Some(assign_target) = lower_assignment_target(ctx, target, *span) {
                     match assign_target {
                         AssignmentTarget::Local(local) => {
                             let expected = ctx.locals[local.0 as usize].ty.clone();
+                            let diags_before = ctx.diagnostics.len();
                             if let Some(mut rv) =
                                 lower_expr_with_expected(ctx, value, expected.as_ref())
                             {
                                 update_local_type_from_rvalue(ctx, local, &mut rv);
                                 ctx.push_inst(MirInst::Assign { local, value: rv });
                             } else {
+                                ensure_lowering_reported(
+                                    ctx,
+                                    diags_before,
+                                    "assignment value",
+                                    expr_span(value).or(Some(*span)),
+                                );
                                 ctx.push_inst(MirInst::Nop);
                             }
                         }
@@ -319,6 +376,7 @@ pub(crate) fn lower_block_with_expected<'a>(
                             field_index,
                             field_type,
                         } => {
+                            let diags_before = ctx.diagnostics.len();
                             if let Some(rv) =
                                 lower_expr_with_expected(ctx, value, Some(&field_type))
                             {
@@ -329,11 +387,23 @@ pub(crate) fn lower_block_with_expected<'a>(
                                     value: rv,
                                 });
                             } else {
+                                ensure_lowering_reported(
+                                    ctx,
+                                    diags_before,
+                                    "assignment value",
+                                    expr_span(value).or(Some(*span)),
+                                );
                                 ctx.push_inst(MirInst::Nop);
                             }
                         }
                     }
                 } else {
+                    ensure_lowering_reported(
+                        ctx,
+                        target_diags_before,
+                        "assignment target",
+                        Some(*span),
+                    );
                     ctx.push_inst(MirInst::Nop);
                 }
             }
@@ -643,6 +713,7 @@ pub(crate) fn lower_for<'a>(
     let var_local = ctx.fresh_local(Some(&var.0));
     ctx.bindings.insert(&var.0, var_local);
 
+    let diags_before = ctx.diagnostics.len();
     if let Some(mut rv) = lower_expr(ctx, start) {
         update_local_type_from_rvalue(ctx, var_local, &mut rv);
         ctx.push_inst(MirInst::Assign {
@@ -650,6 +721,7 @@ pub(crate) fn lower_for<'a>(
             value: rv,
         });
     } else {
+        ensure_lowering_reported(ctx, diags_before, "for-loop start bound", expr_span(start));
         ctx.push_inst(MirInst::Nop);
     }
 

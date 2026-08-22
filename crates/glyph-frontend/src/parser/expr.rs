@@ -327,7 +327,16 @@ impl<'a> Parser<'a> {
                     Some(ident_expr)
                 }
             }
-            TokenKind::Int => Some(Expr::Lit(self.literal_from(tok), tok.span)),
+            TokenKind::Int => {
+                let text = self.slice(tok);
+                if text.parse::<i64>().is_err() && text.parse::<u64>().is_err() {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("integer literal '{}' is out of range (max u64)", text),
+                        Some(tok.span),
+                    ));
+                }
+                Some(Expr::Lit(self.literal_from(tok), tok.span))
+            }
             TokenKind::Float => Some(Expr::Lit(self.literal_from(tok), tok.span)),
             TokenKind::Str => Some(Expr::Lit(self.literal_from(tok), tok.span)),
             TokenKind::Char => Some(Expr::Lit(self.literal_from(tok), tok.span)),

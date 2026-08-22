@@ -342,7 +342,15 @@ impl<'a> Parser<'a> {
     pub(super) fn literal_from(&self, tok: &Token) -> Literal {
         let text = self.slice(tok);
         match tok.kind {
-            TokenKind::Int => Literal::Int(text.parse().unwrap_or(0)),
+            // Literals above i64::MAX but within u64 range keep their bit
+            // pattern; u64-typed contexts reinterpret them correctly.
+            // parse_primary reports anything beyond u64 range.
+            TokenKind::Int => Literal::Int(
+                text.parse::<i64>()
+                    .ok()
+                    .or_else(|| text.parse::<u64>().ok().map(|v| v as i64))
+                    .unwrap_or(0),
+            ),
             TokenKind::Float => Literal::Float(text.parse().unwrap_or(0.0)),
             TokenKind::Str => Literal::Str(parse_string_literal(&text)),
             TokenKind::Char => Literal::Char(parse_char_literal(&text)),
