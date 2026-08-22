@@ -80,8 +80,12 @@ impl Linker {
             cmd.arg(format!("-l{}", lib));
         }
 
-        // macOS-specific: Link against system library
+        // macOS-specific: Link against system library, plus AudioToolbox so
+        // std/audio live output resolves (same precedent as -lm on Linux for
+        // std/math; unreferenced frameworks cost nothing at runtime).
         cmd.arg("-lSystem");
+        cmd.arg("-framework");
+        cmd.arg("AudioToolbox");
 
         // Execute the linker
         let output = cmd

@@ -1,0 +1,92 @@
+// std/audio — offline WAV rendering and live audio output.
+//
+// Samples are f64 in [-1, 1], passed as &Vec<f64> blocks (interleaved when
+// channels > 1). Values outside the range are clamped.
+//
+// WAV rendering works on every platform and writes 16-bit PCM.
+// Live output plays through the system device on macOS (AudioToolbox is
+// linked automatically); on other platforms open() returns an error.
+// Live writes BLOCK until queue space frees up, so a render loop is
+// naturally paced by the audio clock.
+
+from std/enums import Result
+from std/vec import Vec
+
+extern "C" fn glyph_audio_wav_open(path: str, sample_rate: u32, channels: u32) -> i32;
+extern "C" fn glyph_audio_wav_write(handle: i32, samples: &Vec<f64>) -> i32;
+extern "C" fn glyph_audio_wav_close(handle: i32) -> i32;
+extern "C" fn glyph_audio_out_open(sample_rate: u32, channels: u32) -> i32;
+extern "C" fn glyph_audio_out_write(handle: i32, samples: &Vec<f64>) -> i32;
+extern "C" fn glyph_audio_out_close(handle: i32) -> i32;
+
+struct AudioError {
+  message: String,
+  code: i32
+}
+
+fn audio_error(msg: str, code: i32) -> AudioError {
+  ret AudioError {
+    message: String::from_str(msg),
+    code: code,
+  }
+}
+
+// --- Offline WAV writer ---
+
+struct WavWriter {
+  handle: i32
+
+  fn write(self: &mut WavWriter, samples: &Vec<f64>) -> Result<i32, AudioError> {
+    let n = glyph_audio_wav_write(self.handle, samples)
+    if n < 0 {
+      ret Err(audio_error("wav write failed", n))
+    }
+    ret Ok(n)
+  }
+
+  fn close(self: &mut WavWriter) -> Result<(), AudioError> {
+    let rc = glyph_audio_wav_close(self.handle)
+    if rc != 0 {
+      ret Err(audio_error("wav close failed", rc))
+    }
+    ret Ok(())
+  }
+}
+
+fn wav_create(path: str, sample_rate: u32, channels: u32) -> Result<WavWriter, AudioError> {
+  let handle = glyph_audio_wav_open(path, sample_rate, channels)
+  if handle < 0 {
+    ret Err(audio_error("wav open failed", handle))
+  }
+  ret Ok(WavWriter { handle: handle })
+}
+
+// --- Live output ---
+
+struct AudioOut {
+  handle: i32
+
+  fn write(self: &mut AudioOut, samples: &Vec<f64>) -> Result<i32, AudioError> {
+    let n = glyph_audio_out_write(self.handle, samples)
+    if n < 0 {
+      ret Err(audio_error("audio write failed", n))
+    }
+    ret Ok(n)
+  }
+
+  fn close(self: &mut AudioOut) -> Result<(), AudioError> {
+    let rc = glyph_audio_out_close(self.handle)
+    if rc != 0 {
+      ret Err(audio_error("audio close failed", rc))
+    }
+    ret Ok(())
+  }
+}
+
+fn out_open(sample_rate: u32, channels: u32) -> Result<AudioOut, AudioError> {
+  let handle = glyph_audio_out_open(sample_rate, channels)
+  if handle < 0 {
+    ret Err(audio_error("audio open failed (live output requires macOS)", handle))
+  }
+  ret Ok(AudioOut { handle: handle })
+}

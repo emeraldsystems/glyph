@@ -230,9 +230,15 @@ impl CodegenContext {
                 let local_ty = local
                     .ty
                     .as_ref()
-                    .map(|t| match t {
-                        Type::Void => Ok(unsafe { LLVMInt8TypeInContext(self.context) }),
-                        _ => self.get_llvm_type(t),
+                    .map(|t| {
+                        // Unit-typed locals (Void or empty tuple, e.g. the
+                        // binding in `Ok(_u)` on Result<(), E>) get an i8
+                        // slot; their real LLVM type has no storable size.
+                        if Self::is_unit_type(t) {
+                            Ok(unsafe { LLVMInt8TypeInContext(self.context) })
+                        } else {
+                            self.get_llvm_type(t)
+                        }
                     })
                     .transpose()?
                     .unwrap_or_else(|| unsafe { LLVMInt32TypeInContext(self.context) });

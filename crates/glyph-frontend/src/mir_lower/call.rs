@@ -314,7 +314,17 @@ pub(crate) fn lower_method_call<'a>(
         "keys" => return lower_map_keys(ctx, receiver, args, span),
         "vals" => return lower_map_vals(ctx, receiver, args, span),
         "read_to_string" => return lower_file_read_to_string(ctx, receiver, args, span),
-        "write_string" | "write" => return lower_file_write_string(ctx, receiver, args, span),
+        "write_string" => return lower_file_write_string(ctx, receiver, args, span),
+        "write" => {
+            // Only dispatch to file_write if the receiver is a File; otherwise
+            // fall through to struct method resolution (e.g. WavWriter.write()).
+            let recv_ty = infer_expr_type(ctx, receiver);
+            let is_file = matches!(&recv_ty, Some(Type::Named(n)) if n == "File")
+                || matches!(&recv_ty, Some(Type::Ref(inner, _)) if matches!(inner.as_ref(), Type::Named(n) if n == "File"));
+            if is_file {
+                return lower_file_write_string(ctx, receiver, args, span);
+            }
+        }
         "close" => {
             // Only dispatch to file_close if receiver is a File type; otherwise fall through
             // to struct method resolution (e.g., TcpStream.close(), UdpSocket.close())

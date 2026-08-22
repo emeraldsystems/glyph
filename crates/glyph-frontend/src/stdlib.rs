@@ -913,6 +913,8 @@ pub fn std_modules() -> HashMap<String, Module> {
     modules.insert("std/net".into(), std_net_module);
     let std_math_module = parse_std_source("std/math", include_str!("stdlib/math.glyph"));
     modules.insert("std/math".into(), std_math_module);
+    let std_audio_module = parse_std_source("std/audio", include_str!("stdlib/audio.glyph"));
+    modules.insert("std/audio".into(), std_audio_module);
 
     // std/process
     let run_extern = ExternFunctionDecl {
