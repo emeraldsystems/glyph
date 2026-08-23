@@ -113,6 +113,10 @@ pub(crate) struct LowerCtx<'a> {
     mutex_guard_constructor: CanonicalConstructorId,
     spsc_sender_constructor: CanonicalConstructorId,
     spsc_receiver_constructor: CanonicalConstructorId,
+    vec_constructor: CanonicalConstructorId,
+    map_constructor: CanonicalConstructorId,
+    option_constructor: CanonicalConstructorId,
+    result_constructor: CanonicalConstructorId,
     /// Private raw thread slots need nonblocking detach cleanup even though
     /// ordinary RawPtr values have no drop glue.
     thread_handle_locals: std::collections::HashSet<LocalId>,
@@ -161,6 +165,18 @@ impl<'a> LowerCtx<'a> {
             glyph_core::types::SPSC_RECEIVER_TYPE_CONSTRUCTOR,
             CanonicalApplicationPolicy::Receiver,
         );
+        // Unique-owner containers resolve structurally: the container itself
+        // adds no sharing, so Send/Sync reduce to the element types
+        // (GLYPH-63; the fail-closed Type::App rejection remains for
+        // everything the resolver cannot identify as these stdlib types).
+        let vec_constructor = thread_safety_registry
+            .register_constructor("std::vec::Vec", CanonicalApplicationPolicy::Vec);
+        let map_constructor = thread_safety_registry
+            .register_constructor("std::map::Map", CanonicalApplicationPolicy::Map);
+        let option_constructor = thread_safety_registry
+            .register_constructor("std::enums::Option", CanonicalApplicationPolicy::Option);
+        let result_constructor = thread_safety_registry
+            .register_constructor("std::enums::Result", CanonicalApplicationPolicy::Result);
         let mut runtime_nominals = HashMap::new();
         for (name, send, sync, reason) in [
             (
@@ -271,6 +287,10 @@ impl<'a> LowerCtx<'a> {
             mutex_guard_constructor,
             spsc_sender_constructor,
             spsc_receiver_constructor,
+            vec_constructor,
+            map_constructor,
+            option_constructor,
+            result_constructor,
             thread_handle_locals: std::collections::HashSet::new(),
             scoped_callback_scopes: Vec::new(),
             scoped_thread_handle_locals: HashSet::new(),
@@ -432,6 +452,44 @@ impl<'a> LowerCtx<'a> {
                 }
             }
             Type::App { base, args }
+                if args.len() == 1 && self.resolves_to_struct(base, "std/vec", "Vec") =>
+            {
+                ThreadSafetyType::application(
+                    self.vec_constructor,
+                    vec![self.thread_safety_type_inner(&args[0], visiting)],
+                )
+            }
+            Type::App { base, args }
+                if args.len() == 2 && self.resolves_to_struct(base, "std/map", "Map") =>
+            {
+                ThreadSafetyType::application(
+                    self.map_constructor,
+                    vec![
+                        self.thread_safety_type_inner(&args[0], visiting),
+                        self.thread_safety_type_inner(&args[1], visiting),
+                    ],
+                )
+            }
+            Type::App { base, args }
+                if args.len() == 1 && self.resolves_to_enum(base, "std/enums", "Option") =>
+            {
+                ThreadSafetyType::application(
+                    self.option_constructor,
+                    vec![self.thread_safety_type_inner(&args[0], visiting)],
+                )
+            }
+            Type::App { base, args }
+                if args.len() == 2 && self.resolves_to_enum(base, "std/enums", "Result") =>
+            {
+                ThreadSafetyType::application(
+                    self.result_constructor,
+                    vec![
+                        self.thread_safety_type_inner(&args[0], visiting),
+                        self.thread_safety_type_inner(&args[1], visiting),
+                    ],
+                )
+            }
+            Type::App { base, args }
                 if args.len() == 1 && self.resolves_to_struct(base, "std/sync", "Arc") =>
             {
                 ThreadSafetyType::application(
@@ -560,6 +618,17 @@ impl<'a> LowerCtx<'a> {
         matches!(
             self.resolver.resolve_symbol(name),
             Some(ResolvedSymbol::Struct(resolved_module, resolved_symbol))
+                if resolved_module == module && resolved_symbol == symbol
+        )
+    }
+
+    fn resolves_to_enum(&self, name: &str, module: &str, symbol: &str) -> bool {
+        if name == format!("{}::{symbol}", module.replace('/', "::")) {
+            return true;
+        }
+        matches!(
+            self.resolver.resolve_symbol(name),
+            Some(ResolvedSymbol::Enum(resolved_module, resolved_symbol))
                 if resolved_module == module && resolved_symbol == symbol
         )
     }

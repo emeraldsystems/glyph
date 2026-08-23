@@ -69,7 +69,7 @@ fn build_and_run(root: &Path, name: &str) -> i32 {
     assert!(exe.exists(), "expected built binary at {}", exe.display());
 
     let run = Command::new(&exe).output().unwrap();
-    run.status.code().unwrap_or(-1)
+    run.status.code().or_else(|| { use std::os::unix::process::ExitStatusExt; run.status.signal().map(|s| -s) }).unwrap_or(-1)
 }
 
 #[test]
