@@ -71,7 +71,39 @@ audio.
 | `src/seq_engine.glyph` | the engine thread: command loop, tick scheduler, sink |
 | `src/seq_control.glyph` | the controller: `apply_json_command`, the MCP-shaped seam |
 | `src/main.glyph` | this demo — argument handling and transport, nothing musical |
+| `src/seq_server.glyph` | `--server` mode: the same engine over stdio, one JSON command per line |
 | `song.json` | the bundled song, also the acceptance suite's canonical fixture |
+
+## Driving it from another program
+
+`--server` hands the same binary over to a line protocol: one JSON request
+per line in, one JSON reply per line out, interleaved with a stream of
+engine reports. This is how the GlyphAudio app drives the engine, and it is
+the same executable — there is only ever one to build, ship and bundle.
+
+```sh
+glyph build
+./target/debug/sequencer --server --wav out.wav    # or --live
+```
+
+```
+>  {"cmd":"load_song","song":{ ... }}
+<  {"ok":true,"cmd":"load_song","tracks":3,"notes":14,"length_ticks":7680}
+>  {"cmd":"render_to","frame":384000}
+<  {"ok":true,"cmd":"render_to"}
+<  {"ev":"position","frame":256,"tick":10,"playing":true}
+<  {"ev":"block","frame":256,"peak":0.35}
+   …
+<  {"ev":"stopped","frame":384000}
+```
+
+Closing stdin shuts it down cleanly — that is how it learns its parent is
+gone, and it finalizes the sink rather than leaving a half-written WAV.
+A render driven this way is byte-identical to the demo's, which CI asserts.
+
+Three threads and no shared mutable state: the engine, a reader that owns
+the command side, and a report writer. Reading a line blocks, so a single
+thread doing both would stall telemetry every time it waited for input.
 
 ## A pattern is streamed, not sent
 

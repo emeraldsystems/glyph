@@ -1,0 +1,301 @@
+// GLYPH-69 -- the sequencer as a JSON-over-stdio server.
+//
+//   sequencer-server --wav out.wav
+//   sequencer-server --live
+//
+// One JSON command per line on stdin; one JSON reply per line on stdout,
+// interleaved with a stream of engine reports. This is the process the
+// GlyphAudio daemon spawns and talks to; see
+// glyph_audio/docs/design/APP_ARCHITECTURE.md §4.
+//
+// ----------------------------------------------------------------------
+// THREE THREADS, NO SHARED MUTABLE STATE -- so no Mutex anywhere.
+//
+//   main thread   reads stdin, dispatches, writes replies. Owns cmd_tx,
+//                 ControllerState and the engine's JoinHandle.
+//   report thread drains rep_rx and writes report lines. Owns rep_rx and
+//                 nothing else.
+//   engine thread engine_run, exactly as the demo uses it.
+//
+// The split is not cosmetic. Reading a line BLOCKS, so a single thread
+// doing both would stall the report stream every time it waited for a
+// command -- and reports tick every 5.33 ms while playing. Keeping the
+// report thread free of ControllerState is what removes the last reason to
+// share anything: the supervisor upstream keeps the mirror instead.
+//
+// Both writers share stdout safely because std/io's print_str lowers to
+// glyph_print, an unbuffered write(2) to fd 1 rather than stdio. A single
+// print_str of a complete line is therefore one syscall, and writes under
+// PIPE_BUF are atomic. Every line here is far under that; a future reply
+// large enough to exceed it would need its own serialization.
+//
+// KNOWN LIMITATION -- `status` reports frame 0 and playing false, always.
+// Live position lives in the report stream, which the pump thread owns;
+// the ControllerState behind `status` lives on this thread and never sees
+// it. That is the deliberate trade for having no shared mutable state, and
+// it costs nothing in the intended architecture: the supervisor keeps the
+// authoritative mirror by folding the report stream, and answers `status`
+// from there. What `status` here does tell you truthfully is the session
+// shape -- state, bpm, and the loaded song's track and note counts.
+// ----------------------------------------------------------------------
+
+import std
+from seq_control import ControllerState, controller_new, controller_started, apply_json_command, send_commands, str_eq
+from seq_engine import engine_run
+from seq_proto import EngineCommand, EngineReport, PositionReport, BlockReport, sink_wav, sink_live
+from std/audio import WavWriter, wav_create
+from std/enums import Result
+from std/io import read_line_raw, print_str, ignore_sigpipe
+from std/string import string_from_i32, string_from_f64
+from std/sync/spsc import channel, Sender, Receiver, TrySendResult, TryRecvResult
+from std/sys import argv
+from std/thread import JoinHandle, ThreadError, spawn
+from std/time import sleep_ms
+from std/vec import Vec
+
+// --- Output -----------------------------------------------------------
+
+// One line, one write(2). See the header note on atomicity.
+fn emit(line: String) -> i32 {
+  let mut out = line
+  out = out.concat(String::from_str("\n"))
+  let s: str = out
+  ret print_str(s)
+}
+
+fn emit_error(msg: str) -> i32 {
+  let mut s = String::from_str("{\"ok\":false,\"error\":\"")
+  s = s.concat(String::from_str(msg))
+  s = s.concat(String::from_str("\"}"))
+  ret emit(s)
+}
+
+// --- Report serialization ---------------------------------------------
+// Each variant goes through a helper with a typed parameter: a
+// payload-of-payload match loses the inner binding's type
+// (SEQUENCER_CORE.md §3 constraint #5).
+//
+// Frames render through i32, which caps a session at ~12 hours at 48 kHz;
+// std/string has no u64 formatter yet. Peaks render through
+// string_from_f64, which is %.17g today -- GLYPH-67 would make these
+// short.
+
+fn position_json(p: PositionReport) -> String {
+  let mut s = String::from_str("{\"ev\":\"position\",\"frame\":")
+  s = s.concat(string_from_i32(p.frame as i32))
+  s = s.concat(String::from_str(",\"tick\":"))
+  s = s.concat(string_from_i32(p.tick as i32))
+  s = s.concat(String::from_str(",\"playing\":"))
+  if p.playing {
+    s = s.concat(String::from_str("true"))
+  }
+  if p.playing == false {
+    s = s.concat(String::from_str("false"))
+  }
+  s = s.concat(String::from_str("}"))
+  ret s
+}
+
+fn block_json(b: BlockReport) -> String {
+  let mut s = String::from_str("{\"ev\":\"block\",\"frame\":")
+  s = s.concat(string_from_i32(b.frame as i32))
+  s = s.concat(String::from_str(",\"peak\":"))
+  s = s.concat(string_from_f64(b.peak))
+  s = s.concat(String::from_str("}"))
+  ret s
+}
+
+fn overflow_json(dropped: u32) -> String {
+  let mut s = String::from_str("{\"ev\":\"overflow\",\"dropped\":")
+  s = s.concat(string_from_i32(dropped as i32))
+  s = s.concat(String::from_str("}"))
+  ret s
+}
+
+fn stopped_json(frame: u64) -> String {
+  let mut s = String::from_str("{\"ev\":\"stopped\",\"frame\":")
+  s = s.concat(string_from_i32(frame as i32))
+  s = s.concat(String::from_str("}"))
+  ret s
+}
+
+fn report_json(rep: EngineReport) -> String {
+  ret match rep {
+    Position(p) => position_json(p),
+    BlockRendered(b) => block_json(b),
+    Overflow(n) => overflow_json(n),
+    Stopped(f) => stopped_json(f),
+  }
+}
+
+// --- Argument handling ------------------------------------------------
+
+fn flag_index(args: &Vec<String>, name: str) -> i32 {
+  let mut i: i32 = 0
+  while i < args.len() as i32 {
+    let a: str = args[i as usize]
+    if str_eq(a, name) {
+      ret i
+    }
+    i = i + 1
+  }
+  ret 0 - 1
+}
+
+// --- Server -----------------------------------------------------------
+
+// Entry point for `sequencer --server`. Lives behind the same binary as the
+// demo so there is exactly one executable to build, ship and bundle.
+fn serve_stdio() -> i32 {
+  // A supervisor that stops reading — or crashes — closes our stdout. The
+  // default SIGPIPE action would kill us on the next report write, mid
+  // render, still holding the WAV: an unpatched RIFF header and an
+  // unreadable file. Ignoring it turns that into an ordinary failed write
+  // that the report thread can shrug off while the engine finalizes.
+  let _sig = ignore_sigpipe()
+
+  let args: Vec<String> = argv
+
+  // The sink is fixed for the life of the process: the engine opens it
+  // once. A daemon that wants each render in its own file therefore spawns
+  // one server per render, which is cheap. Adding an "open sink" command
+  // would avoid that, and is a deliberate non-goal here.
+  let wav_idx = flag_index(&args, "--wav")
+  let live_idx = flag_index(&args, "--live")
+
+  let mut kind: u32 = sink_wav()
+  let mut wav_handle: i32 = 0 - 1
+
+  if wav_idx >= 0 {
+    if wav_idx + 1 >= args.len() as i32 {
+      let _e = emit_error("--wav needs a path")
+      ret 2
+    }
+    // Control opens the WAV because it owns the path string; a borrowed
+    // str cannot be captured into the engine closure.
+    let path: str = args[(wav_idx + 1) as usize]
+    let made = wav_create(path, 48000, 1)
+    wav_handle = match made {
+      Ok(w) => w.handle,
+      Err(_e) => {
+        let _e2 = emit_error("could not open the output wav")
+        ret 2
+      },
+    }
+  }
+  if wav_idx < 0 {
+    if live_idx < 0 {
+      let _e = emit_error("expected --wav <path> or --live")
+      ret 2
+    }
+    // The live device is opened on the engine thread: audio devices are
+    // engine-thread-affine.
+    kind = sink_live()
+  }
+
+  let mut cmd_rx: Receiver<EngineCommand>
+  let mut cmd_tx: Sender<EngineCommand> = channel(64, &mut cmd_rx)
+  let mut rep_rx: Receiver<EngineReport>
+  let rep_tx: Sender<EngineReport> = channel(64, &mut rep_rx)
+
+  let engine: FnOnce<(), i32> = move () -> {
+    ret engine_run(cmd_rx, rep_tx, kind, wav_handle, 48000, 1)
+  }
+  let started = spawn(engine)
+  let engine_handle = match started {
+    Ok(h) => h,
+    Err(_se) => {
+      let _e = emit_error("could not start the engine thread")
+      ret 3
+    },
+  }
+
+  // Report pump. Ends when the engine drops its sender, which happens
+  // exactly once the engine thread returns.
+  let pump: FnOnce<(), i32> = move () -> {
+    let mut rx = rep_rx
+    let mut seen: i32 = 0
+    let mut running: bool = true
+    while running {
+      let got = rx.try_recv()
+      match got {
+        Value(rep) => {
+          let _e = emit(report_json(rep))
+          seen = seen + 1
+        },
+        Empty => {
+          let _sl = sleep_ms(1)
+        },
+        Disconnected => { running = false },
+      }
+    }
+    ret seen
+  }
+  let pump_started = spawn(pump)
+  let pump_handle = match pump_started {
+    Ok(h) => h,
+    Err(_pe) => {
+      let _e = emit_error("could not start the report thread")
+      ret 3
+    },
+  }
+  // Detached on purpose, and this one is worth understanding.
+  //
+  // Telemetry is best effort. If the parent stops reading stdout, the pipe
+  // fills and the pump blocks inside write(2) — where it can never observe
+  // the engine dropping its sender. Joining it would then deadlock
+  // shutdown forever, which is exactly what a supervisor crashing looks
+  // like from in here. Detaching lets the process exit reclaim it, so the
+  // engine's own clean finalize is never held hostage to a reader that
+  // went away.
+  pump_handle.detach()
+
+  let mut st = controller_new()
+  let _s = controller_started(&mut st)
+  let mut backlog: Vec<EngineCommand> = Vec::new()
+
+  // One command per line until stdin closes. A bare "\n" is a blank line
+  // (length 1) and is skipped; length 0 is EOF, which is how this process
+  // learns its parent is gone.
+  let mut reading: bool = true
+  while reading {
+    let line: str = read_line_raw()
+    if line.len() == 0 {
+      reading = false
+    }
+    if line.len() > 1 {
+      let mut plan: Vec<EngineCommand> = Vec::new()
+      let reply = apply_json_command(line, &mut st, &mut plan)
+      let _e = emit(reply)
+      let mut next: Vec<EngineCommand> = Vec::new()
+      cmd_tx = send_commands(cmd_tx, &backlog, &plan, &mut next)
+      backlog = next
+    }
+  }
+
+  // EOF: finalize rather than let the engine outlive its parent. Shutdown
+  // is immediate by contract, so an in-flight render is cut short -- but
+  // the sink is still closed properly, which is what keeps a partial WAV
+  // readable instead of leaving an unpatched RIFF header.
+  let mut bye: Vec<EngineCommand> = Vec::new()
+  bye.push(EngineCommand::Shutdown)
+  let mut pending: Vec<EngineCommand> = Vec::new()
+  cmd_tx = send_commands(cmd_tx, &backlog, &bye, &mut pending)
+
+  let mut guard: i32 = 0
+  while pending.len() > 0 && guard < 2000 {
+    let mut fresh: Vec<EngineCommand> = Vec::new()
+    let mut next2: Vec<EngineCommand> = Vec::new()
+    cmd_tx = send_commands(cmd_tx, &pending, &fresh, &mut next2)
+    pending = next2
+    if pending.len() > 0 {
+      let _sl = sleep_ms(1)
+    }
+    guard = guard + 1
+  }
+
+  ret match engine_handle.join() {
+    Ok(code) => code,
+    Err(_je) => 4,
+  }
+}

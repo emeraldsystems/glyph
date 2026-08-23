@@ -6,6 +6,7 @@ use std::process::Command;
 /// modules here (and only here).
 const RUNTIME_SOURCES: &[&str] = &[
     "glyph_fmt",
+    "glyph_io",
     "glyph_json",
     "glyph_process",
     "glyph_time",

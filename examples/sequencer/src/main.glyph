@@ -14,6 +14,7 @@
 import std
 from seq_control import ControllerState, controller_new, controller_started, apply_json_command, send_commands, note_report, str_eq
 from seq_engine import engine_run
+from seq_server import serve_stdio
 from seq_proto import EngineCommand, EngineReport, sink_wav, sink_live
 from std import println
 from std/audio import WavWriter, wav_create
@@ -80,7 +81,27 @@ fn load_song_command(path: str) -> String {
   }
 }
 
+fn has_flag(args: &Vec<String>, name: str) -> bool {
+  let mut i: i32 = 0
+  while i < args.len() as i32 {
+    let a: str = args[i as usize]
+    if str_eq(a, name) {
+      ret true
+    }
+    i = i + 1
+  }
+  ret false
+}
+
 fn main() -> i32 {
+  let argv_probe: Vec<String> = argv
+  // `--server` hands the whole process over to the stdio protocol in
+  // seq_server.glyph: one JSON command per line instead of a bundled song.
+  // Same binary, so there is one executable to build, ship and bundle.
+  if has_flag(&argv_probe, "--server") {
+    ret serve_stdio()
+  }
+
   let args: Vec<String> = argv
   let target = offline_target(&args)
   let target_str: str = target

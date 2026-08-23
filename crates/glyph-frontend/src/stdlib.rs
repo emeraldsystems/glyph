@@ -331,6 +331,38 @@ pub fn std_modules() -> HashMap<String, Module> {
         span,
     };
 
+    // Reads one line from stdin, INCLUDING its trailing newline.
+    //
+    // The newline is retained deliberately: it is what makes EOF
+    // unambiguous without a second out-parameter, which Glyph cannot
+    // express (there are no scalar `&mut` params). A blank line comes back
+    // as "\n" (length 1); end of input comes back as "" (length 0).
+    //
+    // The returned view is valid until the next call ON THE SAME THREAD;
+    // copy it with String::from_str to keep it.
+    let read_line_extern = ExternFunctionDecl {
+        abi: Some("C".into()),
+        name: Ident("read_line_raw".into()),
+        params: vec![],
+        ret_type: Some(tp("str", span)),
+        link_name: Some("glyph_io_read_line".into()),
+        span,
+    };
+
+    // Stops a closed stdout from killing the process: SIGPIPE's default
+    // action is immediate termination, which gives a program streaming to a
+    // pipe no chance to finalize anything it holds open. Call this once at
+    // startup in a server; leave it alone in a filter that should die
+    // quietly when its reader closes. No-op where SIGPIPE does not exist.
+    let ignore_sigpipe_extern = ExternFunctionDecl {
+        abi: Some("C".into()),
+        name: Ident("ignore_sigpipe".into()),
+        params: vec![],
+        ret_type: Some(tp("i32", span)),
+        link_name: Some("glyph_io_ignore_sigpipe".into()),
+        span,
+    };
+
     let file_struct = StructDef {
         name: Ident("File".into()),
         generic_params: vec![],
@@ -366,6 +398,8 @@ pub fn std_modules() -> HashMap<String, Module> {
             glyph_core::ast::Item::ExternFunction(ftell_extern),
             glyph_core::ast::Item::ExternFunction(rewind_extern),
             glyph_core::ast::Item::ExternFunction(println_extern),
+            glyph_core::ast::Item::ExternFunction(read_line_extern),
+            glyph_core::ast::Item::ExternFunction(ignore_sigpipe_extern),
         ],
     };
     modules.insert("std/io".into(), std_io_module);
