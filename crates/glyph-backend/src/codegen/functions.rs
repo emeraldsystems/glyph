@@ -397,6 +397,143 @@ impl CodegenContext {
                         LLVMBuildStore(self.builder, val, field_ptr);
                     }
                 }
+                MirInst::AssignIndex { base, index, value } => {
+                    self.debug_log(&format!(
+                        "codegen_inst assign_index {}",
+                        self.rvalue_tag(value)
+                    ));
+
+                    let base_ty = func
+                        .locals
+                        .get(base.0 as usize)
+                        .and_then(|l| l.ty.clone())
+                        .ok_or_else(|| anyhow!("indexed assignment base has unknown type"))?;
+                    let mut inner_ty = &base_ty;
+                    while let Type::Ref(inner, _) = inner_ty {
+                        inner_ty = inner.as_ref();
+                    }
+
+                    // Resolve the element type and a pointer to the element slot.
+                    let (elem_ty, elem_ptr) = match inner_ty {
+                        Type::Array(elem, size) => {
+                            let elem = elem.as_ref().clone();
+                            let size = *size;
+                            let slot = *local_map
+                                .get(base)
+                                .ok_or_else(|| anyhow!("undefined local {:?}", base))?;
+                            // A reference local's slot holds a pointer to the
+                            // array; a direct local's slot IS the array alloca.
+                            let array_ptr = if matches!(base_ty, Type::Ref(_, _)) {
+                                let ref_llvm_ty = self.get_llvm_type(&base_ty)?;
+                                LLVMBuildLoad2(
+                                    self.builder,
+                                    ref_llvm_ty,
+                                    slot,
+                                    CString::new("idx.assign.deref")?.as_ptr(),
+                                )
+                            } else {
+                                slot
+                            };
+                            let llvm_array_ty = self.get_llvm_type(inner_ty)?;
+                            let mut index_val = self.codegen_value(index, func, local_map)?;
+                            // Array bounds checks compare in i32.
+                            let i32_index_ty = LLVMInt32TypeInContext(self.context);
+                            index_val = self.coerce_int_value(index_val, i32_index_ty, true);
+                            self.emit_bounds_check(index_val, size)?;
+                            let i32_ty = LLVMInt32TypeInContext(self.context);
+                            let zero = LLVMConstInt(i32_ty, 0, 0);
+                            let mut indices = vec![zero, index_val];
+                            let elem_ptr = LLVMBuildInBoundsGEP2(
+                                self.builder,
+                                llvm_array_ty,
+                                array_ptr,
+                                indices.as_mut_ptr(),
+                                indices.len() as u32,
+                                CString::new("idx.assign.elem")?.as_ptr(),
+                            );
+                            (elem, elem_ptr)
+                        }
+                        Type::App { base: b, args } if b == "Vec" || b.ends_with("::Vec") => {
+                            let elem = args
+                                .first()
+                                .cloned()
+                                .ok_or_else(|| anyhow!("Vec type missing element type"))?;
+                            let ptr = self.codegen_vec_index_ref(
+                                *base, &elem, index, true, func, local_map,
+                            )?;
+                            (elem, ptr)
+                        }
+                        Type::Named(name) if name.starts_with("Vec$") => {
+                            let elem = {
+                                let layout = self.struct_layouts.get(name).ok_or_else(|| {
+                                    anyhow!("missing vec layout for {}", name)
+                                })?;
+                                match &layout.fields.first() {
+                                    Some((_, Type::RawPtr(elem))) => elem.as_ref().clone(),
+                                    _ => bail!("malformed Vec layout for {}", name),
+                                }
+                            };
+                            let ptr = self.codegen_vec_index_ref(
+                                *base, &elem, index, true, func, local_map,
+                            )?;
+                            (elem, ptr)
+                        }
+                        other => bail!(
+                            "indexed assignment target must be a Vec or array, got {:?}",
+                            other
+                        ),
+                    };
+
+                    // Deep-clone non-owning views entering the container, then
+                    // drop the element being overwritten so droppable payloads
+                    // free exactly once.
+                    let mut val = if let Rvalue::Move(src) = value {
+                        let is_view = func
+                            .locals
+                            .get(src.0 as usize)
+                            .map_or(false, |l| l.skip_drop);
+                        let raw = self.codegen_rvalue(value, func, local_map, functions, mir_module)?;
+                        if is_view && Self::type_needs_clone(&elem_ty) {
+                            self.codegen_deep_clone_value(&elem_ty, raw)?
+                        } else {
+                            raw
+                        }
+                    } else {
+                        self.codegen_rvalue(value, func, local_map, functions, mir_module)?
+                    };
+
+                    if Self::field_type_has_drop_glue(&elem_ty) {
+                        self.codegen_drop_elem_slot(elem_ptr, &elem_ty)?;
+                    }
+
+                    let llvm_elem_ty = self.get_llvm_type(&elem_ty)?;
+                    let signed = matches!(elem_ty, Type::I8 | Type::I32 | Type::I64);
+                    val = self.coerce_int_value(val, llvm_elem_ty, signed);
+                    // Width-coerce float stores (f64 literal into f32 slot).
+                    let val_kind = LLVMGetTypeKind(LLVMTypeOf(val));
+                    let elem_kind = LLVMGetTypeKind(llvm_elem_ty);
+                    if Self::is_float_type_kind(val_kind)
+                        && Self::is_float_type_kind(elem_kind)
+                        && LLVMTypeOf(val) != llvm_elem_ty
+                    {
+                        val = if matches!(elem_ty, Type::F64) {
+                            LLVMBuildFPExt(
+                                self.builder,
+                                val,
+                                llvm_elem_ty,
+                                CString::new("idx.assign.fpext")?.as_ptr(),
+                            )
+                        } else {
+                            LLVMBuildFPTrunc(
+                                self.builder,
+                                val,
+                                llvm_elem_ty,
+                                CString::new("idx.assign.fptrunc")?.as_ptr(),
+                            )
+                        };
+                    }
+                    LLVMBuildStore(self.builder, val, elem_ptr);
+                }
                 MirInst::Return(val) => {
                     // Returning a non-owning view (skip_drop) hands ownership
                     // to the caller; deep-clone so the caller's drop doesn't

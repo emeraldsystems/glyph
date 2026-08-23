@@ -824,6 +824,18 @@ impl<'a> LowerCtx<'a> {
                     }
                 }
             }
+            MirInst::AssignIndex { value, .. } => {
+                // The value moves into the container: mark the source Moved so
+                // scope exit doesn't drop it a second time (the container's
+                // own drop now owns it).
+                self.reject_mutex_guard_field_storage(value);
+                self.reject_lexical_loan_field_storage(value);
+                if let Rvalue::Move(src) = value {
+                    if let Some(state) = self.local_states.get_mut(src.0 as usize) {
+                        *state = LocalState::Moved;
+                    }
+                }
+            }
             _ => {}
         }
         self.current_block_mut().insts.push(inst);

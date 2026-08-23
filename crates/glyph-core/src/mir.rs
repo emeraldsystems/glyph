@@ -125,6 +125,11 @@ pub enum MirInst {
         field_index: u32,
         value: Rvalue,
     },
+    AssignIndex {
+        base: LocalId,
+        index: MirValue,
+        value: Rvalue,
+    },
     Return(Option<MirValue>),
     Goto(BlockId),
     If {

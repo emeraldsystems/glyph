@@ -12,7 +12,7 @@ use crate::{CaptureAccess, CaptureOwnership, analyze_function_closure_ownership}
 
 use super::context::{LocalState, LowerCtx};
 use super::expr::{lower_expr, lower_expr_with_expected, lower_value, lower_value_with_expected};
-use super::types::{resolve_type_name, type_expr_to_string};
+use super::types::{resolve_type_name, type_expr_to_string, vec_elem_type_from_type};
 use super::value::{
     coerce_to_bool, expr_span, infer_value_type, local_struct_name, rvalue_from_value,
     update_local_type_from_rvalue,
@@ -225,11 +225,11 @@ pub(crate) fn lower_function(
         lower_block_with_expected(&mut ctx, &func.body, ret_type.as_ref(), false, true);
     let returns_void = ret_type.as_ref().map_or(true, |ty| is_void_type(ty));
     if returns_void {
-        if let Some(value) = implicit_return.as_ref() {
-            if is_void_value(&ctx, value) {
-                implicit_return = None;
-            }
-        }
+        // A void function discards whatever its last expression produced
+        // (e.g. a Vec snapshot from a trailing `.push()`); the value's local
+        // stays live and is dropped with the rest of the scope. Returning it
+        // emitted `ret <aggregate>` in a void LLVM function.
+        implicit_return = None;
     }
     if !ctx.terminated() {
         // If block returned a value, use it; otherwise return void
@@ -987,6 +987,29 @@ pub(crate) fn lower_block_with_expected<'a>(
                                 ctx.push_inst(MirInst::Nop);
                             }
                         }
+                        AssignmentTarget::Index {
+                            base,
+                            index,
+                            elem_type,
+                        } => {
+                            let diags_before = ctx.diagnostics.len();
+                            if let Some(rv) = lower_expr_with_expected(ctx, value, Some(&elem_type))
+                            {
+                                ctx.push_inst(MirInst::AssignIndex {
+                                    base,
+                                    index,
+                                    value: rv,
+                                });
+                            } else {
+                                ensure_lowering_reported(
+                                    ctx,
+                                    diags_before,
+                                    "assignment value",
+                                    expr_span(value).or(Some(*span)),
+                                );
+                                ctx.push_inst(MirInst::Nop);
+                            }
+                        }
                     }
                 } else {
                     ensure_lowering_reported(
@@ -1640,6 +1663,11 @@ enum AssignmentTarget {
         field_index: u32,
         field_type: Type,
     },
+    Index {
+        base: LocalId,
+        index: MirValue,
+        elem_type: Type,
+    },
 }
 
 fn collect_field_chain<'a>(expr: &'a Expr, fields: &mut Vec<&'a Ident>) -> &'a Expr {
@@ -1839,6 +1867,69 @@ fn lower_assignment_target<'a>(
                 field_name: last_field.0.clone(),
                 field_index,
                 field_type,
+            })
+        }
+        Expr::Index {
+            base,
+            index,
+            span: index_span,
+        } => {
+            let Expr::Ident(base_ident, base_span) = base.as_ref() else {
+                ctx.error(
+                    "indexed assignment base must be an identifier (index a local Vec or array; for struct fields, borrow the field into a local first)",
+                    expr_span(base).or(Some(*index_span)),
+                );
+                return None;
+            };
+
+            let base_local = ctx
+                .bindings
+                .get(base_ident.0.as_str())
+                .copied()
+                .or_else(|| {
+                    ctx.error(
+                        format!("unknown identifier '{}'", base_ident.0),
+                        Some(*base_span),
+                    );
+                    None
+                })?;
+
+            if !assignment_root_is_mutable(ctx, base_local, &base_ident.0, *base_span) {
+                return None;
+            }
+
+            let base_ty = ctx
+                .locals
+                .get(base_local.0 as usize)
+                .and_then(|l| l.ty.clone());
+            let elem_type = match base_ty.as_ref() {
+                Some(ty) => {
+                    let mut inner = ty;
+                    while let Type::Ref(inner_ty, _) = inner {
+                        inner = inner_ty.as_ref();
+                    }
+                    if let Type::Array(elem, _) = inner {
+                        Some(elem.as_ref().clone())
+                    } else {
+                        vec_elem_type_from_type(ty)
+                    }
+                }
+                None => None,
+            };
+            let Some(elem_type) = elem_type else {
+                ctx.error(
+                    "indexed assignment target must be a Vec or fixed-size array",
+                    Some(*index_span),
+                );
+                return None;
+            };
+
+            let index_val = lower_value_with_expected(ctx, index, Some(&Type::Usize))?;
+
+            Some(AssignmentTarget::Index {
+                base: base_local,
+                index: index_val,
+                elem_type,
             })
         }
         _ => {
