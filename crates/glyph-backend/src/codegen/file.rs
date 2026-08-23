@@ -103,7 +103,7 @@ impl CodegenContext {
         unsafe { LLVMPositionBuilderAtEnd(self.builder, ok_bb) };
         let file_ty = self.get_struct_type("File")?;
         let file_alloca =
-            unsafe { LLVMBuildAlloca(self.builder, file_ty, CString::new("file.tmp")?.as_ptr()) };
+            unsafe { self.build_entry_alloca(self.builder, file_ty, CString::new("file.tmp")?.as_ptr()) };
         let handle_ptr = unsafe {
             LLVMBuildStructGEP2(
                 self.builder,

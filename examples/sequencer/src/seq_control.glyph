@@ -1,0 +1,498 @@
+// GLYPH-59 -- the control-side facade, shaped for MCP.
+//
+// `apply_json_command` is the seam the MCP server will sit on: JSON text in,
+// JSON text out. When the MCP epic starts, a server is
+//
+//     read a line -> apply_json_command -> send_commands -> write the reply
+//
+// and nothing about the engine has to change.
+//
+// ----------------------------------------------------------------------
+// WHY THIS IS FUNCTIONS OVER A STATE STRUCT, NOT A CONTROLLER OBJECT
+//
+// The ADR sketched a `SequencerController` owning the Sender, the Receiver
+// and the JoinHandle, with methods like `play()` and `shutdown_and_join()`.
+// Glyph cannot express that today, verified by probe during GLYPH-59:
+// a `Sender<T>` / `Receiver<T>` stored as a STRUCT FIELD loses its channel
+// identity, and `self.cmd_tx.try_send(..)` fails with "methods can only be
+// called on struct types". A `Sender` also cannot be passed by reference
+// for the same reason, and there are no scalar `&mut` out-parameters.
+//
+// What DOES work (all probe-verified) is the split used here:
+//   - the channel endpoints stay as locals in whoever owns the session,
+//   - a Sender is moved INTO a function and returned back OUT,
+//   - everything else lives in `ControllerState`, a flat scalar struct
+//     that can be passed as `&mut`.
+//
+// So `apply_json_command` is pure: it parses, validates, updates the
+// control-side mirror, and APPENDS the engine commands it wants sent to an
+// out-Vec. `send_commands` is the only function that touches the channel.
+// That split also puts the lossless-retry policy in exactly one place, and
+// makes the whole JSON surface testable without starting a thread.
+// ----------------------------------------------------------------------
+
+from seq_model import TrackParams, NoteEvent, SongMeta, song_from_object
+from seq_proto import EngineCommand, EngineReport, PatternHeader, PatternNoteMsg, TrackParamsMsg, NoteCmd, GainCmd, PositionReport, BlockReport, default_bpm, max_tracks
+from std/enums import Result, Option
+from std/json import JsonValue, ParseResult
+from std/json/parser import parse, json_get_object, json_get_number, json_get_string
+from std/map import Map
+from std/string import string_from_i32, string_from_f64, string_index_of
+from std/sync/spsc import Sender, TrySendResult
+from std/vec import Vec
+
+// --- Controller state machine (ADR §10) ---
+// 0 Idle (engine not started) -> 1 Running -> 2 Stopping -> 3 Stopped.
+
+fn state_idle() -> u32 { ret 0 }
+fn state_running() -> u32 { ret 1 }
+fn state_stopping() -> u32 { ret 2 }
+fn state_stopped() -> u32 { ret 3 }
+
+// The control-side mirror. Scalars only, so it can live in a struct and be
+// passed as `&mut` -- unlike the channel endpoints.
+struct ControllerState {
+  state: u32,
+  frame: u64,
+  tick: u32,
+  playing: u32,
+  peak: f64,
+  bpm: f64,
+  dropped: u32,
+  stopped_seen: u32,
+  song_tracks: u32,
+  song_notes: u32,
+  song_length_ticks: u32,
+}
+
+fn controller_new() -> ControllerState {
+  ret ControllerState {
+    state: 0,
+    frame: 0,
+    tick: 0,
+    playing: 0,
+    peak: 0.0,
+    bpm: default_bpm(),
+    dropped: 0,
+    stopped_seen: 0,
+    song_tracks: 0,
+    song_notes: 0,
+    song_length_ticks: 0,
+  }
+}
+
+// Called once the engine thread has been spawned.
+fn controller_started(st: &mut ControllerState) -> i32 {
+  st.state = state_running()
+  ret 0
+}
+
+// --- String helpers ---
+// Glyph has no String equality operator. An explicit `let s: str = owned`
+// binding is the String -> str coercion idiom (see examples/apex).
+
+fn str_eq(a: str, b: str) -> bool {
+  if a.len() != b.len() {
+    ret false
+  }
+  ret string_index_of(a, b) == 0
+}
+
+fn json_escape_free(msg: str) -> String {
+  // Every error string in this module is a fixed literal with no quotes or
+  // backslashes, so no escaping pass is needed.
+  ret String::from_str(msg)
+}
+
+fn json_error(msg: str) -> String {
+  let mut s = String::from_str("{\"ok\":false,\"error\":\"")
+  s = s.concat(json_escape_free(msg))
+  s = s.concat(String::from_str("\"}"))
+  ret s
+}
+
+fn json_ok(verb: str) -> String {
+  let mut s = String::from_str("{\"ok\":true,\"cmd\":\"")
+  s = s.concat(String::from_str(verb))
+  s = s.concat(String::from_str("\"}"))
+  ret s
+}
+
+// --- JSON field access ---
+// Routed through helpers with typed parameters: a payload-of-payload match
+// loses the inner binding's type (SEQUENCER_CORE.md §3 constraint #5).
+
+fn cmd_get_num(obj: &Map<String, JsonValue>, key: str) -> Option<f64> {
+  let got = obj.get(String::from_str(key))
+  ret match got {
+    Some(v) => json_get_number(v),
+    None => None,
+  }
+}
+
+fn cmd_get_str(obj: &Map<String, JsonValue>, key: str) -> Option<String> {
+  let got = obj.get(String::from_str(key))
+  ret match got {
+    Some(v) => json_get_string(v),
+    None => None,
+  }
+}
+
+fn cmd_get_obj(obj: &Map<String, JsonValue>, key: str) -> Option<Map<String, JsonValue>> {
+  let got = obj.get(String::from_str(key))
+  ret match got {
+    Some(v) => json_get_object(v),
+    None => None,
+  }
+}
+
+// --- Status reply ---
+// frame is rendered through i32; a render longer than ~12 hours at 48 kHz
+// would need a u64 formatter, which std/string does not expose yet.
+
+fn status_json(st: &ControllerState) -> String {
+  let mut s = String::from_str("{\"ok\":true,\"cmd\":\"status\",\"state\":")
+  s = s.concat(string_from_i32(st.state as i32))
+  s = s.concat(String::from_str(",\"frame\":"))
+  s = s.concat(string_from_i32(st.frame as i32))
+  s = s.concat(String::from_str(",\"tick\":"))
+  s = s.concat(string_from_i32(st.tick as i32))
+  s = s.concat(String::from_str(",\"playing\":"))
+  if st.playing == 1 {
+    s = s.concat(String::from_str("true"))
+  }
+  if st.playing != 1 {
+    s = s.concat(String::from_str("false"))
+  }
+  s = s.concat(String::from_str(",\"peak\":"))
+  s = s.concat(string_from_f64(st.peak))
+  s = s.concat(String::from_str(",\"bpm\":"))
+  s = s.concat(string_from_f64(st.bpm))
+  s = s.concat(String::from_str(",\"dropped_reports\":"))
+  s = s.concat(string_from_i32(st.dropped as i32))
+  s = s.concat(String::from_str(",\"song_tracks\":"))
+  s = s.concat(string_from_i32(st.song_tracks as i32))
+  s = s.concat(String::from_str(",\"song_notes\":"))
+  s = s.concat(string_from_i32(st.song_notes as i32))
+  s = s.concat(String::from_str("}"))
+  ret s
+}
+
+// --- Report ingestion ---
+// Folds one engine report into the control-side mirror. Telemetry is lossy
+// by design, so this is the only thing that keeps control's view current.
+
+fn note_report(st: &mut ControllerState, rep: EngineReport) -> i32 {
+  ret match rep {
+    Position(p) => {
+      st.frame = p.frame
+      st.tick = p.tick
+      if p.playing { st.playing = 1 }
+      if p.playing == false { st.playing = 0 }
+      1
+    },
+    BlockRendered(b) => {
+      st.peak = b.peak
+      2
+    },
+    Overflow(count) => {
+      st.dropped = st.dropped + count
+      3
+    },
+    Stopped(f) => {
+      st.frame = f
+      st.playing = 0
+      st.stopped_seen = st.stopped_seen + 1
+      4
+    },
+  }
+}
+
+// --- Song loading ---
+// Translates the control-side data model (GLYPH-55) into §4's streamed wire
+// form: PatternBegin, one PatternTrack per track, one PatternNote per note,
+// PatternCommit. A pattern cannot cross the channel as one value, because
+// Vec-carrying payloads are not Send (SEQUENCER_CORE.md §3 constraint #2).
+
+fn emit_song(meta: SongMeta, tracks: &Vec<TrackParams>, notes: &Vec<NoteEvent>, out: &mut Vec<EngineCommand>) -> i32 {
+  out.push(EngineCommand::PatternBegin(PatternHeader {
+    length_ticks: meta.length_ticks,
+    track_count: tracks.len() as u32,
+  }))
+  let mut i: i32 = 0
+  while i < tracks.len() as i32 {
+    let t = tracks[i as usize]
+    out.push(EngineCommand::PatternTrack(TrackParamsMsg {
+      track: t.track,
+      waveform: t.waveform,
+      gain: t.gain,
+      attack_ms: t.attack_ms,
+      decay_ms: t.decay_ms,
+      sustain: t.sustain,
+      release_ms: t.release_ms,
+    }))
+    i = i + 1
+  }
+  let mut j: i32 = 0
+  while j < notes.len() as i32 {
+    let n = notes[j as usize]
+    out.push(EngineCommand::PatternNote(PatternNoteMsg {
+      track: n.track,
+      tick: n.tick,
+      length_ticks: n.length_ticks,
+      pitch: n.pitch,
+      velocity: n.velocity,
+    }))
+    j = j + 1
+  }
+  out.push(EngineCommand::PatternCommit)
+  ret 0
+}
+
+fn load_song_reply(st: &ControllerState) -> String {
+  let mut s = String::from_str("{\"ok\":true,\"cmd\":\"load_song\",\"tracks\":")
+  s = s.concat(string_from_i32(st.song_tracks as i32))
+  s = s.concat(String::from_str(",\"notes\":"))
+  s = s.concat(string_from_i32(st.song_notes as i32))
+  s = s.concat(String::from_str(",\"length_ticks\":"))
+  s = s.concat(string_from_i32(st.song_length_ticks as i32))
+  s = s.concat(String::from_str("}"))
+  ret s
+}
+
+// --- The dispatch surface ---
+//
+// JSON in, JSON out. Engine commands the verb implies are APPENDED to
+// `out`; the caller is responsible for actually sending them (see
+// send_commands). A malformed or rejected command appends nothing, so the
+// engine is provably unaffected by a bad request.
+//
+// Verbs: play · stop · rewind · set_tempo{bpm} · render_to{frame}
+//      · note_on{track,pitch,velocity} · note_off{track,pitch}
+//      · set_track_gain{track,gain} · load_song{song} · status · shutdown
+fn apply_json_command(cmd: str, st: &mut ControllerState, out: &mut Vec<EngineCommand>) -> String {
+  let parsed = parse(cmd)
+  let root = match parsed {
+    Ok(v) => v,
+    Err(_e) => { ret json_error("malformed JSON") },
+  }
+  let obj = match json_get_object(root) {
+    Some(o) => o,
+    None => { ret json_error("command must be a JSON object") },
+  }
+  let verb_owned = match cmd_get_str(&obj, "cmd") {
+    Some(s) => s,
+    None => { ret json_error("missing or non-string cmd field") },
+  }
+  let verb: str = verb_owned
+
+  // status is answered from the mirror and never touches the engine, so it
+  // is legal in every state.
+  if str_eq(verb, "status") {
+    ret status_json(st)
+  }
+
+  // ADR §10: commands issued outside Running are refused by the controller
+  // without touching the channel.
+  if st.state != state_running() {
+    ret json_error("engine is not running")
+  }
+
+  if str_eq(verb, "play") {
+    out.push(EngineCommand::Play)
+    ret json_ok("play")
+  }
+  if str_eq(verb, "stop") {
+    out.push(EngineCommand::Stop)
+    ret json_ok("stop")
+  }
+  if str_eq(verb, "rewind") {
+    out.push(EngineCommand::Rewind)
+    ret json_ok("rewind")
+  }
+  if str_eq(verb, "shutdown") {
+    out.push(EngineCommand::Shutdown)
+    st.state = state_stopping()
+    ret json_ok("shutdown")
+  }
+  if str_eq(verb, "set_tempo") {
+    let bpm = match cmd_get_num(&obj, "bpm") {
+      Some(v) => v,
+      None => { ret json_error("set_tempo needs a numeric bpm") },
+    }
+    if bpm <= 0.0 || bpm > 1000.0 {
+      ret json_error("bpm out of range (0, 1000]")
+    }
+    st.bpm = bpm
+    out.push(EngineCommand::SetTempo(bpm))
+    ret json_ok("set_tempo")
+  }
+  if str_eq(verb, "render_to") {
+    let target = match cmd_get_num(&obj, "frame") {
+      Some(v) => v,
+      None => { ret json_error("render_to needs a numeric frame") },
+    }
+    if target < 0.0 {
+      ret json_error("frame must not be negative")
+    }
+    out.push(EngineCommand::RenderTo(target as u64))
+    ret json_ok("render_to")
+  }
+  if str_eq(verb, "note_on") {
+    let track = match cmd_get_num(&obj, "track") {
+      Some(v) => v,
+      None => { ret json_error("note_on needs a numeric track") },
+    }
+    let pitch = match cmd_get_num(&obj, "pitch") {
+      Some(v) => v,
+      None => { ret json_error("note_on needs a numeric pitch") },
+    }
+    let velocity = match cmd_get_num(&obj, "velocity") {
+      Some(v) => v,
+      None => { ret json_error("note_on needs a numeric velocity") },
+    }
+    if track < 0.0 || track >= max_tracks() as f64 {
+      ret json_error("track out of range")
+    }
+    if pitch < 0.0 || pitch > 127.0 {
+      ret json_error("pitch out of MIDI range 0..127")
+    }
+    if velocity < 0.0 || velocity > 1.0 {
+      ret json_error("velocity out of range 0..1")
+    }
+    out.push(EngineCommand::NoteOn(NoteCmd {
+      track: track as u32,
+      pitch: pitch as u32,
+      velocity: velocity,
+    }))
+    ret json_ok("note_on")
+  }
+  if str_eq(verb, "note_off") {
+    let track2 = match cmd_get_num(&obj, "track") {
+      Some(v) => v,
+      None => { ret json_error("note_off needs a numeric track") },
+    }
+    let pitch2 = match cmd_get_num(&obj, "pitch") {
+      Some(v) => v,
+      None => { ret json_error("note_off needs a numeric pitch") },
+    }
+    if track2 < 0.0 || track2 >= max_tracks() as f64 {
+      ret json_error("track out of range")
+    }
+    if pitch2 < 0.0 || pitch2 > 127.0 {
+      ret json_error("pitch out of MIDI range 0..127")
+    }
+    out.push(EngineCommand::NoteOff(NoteCmd {
+      track: track2 as u32,
+      pitch: pitch2 as u32,
+      velocity: 0.0,
+    }))
+    ret json_ok("note_off")
+  }
+  if str_eq(verb, "set_track_gain") {
+    let track3 = match cmd_get_num(&obj, "track") {
+      Some(v) => v,
+      None => { ret json_error("set_track_gain needs a numeric track") },
+    }
+    let gain = match cmd_get_num(&obj, "gain") {
+      Some(v) => v,
+      None => { ret json_error("set_track_gain needs a numeric gain") },
+    }
+    if track3 < 0.0 || track3 >= max_tracks() as f64 {
+      ret json_error("track out of range")
+    }
+    if gain < 0.0 || gain > 4.0 {
+      ret json_error("gain out of range 0..4")
+    }
+    out.push(EngineCommand::SetTrackGain(GainCmd {
+      track: track3 as u32,
+      gain: gain,
+    }))
+    ret json_ok("set_track_gain")
+  }
+  if str_eq(verb, "load_song") {
+    let song_obj = match cmd_get_obj(&obj, "song") {
+      Some(o) => o,
+      None => { ret json_error("load_song needs a song object") },
+    }
+    let mut tracks: Vec<TrackParams> = Vec::new()
+    let mut notes: Vec<NoteEvent> = Vec::new()
+    let meta = song_from_object(&song_obj, &mut tracks, &mut notes)
+    if meta.ok != 1 {
+      // song_from_object leaves the out-Vecs untouched on failure, so
+      // nothing partial can reach the engine.
+      ret json_error("song failed to parse")
+    }
+    if meta.length_ticks == 0 {
+      ret json_error("song length_ticks must be greater than zero")
+    }
+    st.song_tracks = tracks.len() as u32
+    st.song_notes = notes.len() as u32
+    st.song_length_ticks = meta.length_ticks
+    if meta.bpm > 0.0 {
+      st.bpm = meta.bpm
+      out.push(EngineCommand::SetTempo(meta.bpm))
+    }
+    let _e = emit_song(meta, &tracks, &notes, out)
+    ret load_song_reply(st)
+  }
+
+  ret json_error("unknown cmd")
+}
+
+// --- Transport half ---
+//
+// The only function that touches the channel. Commands are LOSSLESS
+// (ADR §4): on Full, `try_send` hands the command back, and it plus every
+// command after it goes to `next_backlog` for the caller's next poll --
+// deferring the tail as well as the failed command is what preserves
+// ordering. On Disconnected the engine is gone and the caller should join.
+//
+// Returns the Sender because Glyph can pass it neither by reference nor as
+// a struct field.
+fn send_commands(tx: Sender<EngineCommand>, backlog: &Vec<EngineCommand>, fresh: &Vec<EngineCommand>, next_backlog: &mut Vec<EngineCommand>) -> Sender<EngineCommand> {
+  let mut blocked: bool = false
+
+  // if/else rather than two bare ifs: the move checker merges ownership
+  // across reachable paths, so pushing `c` in one bare if would make the
+  // try_send(c) in a following one a use-after-move.
+  let mut i: i32 = 0
+  while i < backlog.len() as i32 {
+    let c = backlog[i as usize]
+    if blocked {
+      next_backlog.push(c)
+    } else {
+      let r = tx.try_send(c)
+      match r {
+        Sent => {},
+        Full(back) => {
+          next_backlog.push(back)
+          blocked = true
+        },
+        Disconnected(_d) => { blocked = true },
+      }
+    }
+    i = i + 1
+  }
+
+  let mut j: i32 = 0
+  while j < fresh.len() as i32 {
+    let c2 = fresh[j as usize]
+    if blocked {
+      next_backlog.push(c2)
+    } else {
+      let r2 = tx.try_send(c2)
+      match r2 {
+        Sent => {},
+        Full(back2) => {
+          next_backlog.push(back2)
+          blocked = true
+        },
+        Disconnected(_d2) => { blocked = true },
+      }
+    }
+    j = j + 1
+  }
+
+  ret tx
+}

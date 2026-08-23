@@ -55,6 +55,60 @@ impl CodegenContext {
         Ok(context)
     }
 
+    /// Emits an `alloca` in the current function's ENTRY block, whatever
+    /// block the builder happens to be filling.
+    ///
+    /// This is not cosmetic. LLVM only treats an alloca in the entry block
+    /// as a static frame slot; an alloca in any other block is a *dynamic*
+    /// stack allocation, lowered on AArch64 to an explicit `sub sp, sp, N`
+    /// whose stack is not given back until the function returns. Every
+    /// scratch slot we materialize for a temporary (aggregates, Vec/Map
+    /// headers, clone buffers, …) therefore leaked stack on each pass
+    /// through an enclosing loop, and any long-running Glyph loop
+    /// eventually walked into its stack guard page. On a spawned thread
+    /// that budget is only 512 KB: the sequencer engine (GLYPH-57), which
+    /// loops for as long as it is playing, died after a few thousand
+    /// blocks with EXC_BAD_ACCESS.
+    ///
+    /// Hoisting is safe for these slots because they are scratch — each is
+    /// written before it is read, and none has its address escape past the
+    /// expression that created it.
+    ///
+    /// The unused `builder` parameter keeps this call-compatible with
+    /// `LLVMBuildAlloca` so call sites read exactly as they did before.
+    pub(super) unsafe fn build_entry_alloca(
+        &self,
+        builder: LLVMBuilderRef,
+        ty: LLVMTypeRef,
+        name: *const std::os::raw::c_char,
+    ) -> LLVMValueRef {
+        let current = LLVMGetInsertBlock(builder);
+        if current.is_null() {
+            // No enclosing block to hoist relative to.
+            return LLVMBuildAlloca(builder, ty, name);
+        }
+        let function = LLVMGetBasicBlockParent(current);
+        if function.is_null() {
+            return LLVMBuildAlloca(builder, ty, name);
+        }
+        let entry = LLVMGetEntryBasicBlock(function);
+        if entry.is_null() {
+            return LLVMBuildAlloca(builder, ty, name);
+        }
+
+        // Park at the top of the entry block, emit, then resume exactly
+        // where we were.
+        let first = LLVMGetFirstInstruction(entry);
+        if first.is_null() {
+            LLVMPositionBuilderAtEnd(builder, entry);
+        } else {
+            LLVMPositionBuilderBefore(builder, first);
+        }
+        let slot = LLVMBuildAlloca(builder, ty, name);
+        LLVMPositionBuilderAtEnd(builder, current);
+        slot
+    }
+
     pub(super) fn effective_target_triple(&self) -> Result<CString> {
         if let Some(target_triple) = self.requested_target_triple.as_ref() {
             return Ok(CString::new(target_triple.as_str())?);

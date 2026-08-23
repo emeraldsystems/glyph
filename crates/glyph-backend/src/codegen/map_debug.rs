@@ -383,7 +383,7 @@ impl CodegenContext {
 
         let json_ty = self.get_enum_type("JsonValue")?;
         let tmp =
-            unsafe { LLVMBuildAlloca(self.builder, json_ty, CString::new("json.tmp")?.as_ptr()) };
+            unsafe { self.build_entry_alloca(self.builder, json_ty, CString::new("json.tmp")?.as_ptr()) };
         unsafe { LLVMBuildStore(self.builder, json_val, tmp) };
         let tag_ptr = unsafe {
             LLVMBuildStructGEP2(

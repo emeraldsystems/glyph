@@ -12,7 +12,7 @@ impl CodegenContext {
             .ok_or_else(|| anyhow!("missing vec layout for {}", inst_name))?;
 
         let alloca_name = CString::new("vec.tmp")?;
-        let alloca = unsafe { LLVMBuildAlloca(self.builder, llvm_vec_ty, alloca_name.as_ptr()) };
+        let alloca = unsafe { self.build_entry_alloca(self.builder, llvm_vec_ty, alloca_name.as_ptr()) };
 
         let len_ptr = unsafe {
             LLVMBuildStructGEP2(
@@ -211,7 +211,7 @@ impl CodegenContext {
             .ok_or_else(|| anyhow!("missing vec layout for {}", inst_name))?;
 
         let alloca_name = CString::new("vec.tmp")?;
-        let alloca = unsafe { LLVMBuildAlloca(self.builder, llvm_vec_ty, alloca_name.as_ptr()) };
+        let alloca = unsafe { self.build_entry_alloca(self.builder, llvm_vec_ty, alloca_name.as_ptr()) };
 
         let elem_ptr_ty = self.get_llvm_type(&Type::RawPtr(Box::new(elem_type.clone())))?;
 
@@ -719,7 +719,7 @@ impl CodegenContext {
         // loop: i in [0, current_len)
         unsafe { LLVMPositionBuilderAtEnd(self.builder, copy_loop_bb) };
         let idx_slot = unsafe {
-            LLVMBuildAlloca(self.builder, usize_ty, CString::new("vec.copy.i")?.as_ptr())
+            self.build_entry_alloca(self.builder, usize_ty, CString::new("vec.copy.i")?.as_ptr())
         };
         unsafe { LLVMBuildStore(self.builder, zero, idx_slot) };
         let loop_check_bb = unsafe {
@@ -1152,7 +1152,7 @@ impl CodegenContext {
 
         // loop over elements 0..len
         let idx_slot = unsafe {
-            LLVMBuildAlloca(self.builder, usize_ty, CString::new("vec.drop.i")?.as_ptr())
+            self.build_entry_alloca(self.builder, usize_ty, CString::new("vec.drop.i")?.as_ptr())
         };
         unsafe { LLVMBuildStore(self.builder, zero, idx_slot) };
         let loop_check_bb = unsafe {

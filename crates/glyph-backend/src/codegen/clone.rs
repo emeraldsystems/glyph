@@ -37,9 +37,9 @@ impl CodegenContext {
         }
         unsafe {
             let llvm_ty = LLVMTypeOf(val);
-            let src = LLVMBuildAlloca(self.builder, llvm_ty, CString::new("clone.src")?.as_ptr());
+            let src = self.build_entry_alloca(self.builder, llvm_ty, CString::new("clone.src")?.as_ptr());
             LLVMBuildStore(self.builder, val, src);
-            let dst = LLVMBuildAlloca(self.builder, llvm_ty, CString::new("clone.dst")?.as_ptr());
+            let dst = self.build_entry_alloca(self.builder, llvm_ty, CString::new("clone.dst")?.as_ptr());
             self.codegen_clone_slot(dst, src, ty)?;
             Ok(LLVMBuildLoad2(
                 self.builder,
@@ -732,7 +732,7 @@ impl CodegenContext {
             LLVMBuildStore(self.builder, new_buf, dst_data_ptr);
 
             // for i in 0..len { clone element i }
-            let idx_slot = LLVMBuildAlloca(
+            let idx_slot = self.build_entry_alloca(
                 self.builder,
                 usize_ty,
                 CString::new("clone.vec.idx")?.as_ptr(),
@@ -936,19 +936,19 @@ impl CodegenContext {
             LLVMBuildStore(self.builder, new_array, dst_buckets_ptr);
 
             // outer loop over buckets
-            let idx_slot = LLVMBuildAlloca(
+            let idx_slot = self.build_entry_alloca(
                 self.builder,
                 usize_ty,
                 CString::new("clone.map.idx")?.as_ptr(),
             );
             LLVMBuildStore(self.builder, zero, idx_slot);
             // src chain cursor and dst tail cursor
-            let cur_slot = LLVMBuildAlloca(
+            let cur_slot = self.build_entry_alloca(
                 self.builder,
                 ptr_ty,
                 CString::new("clone.map.cur")?.as_ptr(),
             );
-            let tail_slot = LLVMBuildAlloca(
+            let tail_slot = self.build_entry_alloca(
                 self.builder,
                 ptr_ty,
                 CString::new("clone.map.tail")?.as_ptr(),

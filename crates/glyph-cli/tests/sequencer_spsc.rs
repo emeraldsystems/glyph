@@ -61,7 +61,7 @@ fn build_and_run_in(temp: &TempDir, source: &str) -> Option<i32> {
 }
 
 #[cfg(all(feature = "codegen", unix))]
-const OFFLINE_SEQUENCER: &str = include_str!("../../../examples/sequencer/src/main.glyph");
+const OFFLINE_SEQUENCER: &str = include_str!("../../../tests/fixtures/sequencer/spsc_proof.glyph");
 
 #[cfg(all(feature = "codegen", unix))]
 #[test]

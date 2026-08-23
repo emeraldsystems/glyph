@@ -218,12 +218,12 @@ impl CodegenContext {
             LLVMBuildBr(self.builder, done_bb);
 
             LLVMPositionBuilderAtEnd(self.builder, start_bb);
-            let start_slot = LLVMBuildAlloca(
+            let start_slot = self.build_entry_alloca(
                 self.builder,
                 usize_ty,
                 CString::new("str.trim.start.idx")?.as_ptr(),
             );
-            let end_slot = LLVMBuildAlloca(
+            let end_slot = self.build_entry_alloca(
                 self.builder,
                 usize_ty,
                 CString::new("str.trim.end.idx")?.as_ptr(),
@@ -513,7 +513,7 @@ impl CodegenContext {
         let vec_name = format!("Vec${}", self.type_key(&Type::String));
         let llvm_vec_ty = self.get_struct_type(&vec_name)?;
         let vec_ptr = unsafe {
-            let alloca = LLVMBuildAlloca(
+            let alloca = self.build_entry_alloca(
                 self.builder,
                 llvm_vec_ty,
                 CString::new("str.split.vec")?.as_ptr(),
@@ -563,7 +563,7 @@ impl CodegenContext {
 
         unsafe { LLVMPositionBuilderAtEnd(self.builder, loop_bb) };
         let current_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 self.get_llvm_type(&Type::String)?,
                 CString::new("str.split.curr")?.as_ptr(),
@@ -715,9 +715,9 @@ impl CodegenContext {
         let zero = unsafe { LLVMConstInt(usize_ty, 0, 0) };
 
         let hash_slot =
-            unsafe { LLVMBuildAlloca(self.builder, u64_ty, CString::new("hash.state")?.as_ptr()) };
+            unsafe { self.build_entry_alloca(self.builder, u64_ty, CString::new("hash.state")?.as_ptr()) };
         let idx_slot =
-            unsafe { LLVMBuildAlloca(self.builder, usize_ty, CString::new("hash.idx")?.as_ptr()) };
+            unsafe { self.build_entry_alloca(self.builder, usize_ty, CString::new("hash.idx")?.as_ptr()) };
         unsafe {
             LLVMBuildStore(self.builder, offset, hash_slot);
             LLVMBuildStore(self.builder, zero, idx_slot);

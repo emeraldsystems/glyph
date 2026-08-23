@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -66,6 +67,16 @@ path = "src/main.glyph"
     assert!(exe.exists(), "expected built binary at {}", exe.display());
 
     let run = Command::new(&exe).current_dir(root).output().unwrap();
+    // A signal death yields code() == None, which callers treat as "skipped".
+    // Fail loudly instead: this is how a stack-overflow crash once hid.
+    if let Some(sig) = run.status.signal() {
+        panic!(
+            "program was killed by signal {}\nstdout: {}\nstderr: {}",
+            sig,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
     (run.status.code(), temp)
 }
 

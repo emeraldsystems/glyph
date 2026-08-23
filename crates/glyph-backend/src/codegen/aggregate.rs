@@ -34,7 +34,7 @@ impl CodegenContext {
 
         unsafe {
             let alloca_name = CString::new(format!("{}_tmp", enum_name))?;
-            let alloca = LLVMBuildAlloca(self.builder, llvm_enum, alloca_name.as_ptr());
+            let alloca = self.build_entry_alloca(self.builder, llvm_enum, alloca_name.as_ptr());
             // Zero the full aggregate so inactive variant payloads are well-defined.
             let zero_enum = LLVMConstNull(llvm_enum);
             LLVMBuildStore(self.builder, zero_enum, alloca);
@@ -116,7 +116,7 @@ impl CodegenContext {
 
         unsafe {
             let alloca_name = CString::new("err.tmp")?;
-            let alloca = LLVMBuildAlloca(self.builder, llvm_err, alloca_name.as_ptr());
+            let alloca = self.build_entry_alloca(self.builder, llvm_err, alloca_name.as_ptr());
             let msg_ptr = LLVMBuildStructGEP2(
                 self.builder,
                 llvm_err,
@@ -178,7 +178,7 @@ impl CodegenContext {
         let fields = layout.fields.clone();
 
         let alloca_name = CString::new(format!("{}_tmp", struct_name))?;
-        let alloca = unsafe { LLVMBuildAlloca(self.builder, llvm_struct, alloca_name.as_ptr()) };
+        let alloca = unsafe { self.build_entry_alloca(self.builder, llvm_struct, alloca_name.as_ptr()) };
 
         let mut value_map = HashMap::new();
         for (name, value) in field_values {

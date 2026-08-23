@@ -245,7 +245,7 @@ impl CodegenContext {
             }
             if let Type::Ref(inner, _) = param_ty {
                 if arg_ty.as_ref() == Some(inner.as_ref()) {
-                    let slot = LLVMBuildAlloca(
+                    let slot = self.build_entry_alloca(
                         self.builder,
                         self.get_llvm_type(inner)?,
                         CString::new("callable.arg.addr")?.as_ptr(),
@@ -451,7 +451,7 @@ impl CodegenContext {
         if uses_sret {
             let ret_ty = self.get_llvm_type(&ret)?;
             let slot = unsafe {
-                LLVMBuildAlloca(
+                self.build_entry_alloca(
                     self.builder,
                     ret_ty,
                     CString::new("callable.sret.tmp")?.as_ptr(),

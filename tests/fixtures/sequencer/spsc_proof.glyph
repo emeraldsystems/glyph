@@ -1,0 +1,120 @@
+from std/audio import WavWriter, wav_create
+from std/enums import Result
+from std/math import sin, tau
+from std/sync/spsc import channel, Sender, Receiver, TrySendResult, TryRecvResult
+from std/thread import JoinHandle, ThreadError, spawn
+from std/vec import Vec
+
+struct RenderEvent {
+  at_frame: i32,
+  frames: i32,
+  frequency: f64,
+  gain: f64,
+  queue_depth: i32
+}
+
+fn append_segment(samples: &mut Vec<f64>, event: RenderEvent) {
+  let mut frame: i32 = 0
+  while frame < event.frames {
+    let phase = frame as f64 * tau() * event.frequency / 48000.0
+    samples.push(sin(phase) * event.gain)
+    frame = frame + 1
+  }
+}
+
+fn main() -> i32 {
+  let mut receiver: Receiver<RenderEvent>
+  let sender: Sender<RenderEvent> = channel(8, &mut receiver)
+  let producer: FnOnce<(), i32> = move () -> {
+    let mut output = sender
+    let first = output.try_send(RenderEvent { at_frame: 0, frames: 12000, frequency: 440.0, gain: 0.5, queue_depth: 1 })
+    match first {
+      Sent => {},
+      Full(_event) => { ret 11 },
+      Disconnected(_event) => { ret 21 },
+    }
+    let second = output.try_send(RenderEvent { at_frame: 12000, frames: 12000, frequency: 440.0, gain: 0.0, queue_depth: 2 })
+    match second {
+      Sent => {},
+      Full(_event) => { ret 12 },
+      Disconnected(_event) => { ret 22 },
+    }
+    let third = output.try_send(RenderEvent { at_frame: 24000, frames: 12000, frequency: 660.0, gain: 0.5, queue_depth: 3 })
+    match third {
+      Sent => {},
+      Full(_event) => { ret 13 },
+      Disconnected(_event) => { ret 23 },
+    }
+    let fourth = output.try_send(RenderEvent { at_frame: 36000, frames: 12000, frequency: 660.0, gain: 0.0, queue_depth: 4 })
+    match fourth {
+      Sent => {},
+      Full(_event) => { ret 14 },
+      Disconnected(_event) => { ret 24 },
+    }
+    ret 0
+  }
+
+  let started = spawn(producer)
+  let producer_status = match started {
+    Ok(handle) => match handle.join() {
+      Ok(code) => code,
+      Err(_join_error) => 25,
+    },
+    Err(_spawn_error) => 26,
+  }
+  if producer_status != 0 { ret producer_status }
+
+  let mut samples: Vec<f64> = Vec::new()
+  let mut received: i32 = 0
+  let mut empty_polls: i32 = 0
+  let mut rendered_frames: i32 = 0
+  let mut late_events: i32 = 0
+  let mut peak_queue_depth: i32 = 0
+  let mut disconnected = false
+  while !disconnected {
+    let next = receiver.try_recv()
+    match next {
+      Value(event) => {
+        if event.at_frame < rendered_frames {
+          late_events = late_events + 1
+        }
+        while rendered_frames < event.at_frame {
+          samples.push(0.0)
+          rendered_frames = rendered_frames + 1
+        }
+        if event.queue_depth > peak_queue_depth {
+          peak_queue_depth = event.queue_depth
+        }
+        rendered_frames = rendered_frames + event.frames
+        append_segment(&mut samples, event)
+        received = received + 1
+      },
+      Empty => {
+        empty_polls = empty_polls + 1
+        if empty_polls > 1000 { ret 31 }
+      },
+      Disconnected => { disconnected = true },
+    }
+  }
+  if received != 4 { ret 32 }
+  if samples.len() != 48000 { ret 33 }
+  if rendered_frames != 48000 { ret 34 }
+  if peak_queue_depth != 4 { ret 35 }
+  if late_events != 0 { ret 36 }
+  if empty_polls != 0 { ret 37 }
+
+  let opened = wav_create("sequencer.wav", 48000, 1)
+  ret match opened {
+    Ok(w) => {
+      let mut writer = w
+      match writer.write(&samples) {
+        Ok(_count) => match writer.close() {
+          Ok(_unit) => 0,
+          Err(_close_error) => 42,
+        },
+        Err(_write_error) => 41,
+      }
+    },
+    Err(_open_error) => 40,
+  }
+}

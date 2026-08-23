@@ -1,120 +1,194 @@
+// GLYPH-62 -- the flagship sequencer demo.
+//
+//   glyph run                          play song.json live (macOS)
+//   glyph run -- --offline out.wav     render the identical audio to a WAV
+//
+// Both modes drive the same engine with the same commands and render the
+// same frame range, so the file you get offline is what you heard live.
+//
+// Note how little this file does. It reads a song, wraps it in one JSON
+// command, hands that to the controller, and pumps reports. Everything
+// musical happens on the engine thread; everything here is transport.
+// That is the shape the MCP server will take too -- see the README.
+
+import std
+from seq_control import ControllerState, controller_new, controller_started, apply_json_command, send_commands, note_report, str_eq
+from seq_engine import engine_run
+from seq_proto import EngineCommand, EngineReport, sink_wav, sink_live
+from std import println
 from std/audio import WavWriter, wav_create
 from std/enums import Result
-from std/math import sin, tau
+from std/io import File
+from std/string import string_index_of
 from std/sync/spsc import channel, Sender, Receiver, TrySendResult, TryRecvResult
+from std/sys import argv
 from std/thread import JoinHandle, ThreadError, spawn
+from std/time import sleep_ms
 from std/vec import Vec
 
-struct RenderEvent {
-  at_frame: i32,
-  frames: i32,
-  frequency: f64,
-  gain: f64,
-  queue_depth: i32
+// The bundled song is 2 bars at 120 bpm (7680 ticks = 192000 frames).
+// Play it through twice so the loop wrap is audible.
+fn render_frames() -> u64 { ret 384000 }
+
+fn reply_ok(s: str) -> bool {
+  ret string_index_of(s, "\"ok\":true") > 0
 }
 
-fn append_segment(samples: &mut Vec<f64>, event: RenderEvent) {
-  let mut frame: i32 = 0
-  while frame < event.frames {
-    let phase = frame as f64 * tau() * event.frequency / 48000.0
-    samples.push(sin(phase) * event.gain)
-    frame = frame + 1
+// "" means live playback; anything else is the offline WAV path.
+fn offline_target(args: &Vec<String>) -> String {
+  let mut i: i32 = 0
+  while i < args.len() as i32 {
+    let a: str = args[i as usize]
+    if str_eq(a, "--offline") {
+      if i + 1 < args.len() as i32 {
+        ret args[(i + 1) as usize]
+      }
+      ret String::from_str("sequencer.wav")
+    }
+    i = i + 1
+  }
+  ret String::from_str("")
+}
+
+// One JSON command carries the whole song. The controller expands it into
+// the streamed PatternBegin/Track/Note/Commit wire form, because a pattern
+// cannot cross a channel as a single value.
+//
+// The wrapping happens in its own function because an owned String is
+// single-owner: `text.len()` and `cmd.concat(text)` in the same scope would
+// be a use-after-move. Build it, then take one `str` view at the end.
+fn wrap_load_command(text: String) -> String {
+  let mut cmd = String::from_str("{\"cmd\":\"load_song\",\"song\":")
+  cmd = cmd.concat(text)
+  cmd = cmd.concat(String::from_str("}"))
+  ret cmd
+}
+
+// Returns "" if the song could not be read.
+fn load_song_command(path: str) -> String {
+  let opened = File::open(path)
+  ret match opened {
+    Ok(f) => {
+      let got = f.read_to_string()
+      let _c = f.close()
+      match got {
+        Ok(t) => wrap_load_command(t),
+        Err(_re) => String::from_str(""),
+      }
+    },
+    Err(_e) => String::from_str(""),
   }
 }
 
 fn main() -> i32 {
-  let mut receiver: Receiver<RenderEvent>
-  let sender: Sender<RenderEvent> = channel(8, &mut receiver)
-  let producer: FnOnce<(), i32> = move () -> {
-    let mut output = sender
-    let first = output.try_send(RenderEvent { at_frame: 0, frames: 12000, frequency: 440.0, gain: 0.5, queue_depth: 1 })
-    match first {
-      Sent => {},
-      Full(_event) => { ret 11 },
-      Disconnected(_event) => { ret 21 },
-    }
-    let second = output.try_send(RenderEvent { at_frame: 12000, frames: 12000, frequency: 440.0, gain: 0.0, queue_depth: 2 })
-    match second {
-      Sent => {},
-      Full(_event) => { ret 12 },
-      Disconnected(_event) => { ret 22 },
-    }
-    let third = output.try_send(RenderEvent { at_frame: 24000, frames: 12000, frequency: 660.0, gain: 0.5, queue_depth: 3 })
-    match third {
-      Sent => {},
-      Full(_event) => { ret 13 },
-      Disconnected(_event) => { ret 23 },
-    }
-    let fourth = output.try_send(RenderEvent { at_frame: 36000, frames: 12000, frequency: 660.0, gain: 0.0, queue_depth: 4 })
-    match fourth {
-      Sent => {},
-      Full(_event) => { ret 14 },
-      Disconnected(_event) => { ret 24 },
-    }
-    ret 0
+  let args: Vec<String> = argv
+  let target = offline_target(&args)
+  let target_str: str = target
+  let offline: bool = target_str.len() > 0
+
+  // Taking a `str` view of a String MOVES it, so every owned string here is
+  // viewed exactly once and used only through that view afterwards.
+  let load_cmd = load_song_command("song.json")
+  let load_str: str = load_cmd
+  if load_str.len() == 0 {
+    println("could not read song.json (run this from examples/sequencer)")
+    ret 1
   }
 
-  let started = spawn(producer)
-  let producer_status = match started {
-    Ok(handle) => match handle.join() {
-      Ok(code) => code,
-      Err(_join_error) => 25,
-    },
-    Err(_spawn_error) => 26,
-  }
-  if producer_status != 0 { ret producer_status }
+  let mut cmd_rx: Receiver<EngineCommand>
+  let mut cmd_tx: Sender<EngineCommand> = channel(64, &mut cmd_rx)
+  let mut rep_rx: Receiver<EngineReport>
+  let rep_tx: Sender<EngineReport> = channel(64, &mut rep_rx)
 
-  let mut samples: Vec<f64> = Vec::new()
-  let mut received: i32 = 0
-  let mut empty_polls: i32 = 0
-  let mut rendered_frames: i32 = 0
-  let mut late_events: i32 = 0
-  let mut peak_queue_depth: i32 = 0
-  let mut disconnected = false
-  while !disconnected {
-    let next = receiver.try_recv()
-    match next {
-      Value(event) => {
-        if event.at_frame < rendered_frames {
-          late_events = late_events + 1
-        }
-        while rendered_frames < event.at_frame {
-          samples.push(0.0)
-          rendered_frames = rendered_frames + 1
-        }
-        if event.queue_depth > peak_queue_depth {
-          peak_queue_depth = event.queue_depth
-        }
-        rendered_frames = rendered_frames + event.frames
-        append_segment(&mut samples, event)
-        received = received + 1
-      },
+  // The sink crosses the spawn boundary as scalars. A WAV is opened HERE,
+  // because control owns the path string; a live device is opened on the
+  // engine thread, because audio devices are engine-thread-affine.
+  let mut kind: u32 = sink_live()
+  let mut wav_handle: i32 = 0 - 1
+  if offline {
+    kind = sink_wav()
+    let made = wav_create(target_str, 48000, 1)
+    wav_handle = match made {
+      Ok(w) => w.handle,
+      Err(_e) => { ret 2 },
+    }
+    println("rendering offline...")
+  }
+  if offline == false {
+    println("playing live (ctrl-c to stop early)...")
+  }
+
+  let engine: FnOnce<(), i32> = move () -> {
+    ret engine_run(cmd_rx, rep_tx, kind, wav_handle, 48000, 1)
+  }
+  let started = spawn(engine)
+  let handle = match started {
+    Ok(h) => h,
+    Err(_se) => { ret 3 },
+  }
+
+  let mut st = controller_new()
+  let _s = controller_started(&mut st)
+  let mut backlog: Vec<EngineCommand> = Vec::new()
+
+  let mut plan: Vec<EngineCommand> = Vec::new()
+  let reply = apply_json_command(load_str, &mut st, &mut plan)
+  let reply_str: str = reply
+  if reply_ok(reply_str) == false {
+    println("song.json was rejected:")
+    println(reply_str)
+    ret 4
+  }
+  // RenderTo bounds the render exactly, so offline output is
+  // byte-reproducible instead of a race against shutdown.
+  plan.push(EngineCommand::RenderTo(render_frames()))
+
+  let mut next: Vec<EngineCommand> = Vec::new()
+  cmd_tx = send_commands(cmd_tx, &backlog, &plan, &mut next)
+  backlog = next
+
+  // Pump telemetry until the render lands. Live, this loop is paced by the
+  // audio device's blocking writes on the engine thread.
+  let mut spins: i32 = 0
+  while st.stopped_seen == 0 && spins < 600000 {
+    let got = rep_rx.try_recv()
+    match got {
+      Value(rep) => { let _k = note_report(&mut st, rep) },
       Empty => {
-        empty_polls = empty_polls + 1
-        if empty_polls > 1000 { ret 31 }
+        if backlog.len() > 0 {
+          let mut empty: Vec<EngineCommand> = Vec::new()
+          let mut next2: Vec<EngineCommand> = Vec::new()
+          cmd_tx = send_commands(cmd_tx, &backlog, &empty, &mut next2)
+          backlog = next2
+        }
+        let _sl = sleep_ms(1)
+        spins = spins + 1
       },
-      Disconnected => { disconnected = true },
+      Disconnected => { spins = 600000 },
     }
   }
-  if received != 4 { ret 32 }
-  if samples.len() != 48000 { ret 33 }
-  if rendered_frames != 48000 { ret 34 }
-  if peak_queue_depth != 4 { ret 35 }
-  if late_events != 0 { ret 36 }
-  if empty_polls != 0 { ret 37 }
-
-  let opened = wav_create("sequencer.wav", 48000, 1)
-  ret match opened {
-    Ok(w) => {
-      let mut writer = w
-      match writer.write(&samples) {
-        Ok(_count) => match writer.close() {
-          Ok(_unit) => 0,
-          Err(_close_error) => 42,
-        },
-        Err(_write_error) => 41,
-      }
-    },
-    Err(_open_error) => 40,
+  if st.stopped_seen == 0 {
+    println("engine never reported Stopped")
+    ret 5
   }
+
+  let mut plan2: Vec<EngineCommand> = Vec::new()
+  let bye = apply_json_command("{\"cmd\":\"shutdown\"}", &mut st, &mut plan2)
+  let _bs: str = bye
+  let mut next3: Vec<EngineCommand> = Vec::new()
+  cmd_tx = send_commands(cmd_tx, &backlog, &plan2, &mut next3)
+
+  let status = match handle.join() {
+    Ok(code) => code,
+    Err(_je) => 6,
+  }
+  if status != 0 {
+    println("engine exited with a nonzero status")
+    ret status
+  }
+
+  if offline {
+    println("wrote the render to the requested path")
+  }
+  ret 0
 }

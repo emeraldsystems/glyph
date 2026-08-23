@@ -88,7 +88,7 @@ impl CodegenContext {
             .ok_or_else(|| anyhow!("missing map layout for {}", inst_name))?;
 
         let alloca_name = CString::new("map.tmp")?;
-        let alloca = unsafe { LLVMBuildAlloca(self.builder, llvm_map_ty, alloca_name.as_ptr()) };
+        let alloca = unsafe { self.build_entry_alloca(self.builder, llvm_map_ty, alloca_name.as_ptr()) };
 
         let zero = unsafe { LLVMConstInt(usize_ty, 0, 0) };
         let cap_val = match rvalue {
@@ -457,7 +457,7 @@ impl CodegenContext {
         }
 
         let current_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 bucket_head_llvm_ty,
                 CString::new("map.curr")?.as_ptr(),
@@ -939,7 +939,7 @@ impl CodegenContext {
         self.debug_map_log("get", cap_val, len_val, head_val)?;
 
         let current_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 bucket_head_llvm_ty,
                 CString::new("map.curr")?.as_ptr(),
@@ -1276,14 +1276,14 @@ impl CodegenContext {
         };
 
         let current_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 bucket_head_llvm_ty,
                 CString::new("map.curr")?.as_ptr(),
             )
         };
         let prev_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 bucket_head_llvm_ty,
                 CString::new("map.prev")?.as_ptr(),
@@ -1739,7 +1739,7 @@ impl CodegenContext {
         self.debug_map_log("get", cap_val, len_val, head_val)?;
 
         let current_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 bucket_head_llvm_ty,
                 CString::new("map.curr")?.as_ptr(),
@@ -1945,7 +1945,7 @@ impl CodegenContext {
         };
         if std::env::var("GLYPH_DEBUG_MAP").is_ok() {
             let tmp = unsafe {
-                LLVMBuildAlloca(
+                self.build_entry_alloca(
                     self.builder,
                     llvm_option_ty,
                     CString::new("map.get.opt.tmp")?.as_ptr(),
@@ -2099,7 +2099,7 @@ impl CodegenContext {
         };
 
         let current_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 bucket_head_llvm_ty,
                 CString::new("map.curr")?.as_ptr(),
@@ -2342,7 +2342,7 @@ impl CodegenContext {
         let vec_name = format!("Vec${}", self.type_key(key_type));
         let llvm_vec_ty = self.get_struct_type(&vec_name)?;
         let vec_ptr = unsafe {
-            let alloca = LLVMBuildAlloca(
+            let alloca = self.build_entry_alloca(
                 self.builder,
                 llvm_vec_ty,
                 CString::new("map.keys.vec")?.as_ptr(),
@@ -2413,7 +2413,7 @@ impl CodegenContext {
         };
 
         let idx_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 usize_ty,
                 CString::new("map.keys.idx")?.as_ptr(),
@@ -2421,7 +2421,7 @@ impl CodegenContext {
         };
         unsafe { LLVMBuildStore(self.builder, zero, idx_slot) };
         let current_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 bucket_head_llvm_ty,
                 CString::new("map.keys.curr")?.as_ptr(),
@@ -2676,7 +2676,7 @@ impl CodegenContext {
         let vec_name = format!("Vec${}", self.type_key(value_type));
         let llvm_vec_ty = self.get_struct_type(&vec_name)?;
         let vec_ptr = unsafe {
-            let alloca = LLVMBuildAlloca(
+            let alloca = self.build_entry_alloca(
                 self.builder,
                 llvm_vec_ty,
                 CString::new("map.vals.vec")?.as_ptr(),
@@ -2747,7 +2747,7 @@ impl CodegenContext {
         };
 
         let idx_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 usize_ty,
                 CString::new("map.vals.idx")?.as_ptr(),
@@ -2755,7 +2755,7 @@ impl CodegenContext {
         };
         unsafe { LLVMBuildStore(self.builder, zero, idx_slot) };
         let current_slot = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 bucket_head_llvm_ty,
                 CString::new("map.vals.curr")?.as_ptr(),
@@ -3067,7 +3067,7 @@ impl CodegenContext {
             };
 
             let idx_slot = unsafe {
-                LLVMBuildAlloca(
+                self.build_entry_alloca(
                     self.builder,
                     usize_ty,
                     CString::new("map.drop.idx")?.as_ptr(),
@@ -3076,7 +3076,7 @@ impl CodegenContext {
             unsafe { LLVMBuildStore(self.builder, zero, idx_slot) };
 
             let current_slot = unsafe {
-                LLVMBuildAlloca(
+                self.build_entry_alloca(
                     self.builder,
                     bucket_head_llvm_ty,
                     CString::new("map.drop.curr")?.as_ptr(),

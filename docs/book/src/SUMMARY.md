@@ -5,6 +5,7 @@
 - [Language Basics](language-basics.md)
 - [Closures and Callable Values](closures.md)
 - [Threads and Shared State](concurrency.md)
+- [Building the Sequencer](sequencer.md)
 - [Imports](imports.md)
 - [Cases and Dependencies](cases.md)
 - [Pointers](pointers.md)

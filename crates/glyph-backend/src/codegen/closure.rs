@@ -670,7 +670,7 @@ impl CodegenContext {
             function, signature, captures, functions, mir_module,
         )?;
         let typed_env = unsafe {
-            LLVMBuildAlloca(
+            self.build_entry_alloca(
                 self.builder,
                 artifacts.env_type,
                 CString::new("borrowed.closure.env")?.as_ptr(),

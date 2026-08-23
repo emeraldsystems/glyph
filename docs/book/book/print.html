@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-52de4e19.js";
+            window.path_to_searchindex_js = "searchindex-d2df5439.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-2dc36abc.js"></script>
+        <script src="toc-c681401e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -842,6 +842,189 @@ sequencer, and render loops. Glyph submits prefilled native buffers through the
 blocking audio API; the native device callback only consumes those buffers and
 never invokes Glyph code. Running Glyph DSP or SPSC operations directly in
 that callback is a future protocol, not a current guarantee.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="building-the-sequencer"><a class="header" href="#building-the-sequencer">Building the sequencer</a></h1>
+<p><code>examples/sequencer</code> is a 16-voice synthesizer and pattern sequencer written
+entirely in Glyph. It is worth walking through because it is the first
+program in this book that has to be correct in three dimensions at once:
+it is concurrent, it is real-time, and it is deterministic. Each of those
+pushed back on the design, and the shape the program ended up with is mostly
+a record of that argument.</p>
+<p>Run it with:</p>
+<pre><code class="language-sh">cd examples/sequencer
+glyph run                        # live playback (macOS)
+glyph run -- --offline out.wav   # the identical audio, rendered to a file
+</code></pre>
+<h2 id="two-threads-one-owner-per-thing"><a class="header" href="#two-threads-one-owner-per-thing">Two threads, one owner per thing</a></h2>
+<p>The whole program is two threads that never share memory:</p>
+<pre><code>CONTROL THREAD (main)                 ENGINE THREAD (spawned FnOnce)
+─────────────────────                 ──────────────────────────────
+owns: the Song, as JSON               owns: the 16-voice pool
+      the command Sender                    the sink (WAV or live device)
+      the report Receiver                   the musical clock
+      a mirror of engine state              three pattern buffers
+
+        ── EngineCommand ──▶
+        ◀── EngineReport ───
+</code></pre>
+<p>There is no <code>Mutex</code> anywhere in it. That is not asceticism — it falls out of
+what the two threads actually need. Control needs to express intent; the
+engine needs to make sound. Neither needs to read the other’s memory, so
+two bounded SPSC channels carrying owned messages are enough, and the
+absence of shared state means there is no lock to hold during a render.</p>
+<p>The engine body is an ordinary function that takes ownership of both
+endpoints:</p>
+<pre><code class="language-glyph">fn engine_run(rx: Receiver&lt;EngineCommand&gt;, tx: Sender&lt;EngineReport&gt;,
+              sink_kind: u32, wav_handle: i32, rate: u32, channels: u32) -&gt; i32
+</code></pre>
+<p>so the spawned closure is a one-line forward:</p>
+<pre><code class="language-glyph">let engine: FnOnce&lt;(), i32&gt; = move () -&gt; {
+  ret engine_run(cmd_rx, rep_tx, kind, wav_handle, 48000, 1)
+}
+let started = spawn(engine)
+</code></pre>
+<p>Keeping the loop in a named function rather than inside the closure body is
+worth doing: it is several hundred lines, and a closure body is an awkward
+place to read them.</p>
+<h2 id="each-channel-gets-one-policy"><a class="header" href="#each-channel-gets-one-policy">Each channel gets one policy</a></h2>
+<p>The two directions are not symmetric, and pretending they were would be a
+bug.</p>
+<p><strong>Commands must not be lost.</strong> If the engine misses a <code>NoteOff</code>, a note
+rings forever. So when <code>try_send</code> reports <code>Full</code>, it hands the command back,
+and the controller keeps it for the next poll:</p>
+<pre><code class="language-glyph">let r = tx.try_send(c)
+match r {
+  Sent =&gt; {},
+  Full(back) =&gt; {
+    next_backlog.push(back)
+    blocked = true
+  },
+  Disconnected(_d) =&gt; { blocked = true },
+}
+</code></pre>
+<p>Note the <code>blocked</code> flag. Once one command is deferred, every command behind
+it must be deferred too, or a later command would overtake an earlier one.
+Losslessness alone is not enough; ordering has to survive as well.</p>
+<p><strong>Reports must not block.</strong> Telemetry exists to tell a UI where the playhead
+is. If the engine ever waited to report, a slow reader would stall audio —
+the tail wagging the dog. So the engine never retries inside the render
+loop: on <code>Full</code> it counts a drop and moves on, and the next report that gets
+through is preceded by an <code>Overflow(n)</code>.</p>
+<p>That asymmetry — lossless down, lossy up — is the single most important
+design decision in the program.</p>
+<h2 id="the-engine-owns-the-clock"><a class="header" href="#the-engine-owns-the-clock">The engine owns the clock</a></h2>
+<p>The tempting design is for control to decide when notes happen, since
+control is where the user is. It is also wrong. Control runs on an ordinary
+thread subject to ordinary scheduling; if it decided note times, every note
+would land wherever the OS happened to wake it up.</p>
+<p>Instead control expresses <em>intent</em> — play, 120 bpm, here is a pattern — and
+the engine converts musical time to frames while rendering. A note lands on
+an exact sample because the engine computes which frame it belongs to at the
+moment it fills that block:</p>
+<pre><code class="language-glyph">fn ticks_per_frame(bpm: f64) -&gt; f64 {
+  ret bpm * ppq() as f64 / (60.0 * sample_rate() as f64)
+}
+</code></pre>
+<p>The playhead is recomputed each block from the absolute frame counter:</p>
+<pre><code class="language-glyph">fn playhead_at(span_start_tick: f64, span_start_frame: u64, frame: u64, tpf: f64) -&gt; f64 {
+  ret span_start_tick + (frame - span_start_frame) as f64 * tpf
+}
+</code></pre>
+<p>rather than accumulated with <code>+=</code>. One multiply per block keeps rounding
+error near 1e-6 tick over an hour; repeated addition would drift audibly.
+The span base is reset on play, rewind, and every tempo change, so a tempo
+change is continuous in musical time rather than jumping the playhead.</p>
+<p>Inside a block, the scheduler collects the note edges that fall in this
+block’s tick range, sorts them by frame offset, and renders the block in
+segments between them. That is what makes placement sample-accurate rather
+than block-quantized. Live notes typed by a human <em>are</em> block-quantized, to
+frame 0 of the next block — 5.33 ms, which nobody can hear.</p>
+<h2 id="a-pattern-is-streamed-not-sent"><a class="header" href="#a-pattern-is-streamed-not-sent">A pattern is streamed, not sent</a></h2>
+<p>Here the language pushed back. A <code>Vec</code> cannot cross a spawn boundary today:
+the thread-safety checker fails closed on source-spelled generics, because
+<code>Vec</code> has no canonical resolver identity to check <code>Send</code> against. So there
+is no <code>LoadPattern(Pattern)</code> message.</p>
+<p>Instead a pattern crosses as a stream of flat, scalar-only messages:</p>
+<pre><code>PatternBegin · PatternTrack* · PatternNote* · PatternCommit
+</code></pre>
+<p>and the engine reassembles it into thread-local buffers. It holds three:
+<em>staging</em> (an open <code>Begin</code> window), <em>pending</em> (committed, waiting for its
+swap point) and <em>active</em> (playing). A commit while stopped swaps
+immediately; a commit while playing waits for the next bar line, so a new
+pattern never arrives halfway through a beat.</p>
+<p>This constraint sounds like a limitation, and it is, but the streamed form
+turned out to be a reasonable wire format anyway — it is incremental, it
+needs no allocation on the engine side beyond the buffers, and it maps
+cleanly onto a network protocol later.</p>
+<h2 id="determinism-needs-renderto"><a class="header" href="#determinism-needs-renderto">Determinism needs <code>RenderTo</code></a></h2>
+<p>Offline there is no sleep anywhere in the engine loop, because pacing comes
+only from a live device’s blocking write. An offline render therefore runs
+as fast as the CPU allows, and “play, wait, stop” would produce a file whose
+length depended on thread scheduling.</p>
+<p><code>RenderTo(n)</code> fixes that: play until frame <code>n</code> exactly — with a short final
+block if the target is not a multiple of the block size — then stop and
+report <code>Stopped(n)</code>. The WAV is byte-reproducible, and the acceptance suite
+pins its content hash.</p>
+<p>It also imposes an ordering rule on callers. <code>Shutdown</code> is immediate, so a
+<code>Shutdown</code> queued behind a <code>RenderTo</code> cancels the render. Control must wait
+for <code>Stopped</code> first:</p>
+<pre><code class="language-glyph">while st.stopped_seen == 0 &amp;&amp; spins &lt; 600000 {
+  let got = rep_rx.try_recv()
+  match got {
+    Value(rep) =&gt; { let _k = note_report(&amp;mut st, rep) },
+    Empty =&gt; { let _sl = sleep_ms(1) spins = spins + 1 },
+    Disconnected =&gt; { spins = 600000 },
+  }
+}
+</code></pre>
+<h2 id="where-the-sink-lives"><a class="header" href="#where-the-sink-lives">Where the sink lives</a></h2>
+<p>The obvious design — an enum <code>Sink { Wav(WavWriter), Live(AudioOut) }</code> owned
+by the engine closure — does not work, for two independent reasons worth
+knowing about.</p>
+<p><code>AudioOut</code> is deliberately not <code>Send</code>. Try to capture one in a spawned
+closure and the checker says so: <em>live audio devices are engine-thread-
+affine</em>. An audio device belongs to the thread that feeds it.</p>
+<p>And a <code>match</code> needs an enum <em>value</em>, not a reference, so there is no way to
+write through a writer held inside an enum without moving it out.</p>
+<p>So the sink crosses the boundary as scalars — a kind and a handle — and each
+side opens what it owns. Control opens the WAV, because control owns the
+path string (a borrowed <code>str</code> cannot escape into a closure either). The
+engine opens the live device, because that is where it has to live:</p>
+<pre><code class="language-glyph">let mut handle: i32 = wav_handle
+if sink_kind == sink_live() {
+  let opened = out_open(rate, channels)
+  handle = match opened {
+    Ok(a) =&gt; a.handle,
+    Err(_e) =&gt; { ret 90 },
+  }
+}
+</code></pre>
+<p>Both <code>std/audio</code> writers are transparent <code>{ handle: i32 }</code> wrappers, so
+rebuilding the typed writer at each call site costs nothing and keeps the
+<code>Result</code>-returning API.</p>
+<h2 id="one-more-thing-allocas-in-loops"><a class="header" href="#one-more-thing-allocas-in-loops">One more thing: allocas in loops</a></h2>
+<p>An engine loops for as long as it is playing, which turns out to be an
+unusually demanding thing to ask of a compiler. Early versions of this
+program died after a few thousand blocks with <code>EXC_BAD_ACCESS</code>, always on
+the engine thread, always with a two-frame backtrace.</p>
+<p>The cause was that scratch slots for temporaries were emitted wherever the
+builder happened to be. LLVM only treats an <code>alloca</code> in a function’s <em>entry</em>
+block as a static frame slot; anywhere else it becomes a dynamic stack
+allocation that is not reclaimed until the function returns. Every pass
+through the render loop leaked a little stack, and a spawned thread only has
+512 KB of it.</p>
+<p>The fix was to hoist those allocas to the entry block. It is mentioned here
+because it is the kind of bug that only a long-running loop finds, and an
+audio engine is the most patient loop you will write.</p>
+<h2 id="where-to-look-next"><a class="header" href="#where-to-look-next">Where to look next</a></h2>
+<ul>
+<li><a href="https://github.com/emeraldsystems/glyph/tree/master/examples/sequencer"><code>examples/sequencer/README.md</code></a>
+— the file-by-file map and the JSON command surface.</li>
+<li><code>docs/design/SEQUENCER_CORE.md</code> — the full contract, including every
+message and the verified platform constraints behind it.</li>
+<li><code>crates/glyph-cli/tests/seq_acceptance.rs</code> — determinism, command floods,
+transport chaos, a long-run heap check, and the latency bound.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="imports-1"><a class="header" href="#imports-1">Imports</a></h1>
 <p>Glyph uses file-based modules. Each <code>.glyph</code> file is a module, and you import

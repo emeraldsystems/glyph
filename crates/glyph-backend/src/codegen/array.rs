@@ -15,7 +15,7 @@ impl CodegenContext {
         let array_ty = Type::Array(Box::new(elem_type.clone()), elements.len());
         let llvm_array_ty = self.get_llvm_type(&array_ty)?;
         let alloca_name = CString::new("array.tmp")?;
-        let alloca = unsafe { LLVMBuildAlloca(self.builder, llvm_array_ty, alloca_name.as_ptr()) };
+        let alloca = unsafe { self.build_entry_alloca(self.builder, llvm_array_ty, alloca_name.as_ptr()) };
 
         let i32_ty = unsafe { LLVMInt32TypeInContext(self.context) };
         let zero = unsafe { LLVMConstInt(i32_ty, 0, 0) };

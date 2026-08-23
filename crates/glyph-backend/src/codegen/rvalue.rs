@@ -931,7 +931,7 @@ impl CodegenContext {
                     let mut llvm_args: Vec<LLVMValueRef> = Vec::new();
                     if let Some(ret_ty) = sret_type.as_ref() {
                         let llvm_ret_ty = self.get_llvm_type(ret_ty)?;
-                        let slot = LLVMBuildAlloca(
+                        let slot = self.build_entry_alloca(
                             self.builder,
                             llvm_ret_ty,
                             CString::new("sret.tmp")?.as_ptr(),
@@ -981,7 +981,7 @@ impl CodegenContext {
                             if let Type::Ref(inner, _) = param_ty {
                                 if arg_ty.as_ref() == Some(inner.as_ref()) {
                                     let inner_llvm_ty = self.get_llvm_type(inner)?;
-                                    let slot = LLVMBuildAlloca(
+                                    let slot = self.build_entry_alloca(
                                         self.builder,
                                         inner_llvm_ty,
                                         CString::new("arg.addr")?.as_ptr(),

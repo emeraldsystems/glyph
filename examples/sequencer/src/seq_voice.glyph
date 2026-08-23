@@ -207,6 +207,80 @@ fn voices_choke(vi: &mut Vec<u32>, vf: &mut Vec<f64>) -> i32 {
   ret count
 }
 
+// Releases every active voice using its own release time, as if each had
+// received a note_off. Used when the active pattern is swapped out from
+// under sounding notes: their note_off events belonged to the old note
+// list and will never be scheduled again, so without this they would ring
+// forever. The per-voice release ramp is what keeps the swap click-free
+// (unlike voices_choke, which forces a uniform 5 ms stop).
+fn voices_release_all(vi: &mut Vec<u32>, vf: &mut Vec<f64>) -> i32 {
+  let stride_i: i32 = vi_stride()
+  let stride_f: i32 = vf_stride()
+  let mut idx: i32 = 0
+  let mut count: i32 = 0
+  while idx < voice_count() {
+    let base: usize = (idx * stride_i) as usize
+    if vi[base] != 0 {
+      let stage = vi[base + 3]
+      if stage < 4 {
+        let fbase: usize = (idx * stride_f) as usize
+        let level: f64 = vf[fbase + 3]
+        let release_frames: f64 = vf[fbase + 7]
+        vf[fbase + 7] = level / release_frames
+        vi[base + 3] = 4
+        count = count + 1
+      }
+    }
+    idx = idx + 1
+  }
+  ret count
+}
+
+// Hard-stops every voice with no release ramp. Used where rendering must
+// end on an exact frame (RenderTo) or has already ended (shutdown), so the
+// click a hard cut would cause is never rendered. Prefer voices_choke for
+// a musical stop.
+fn voices_silence_all(vi: &mut Vec<u32>, vf: &mut Vec<f64>) -> i32 {
+  let stride_i: i32 = vi_stride()
+  let stride_f: i32 = vf_stride()
+  let mut idx: i32 = 0
+  let mut count: i32 = 0
+  while idx < voice_count() {
+    let base: usize = (idx * stride_i) as usize
+    if vi[base] != 0 {
+      count = count + 1
+    }
+    vi[base] = 0
+    vi[base + 3] = 0
+    let fbase: usize = (idx * stride_f) as usize
+    vf[fbase + 3] = 0.0
+    idx = idx + 1
+  }
+  ret count
+}
+
+// Retunes the gain of every voice already sounding on a track, so a live
+// gain change is audible on held notes instead of only on the next one.
+fn voices_set_track_gain(vi: &mut Vec<u32>, vf: &mut Vec<f64>, track: u32, gain: f64) -> i32 {
+  let stride_i: i32 = vi_stride()
+  let stride_f: i32 = vf_stride()
+  let mut idx: i32 = 0
+  let mut count: i32 = 0
+  while idx < voice_count() {
+    let base: usize = (idx * stride_i) as usize
+    if vi[base] != 0 {
+      let vtrack = vi[base + 1]
+      if vtrack == track {
+        let fbase: usize = (idx * stride_f) as usize
+        vf[fbase + 4] = gain
+        count = count + 1
+      }
+    }
+    idx = idx + 1
+  }
+  ret count
+}
+
 fn voices_active_count(vi: &Vec<u32>) -> i32 {
   let stride_i: i32 = vi_stride()
   let mut idx: i32 = 0

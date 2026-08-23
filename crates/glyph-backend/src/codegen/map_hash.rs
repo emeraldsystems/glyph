@@ -74,7 +74,7 @@ impl CodegenContext {
                         let value = self.codegen_value(key, func, local_map)?;
                         let elem_ty = self.get_llvm_type(key_type)?;
                         let tmp = unsafe {
-                            LLVMBuildAlloca(
+                            self.build_entry_alloca(
                                 self.builder,
                                 elem_ty,
                                 CString::new("hash.key.tmp")?.as_ptr(),
