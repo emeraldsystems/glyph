@@ -1,0 +1,220 @@
+from std/enums import Result
+from std/sync/spsc import channel, Sender, Receiver, TrySendResult, TryRecvResult
+from std/thread import JoinHandle, ThreadError, spawn
+from std/vec import Vec
+
+// Flat, scalar-only messages: proven to cross SPSC + spawn boundaries.
+struct PatternHeader {
+  length_ticks: u32,
+  track_count: u32,
+}
+
+struct PatternNoteMsg {
+  track: u32,
+  tick: u32,
+  length_ticks: u32,
+  pitch: u32,
+  velocity: f64,
+}
+
+struct TrackParamsMsg {
+  track: u32,
+  waveform: u32,
+  gain: f64,
+  attack_ms: f64,
+  decay_ms: f64,
+  sustain: f64,
+  release_ms: f64,
+}
+
+struct NoteCmd {
+  track: u32,
+  pitch: u32,
+  velocity: f64,
+}
+
+struct GainCmd {
+  track: u32,
+  gain: f64,
+}
+
+enum EngineCommand {
+  Play,
+  Stop,
+  Rewind,
+  SetTempo(f64),
+  RenderTo(u64),
+  PatternBegin(PatternHeader),
+  PatternNote(PatternNoteMsg),
+  PatternTrack(TrackParamsMsg),
+  PatternCommit,
+  NoteOn(NoteCmd),
+  NoteOff(NoteCmd),
+  SetTrackGain(GainCmd),
+  Shutdown,
+}
+
+struct BlockReport {
+  frame: u64,
+  peak: f64,
+}
+
+struct PositionReport {
+  frame: u64,
+  tick: u32,
+  playing: bool,
+}
+
+enum EngineReport {
+  Position(PositionReport),
+  BlockRendered(BlockReport),
+  Overflow(u32),
+  Stopped(u64),
+}
+
+// Engine-side pattern storage: flat event list + per-track params,
+// all thread-local Vecs assembled from the stream.
+fn main() -> i32 {
+  let mut cmd_rx: Receiver<EngineCommand>
+  let cmd_tx: Sender<EngineCommand> = channel(64, &mut cmd_rx)
+  let mut rep_rx: Receiver<EngineReport>
+  let rep_tx: Sender<EngineReport> = channel(64, &mut rep_rx)
+
+  let s1 = cmd_tx.try_send(EngineCommand::PatternBegin(PatternHeader { length_ticks: 3840, track_count: 1 }))
+  match s1 { Sent => {}, Full(_c1) => { ret 10 }, Disconnected(_d1) => { ret 11 }, }
+  let s2 = cmd_tx.try_send(EngineCommand::PatternTrack(TrackParamsMsg { track: 0, waveform: 0, gain: 0.8, attack_ms: 5.0, decay_ms: 50.0, sustain: 0.7, release_ms: 80.0 }))
+  match s2 { Sent => {}, Full(_c2) => { ret 12 }, Disconnected(_d2) => { ret 13 }, }
+  let s3 = cmd_tx.try_send(EngineCommand::PatternNote(PatternNoteMsg { track: 0, tick: 0, length_ticks: 480, pitch: 60, velocity: 0.9 }))
+  match s3 { Sent => {}, Full(_c3) => { ret 14 }, Disconnected(_d3) => { ret 15 }, }
+  let s4 = cmd_tx.try_send(EngineCommand::PatternNote(PatternNoteMsg { track: 0, tick: 960, length_ticks: 480, pitch: 64, velocity: 0.8 }))
+  match s4 { Sent => {}, Full(_c4) => { ret 16 }, Disconnected(_d4) => { ret 17 }, }
+  let s5 = cmd_tx.try_send(EngineCommand::PatternCommit)
+  match s5 { Sent => {}, Full(_c5) => { ret 18 }, Disconnected(_d5) => { ret 19 }, }
+  let s6 = cmd_tx.try_send(EngineCommand::Play)
+  match s6 { Sent => {}, Full(_c6) => { ret 30 }, Disconnected(_d6) => { ret 31 }, }
+  let s7 = cmd_tx.try_send(EngineCommand::Shutdown)
+  match s7 { Sent => {}, Full(_c7) => { ret 32 }, Disconnected(_d7) => { ret 33 }, }
+
+  let engine: FnOnce<(), i32> = move () -> {
+    let mut rx = cmd_rx
+    let tx = rep_tx
+    let mut staged_notes: Vec<PatternNoteMsg> = Vec::new()
+    let mut staged_len: u32 = 0
+    let mut committed: bool = false
+    let mut track_gain: f64 = 0.0
+    let mut playing: bool = false
+    let mut running: bool = true
+    while running {
+      let got = rx.try_recv()
+      match got {
+        Value(cmd) => match cmd {
+          Play => { playing = true },
+          Stop => { playing = false },
+          Rewind => {},
+          SetTempo(_bpm) => {},
+          RenderTo(_frames) => {},
+          PatternBegin(h) => {
+            staged_notes = Vec::new()
+            staged_len = h.length_ticks
+          },
+          PatternTrack(t) => { track_gain = t.gain },
+          PatternNote(n) => { staged_notes.push(n) },
+          PatternCommit => { committed = true },
+          NoteOn(_nc) => {},
+          NoteOff(_nc2) => {},
+          SetTrackGain(_gc) => {},
+          Shutdown => { running = false },
+        },
+        Empty => {},
+        Disconnected => { running = false },
+      }
+    }
+    // Prove the engine assembled the streamed pattern locally.
+    let mut checksum: u64 = staged_len as u64
+    if committed { checksum = checksum + 1 }
+    if playing { checksum = checksum + 2 }
+    if track_gain > 0.7 { checksum = checksum + 4 }
+    let mut i: i32 = 0
+    while i < staged_notes.len() as i32 {
+      let note = staged_notes[i as usize]
+      checksum = checksum + note.pitch as u64
+      i = i + 1
+    }
+    let r0 = tx.try_send(EngineReport::Position(PositionReport { frame: 0, tick: 0, playing: true }))
+    match r0 { Sent => {}, Full(_p0) => {}, Disconnected(_pd0) => {}, }
+    let rov = tx.try_send(EngineReport::Overflow(0))
+    match rov { Sent => {}, Full(_ov) => {}, Disconnected(_ovd) => {}, }
+    let r1 = tx.try_send(EngineReport::BlockRendered(BlockReport { frame: 256, peak: 0.5 }))
+    match r1 { Sent => {}, Full(_r) => {}, Disconnected(_rd) => {}, }
+    let r2 = tx.try_send(EngineReport::Stopped(checksum))
+    match r2 { Sent => {}, Full(_r2) => {}, Disconnected(_rd2) => {}, }
+    ret 0
+  }
+
+  let started = spawn(engine)
+  let status: i32 = match started {
+    Ok(handle) => match handle.join() {
+      Ok(code) => code,
+      Err(_je) => 0 - 20,
+    },
+    Err(_se) => 0 - 21,
+  }
+  if status != 0 { ret 22 }
+
+  let g0 = rep_rx.try_recv()
+  let pos_ok: i32 = match g0 {
+    Value(rep0) => check_position(rep0),
+    Empty => 41,
+    Disconnected => 42,
+  }
+  if pos_ok != 0 { ret pos_ok }
+  let gov = rep_rx.try_recv()
+  let ov_ok: i32 = match gov {
+    Value(repov) => check_overflow(repov),
+    Empty => 43,
+    Disconnected => 44,
+  }
+  if ov_ok != 0 { ret ov_ok }
+  let g1 = rep_rx.try_recv()
+  let block_ok: i32 = match g1 {
+    Value(rep1) => check_block(rep1),
+    Empty => 25,
+    Disconnected => 26,
+  }
+  if block_ok != 0 { ret block_ok }
+  let g2 = rep_rx.try_recv()
+  ret match g2 {
+    Value(rep2) => check_stopped(rep2),
+    Empty => 29,
+    Disconnected => 30,
+  }
+}
+
+fn check_position(rep: EngineReport) -> i32 {
+  ret match rep {
+    Position(p) => { if p.playing { 0 } else { 45 } },
+    _ => 46,
+  }
+}
+
+fn check_overflow(rep: EngineReport) -> i32 {
+  ret match rep {
+    Overflow(count) => { if count == 0 { 0 } else { 47 } },
+    _ => 48,
+  }
+}
+
+fn check_block(rep: EngineReport) -> i32 {
+  ret match rep {
+    BlockRendered(b) => { if b.frame != 256 { 23 } else { 0 } },
+    _ => 24,
+  }
+}
+
+fn check_stopped(rep: EngineReport) -> i32 {
+  ret match rep {
+    // 3840 + 1 (committed) + 2 (playing) + 4 (gain) + 60 + 64 = 3971
+    Stopped(sum) => { if sum == 3971 { 0 } else { 27 } },
+    _ => 28,
+  }
+}
