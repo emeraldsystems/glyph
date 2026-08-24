@@ -1,7 +1,0 @@
-[package]
-name = "sequencer"
-version = "0.1.0"
-
-[[bin]]
-name = "sequencer"
-path = "src/main.glyph"

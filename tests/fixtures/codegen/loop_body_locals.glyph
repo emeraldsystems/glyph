@@ -1,0 +1,115 @@
+// GLYPH-68 regression: locals declared inside a loop body must not leak
+// stack.
+//
+// In LLVM, only an alloca in a function's ENTRY block is a static frame
+// slot. An alloca emitted anywhere else is a dynamic stack allocation and
+// is not reclaimed until the function returns. The backend used to emit
+// `let` bindings in place, so every binding inside a loop body moved the
+// stack pointer down and nothing ever moved it back: a long-running loop
+// walked into the guard page and the process died with SIGBUS.
+//
+// This fixture asserts nothing about its output. It only has to FINISH.
+// A leak of even a few bytes per iteration cannot survive the iteration
+// counts below.
+//
+// The work runs on a spawned thread on purpose. That is where the bug
+// originally bit, and it is the sensitive case: a spawned thread's stack
+// is a fraction of the main thread's (512 KB on macOS, against 8 MB), so
+// a leak that might hide on `main` is fatal here.
+
+from std/thread import JoinHandle, ThreadError, spawn
+
+struct Chunk {
+  a: f64,
+  b: f64,
+  c: f64,
+  d: f64,
+  e: f64,
+  f: f64,
+  g: f64,
+  h: f64,
+}
+
+// Each iteration binds roughly 200 bytes of locals. At 100_000 iterations
+// a per-iteration leak needs ~20 MB of stack — two orders of magnitude
+// past a thread's budget, so a regression cannot squeak through.
+fn churn(iterations: i32) -> f64 {
+  let mut total: f64 = 0.0
+  let mut i: i32 = 0
+
+  while i < iterations {
+    // Plain scalar bindings in a loop body.
+    let x: f64 = i as f64
+    let y: f64 = x * 0.5
+    let z: f64 = y + 1.0
+
+    // An aggregate, which is where a leak grows fastest: a struct binding
+    // is a whole slot, not a register.
+    let chunk = Chunk { a: x, b: y, c: z, d: x + y, e: y + z, f: z + x, g: x * y, h: y * z }
+    let scaled = Chunk {
+      a: chunk.a * 2.0,
+      b: chunk.b * 2.0,
+      c: chunk.c * 2.0,
+      d: chunk.d * 2.0,
+      e: chunk.e * 2.0,
+      f: chunk.f * 2.0,
+      g: chunk.g * 2.0,
+      h: chunk.h * 2.0,
+    }
+
+    // A nested block is not the entry block either, so its bindings leaked
+    // by exactly the same mechanism. Both arms bind, so neither branch is
+    // the only one covered.
+    if i % 2 == 0 {
+      let even_part = scaled.a + scaled.c + scaled.e + scaled.g
+      total = total + even_part
+    } else {
+      let odd_part = scaled.b + scaled.d + scaled.f + scaled.h
+      total = total + odd_part
+    }
+
+    // A nested loop, so the inner body's bindings are entered and left
+    // many times per outer iteration.
+    let mut j: i32 = 0
+    while j < 4 {
+      let inner = Chunk { a: total, b: x, c: y, d: z, e: x, f: y, g: z, h: total }
+      total = total + inner.a * 0.0 + 1.0
+      j = j + 1
+    }
+
+    i = i + 1
+  }
+
+  ret total
+}
+
+fn main() -> i32 {
+  // On a spawned thread first: the small-stack case.
+  let worker: FnOnce<(), i32> = move () -> {
+    let produced = churn(100000)
+    if produced > 0.0 { ret 0 }
+    ret 3
+  }
+
+  let started = spawn(worker)
+  let thread_status = match started {
+    Ok(handle) => match handle.join() {
+      Ok(code) => code,
+      Err(_e) => 4,
+    },
+    Err(_se) => 5,
+  }
+
+  if thread_status != 0 {
+    ret thread_status
+  }
+
+  // And on the main thread, so a regression that only affects the main
+  // stack is still caught.
+  let on_main = churn(100000)
+  if on_main <= 0.0 {
+    ret 6
+  }
+
+  ret 0
+}

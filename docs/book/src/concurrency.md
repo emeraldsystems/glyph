@@ -122,11 +122,12 @@ pre-allocated sequencer-to-render event path. Endpoint destruction can drain
 values and free memory, so arrange for final endpoint drops on an ordinary
 control or render thread.
 
-The tracked sequencer acceptance example and its metric definitions are in
-[`examples/sequencer`](../../../examples/sequencer/README.md). Its offline
-golden uses sample-frame timestamps for deterministic rendering; its opt-in
-live producer uses absolute monotonic `sleep_until_ns` deadlines and reports
-scheduler jitter without ever running Glyph code in the device callback.
+The tracked sequencer acceptance example and its metric definitions now
+live with the GlyphAudio engine; [the sequencer chapter](sequencer.md)
+walks through it. Its offline golden uses sample-frame timestamps for
+deterministic rendering; its opt-in live producer uses absolute monotonic
+`sleep_until_ns` deadlines and reports scheduler jitter without ever
+running Glyph code in the device callback.
 
 ## Hard real-time boundary
 

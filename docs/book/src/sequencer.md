@@ -1,19 +1,32 @@
 # Building the sequencer
 
-`examples/sequencer` is a 16-voice synthesizer and pattern sequencer written
+The sequencer is a 16-voice synthesizer and pattern sequencer written
 entirely in Glyph. It is worth walking through because it is the first
 program in this book that has to be correct in three dimensions at once:
 it is concurrent, it is real-time, and it is deterministic. Each of those
 pushed back on the design, and the shape the program ended up with is mostly
 a record of that argument.
 
-Run it with:
+It began life here as `examples/sequencer` and has since become the audio
+engine of **GlyphAudio**, a separate application, where it lives in that
+project's `engine/` directory. That move is why this chapter describes the
+program rather than shipping it: it is application code that outgrew being
+an example. What it demonstrates about the language is unchanged, and it
+remains the largest Glyph program written — which is most of why it is
+worth reading.
+
+From a GlyphAudio checkout:
 
 ```sh
-cd examples/sequencer
+cd engine
 glyph run                        # live playback (macOS)
 glyph run -- --offline out.wav   # the identical audio, rendered to a file
+glyph run -- --server            # newline-delimited JSON on stdin/stdout
 ```
+
+The language-level contracts this chapter leans on are still exercised in
+this repository by `tests/fixtures/sequencer/`, so the ideas below cannot
+quietly stop compiling.
 
 ## Two threads, one owner per thing
 
@@ -231,11 +244,20 @@ The fix was to hoist those allocas to the entry block. It is mentioned here
 because it is the kind of bug that only a long-running loop finds, and an
 audio engine is the most patient loop you will write.
 
+Relying on that is not a testing strategy, though, so the regression is now
+pinned directly: `tests/fixtures/codegen/loop_body_locals.glyph` leaks
+nothing but stack if the hoist regresses, and its driver also reads the
+emitted IR and insists every `alloca` sits in its function's entry block.
+That check runs in milliseconds and names the offending function, instead
+of waiting for an audio engine to die three layers away.
+
 ## Where to look next
 
-- [`examples/sequencer/README.md`](https://github.com/emeraldsystems/glyph/tree/master/examples/sequencer)
-  — the file-by-file map and the JSON command surface.
 - `docs/design/SEQUENCER_CORE.md` — the full contract, including every
   message and the verified platform constraints behind it.
-- `crates/glyph-cli/tests/seq_acceptance.rs` — determinism, command floods,
-  transport chaos, a long-run heap check, and the latency bound.
+- `tests/fixtures/sequencer/` — the language-level contract and SPSC
+  proofs, which stayed in this repository.
+- The GlyphAudio project — the engine itself, its `engine/README.md`
+  file-by-file map, the JSON command surface, and the acceptance suite
+  covering determinism, command floods, transport chaos, the long-run heap
+  check, and the latency bound.
