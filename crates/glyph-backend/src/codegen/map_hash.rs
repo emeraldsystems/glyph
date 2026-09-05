@@ -32,11 +32,17 @@ impl CodegenContext {
         mir_module: &MirModule,
     ) -> Result<LLVMValueRef> {
         match key_type {
-            Type::I8 | Type::I32 | Type::I64 => {
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
                 let val = self.codegen_value(key, func, local_map)?;
                 self.cast_int_to_u64(val, true)
             }
-            Type::U8 | Type::U32 | Type::U64 | Type::Usize | Type::Bool | Type::Char => {
+            Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Usize
+            | Type::Bool
+            | Type::Char => {
                 let val = self.codegen_value(key, func, local_map)?;
                 self.cast_int_to_u64(val, false)
             }
@@ -110,7 +116,7 @@ impl CodegenContext {
         mir_module: &MirModule,
     ) -> Result<LLVMValueRef> {
         match key_type {
-            Type::I8 | Type::I32 | Type::I64 => {
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
                 let llvm_ty = self.get_llvm_type(key_type)?;
                 let val = unsafe {
                     LLVMBuildLoad2(
@@ -122,7 +128,13 @@ impl CodegenContext {
                 };
                 self.cast_int_to_u64(val, true)
             }
-            Type::U8 | Type::U32 | Type::U64 | Type::Usize | Type::Bool | Type::Char => {
+            Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Usize
+            | Type::Bool
+            | Type::Char => {
                 let llvm_ty = self.get_llvm_type(key_type)?;
                 let val = unsafe {
                     LLVMBuildLoad2(

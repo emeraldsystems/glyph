@@ -135,9 +135,11 @@ impl CodegenContext {
     pub(super) fn type_key(&self, ty: &Type) -> String {
         match ty {
             Type::I8 => "i8".into(),
+            Type::I16 => "i16".into(),
             Type::I32 => "i32".into(),
             Type::I64 => "i64".into(),
             Type::U8 => "u8".into(),
+            Type::U16 => "u16".into(),
             Type::U32 => "u32".into(),
             Type::U64 => "u64".into(),
             Type::Usize => "usize".into(),
@@ -272,9 +274,11 @@ impl CodegenContext {
         unsafe {
             Ok(match ty {
                 Type::I8 => LLVMInt8TypeInContext(self.context),
+                Type::I16 => LLVMInt16TypeInContext(self.context),
                 Type::I32 => LLVMInt32TypeInContext(self.context),
                 Type::I64 => LLVMInt64TypeInContext(self.context),
                 Type::U8 => LLVMInt8TypeInContext(self.context),
+                Type::U16 => LLVMInt16TypeInContext(self.context),
                 Type::U32 => LLVMInt32TypeInContext(self.context),
                 Type::U64 => LLVMInt64TypeInContext(self.context),
                 Type::Usize => LLVMInt64TypeInContext(self.context),

@@ -80,9 +80,13 @@ pub(crate) fn infer_numeric_result_type(
         }
     }
 
+    // Narrow integers are not promoted: same-width operands keep their width
+    // and wrap, mixed widths evaluate at the wider one. See the promotion note
+    // on `glyph_core::types::Type`.
     fn width(ty: &Type) -> Option<u32> {
         match ty {
             Type::I8 | Type::U8 => Some(8),
+            Type::I16 | Type::U16 => Some(16),
             Type::I32 | Type::U32 | Type::Char => Some(32),
             Type::I64 | Type::U64 | Type::Usize => Some(64),
             _ => None,

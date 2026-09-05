@@ -48,9 +48,11 @@ pub(crate) fn tuple_struct_name(elem_types: &[Type]) -> String {
 pub(crate) fn type_key_simple(ty: &Type) -> String {
     match ty {
         Type::I8 => "i8".into(),
+        Type::I16 => "i16".into(),
         Type::I32 => "i32".into(),
         Type::I64 => "i64".into(),
         Type::U8 => "u8".into(),
+        Type::U16 => "u16".into(),
         Type::U32 => "u32".into(),
         Type::U64 => "u64".into(),
         Type::Usize => "usize".into(),

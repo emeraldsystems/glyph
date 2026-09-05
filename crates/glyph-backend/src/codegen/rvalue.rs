@@ -156,9 +156,9 @@ impl CodegenContext {
     ) -> Result<LLVMValueRef> {
         let src_unsigned = matches!(
             from,
-            Type::U8 | Type::U32 | Type::U64 | Type::Usize | Type::Char | Type::Bool
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Usize | Type::Char | Type::Bool
         );
-        let dst_signed = matches!(to, Type::I8 | Type::I32 | Type::I64);
+        let dst_signed = matches!(to, Type::I8 | Type::I16 | Type::I32 | Type::I64);
         let from_is_float = from.is_float();
         let to_is_float = to.is_float();
 
@@ -448,7 +448,8 @@ impl CodegenContext {
                         if ty.is_int() {
                             unsafe {
                                 let llvm_ty = self.get_llvm_type(ty)?;
-                                let signed = matches!(ty, Type::I8 | Type::I32 | Type::I64);
+                                let signed =
+                                    matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
                                 return Ok(LLVMConstInt(
                                     llvm_ty,
                                     *i as u64,
@@ -604,7 +605,10 @@ impl CodegenContext {
                             || Self::is_float_type_kind(LLVMGetTypeKind(LLVMTypeOf(rhs_val0)));
                     if is_float_op {
                         let is_unsigned = |ty: Option<&Type>| {
-                            matches!(ty, Some(Type::U8 | Type::U32 | Type::U64 | Type::Usize))
+                            matches!(
+                                ty,
+                                Some(Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Usize)
+                            )
                         };
                         let (lhs_val, rhs_val) = self.coerce_float_binop(
                             lhs_val0,
@@ -1022,7 +1026,10 @@ impl CodegenContext {
                             if expected_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
                                 && arg_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
                             {
-                                let signed = matches!(param_ty, Type::I8 | Type::I32 | Type::I64);
+                                let signed = matches!(
+                                    param_ty,
+                                    Type::I8 | Type::I16 | Type::I32 | Type::I64
+                                );
                                 arg_val = self.coerce_int_value(arg_val, expected_ty, signed);
                             } else if Self::is_float_type_kind(expected_kind)
                                 && Self::is_float_type_kind(arg_kind)
@@ -1050,7 +1057,9 @@ impl CodegenContext {
                                 let arg_glyph_ty = self.mir_value_type(arg, func);
                                 let unsigned = matches!(
                                     arg_glyph_ty,
-                                    Some(Type::U8 | Type::U32 | Type::U64 | Type::Usize)
+                                    Some(
+                                        Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Usize
+                                    )
                                 );
                                 let cast_name = CString::new("arg.int.to.fp")?;
                                 arg_val = if unsigned {

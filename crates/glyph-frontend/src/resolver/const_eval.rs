@@ -391,9 +391,11 @@ fn find_const_def<'a>(module: &'a Module, name: &str) -> Option<&'a ConstDef> {
 fn const_value_matches_type(value: &ConstValue, ty: &Type) -> bool {
     match (value, ty) {
         (ConstValue::Int(_), Type::I8)
+        | (ConstValue::Int(_), Type::I16)
         | (ConstValue::Int(_), Type::I32)
         | (ConstValue::Int(_), Type::I64)
         | (ConstValue::Int(_), Type::U8)
+        | (ConstValue::Int(_), Type::U16)
         | (ConstValue::Int(_), Type::U32)
         | (ConstValue::Int(_), Type::U64)
         | (ConstValue::Int(_), Type::Usize) => true,

@@ -34,9 +34,11 @@ fn type_is_copy(ty: &Type) -> bool {
     matches!(
         ty,
         Type::I8
+            | Type::I16
             | Type::I32
             | Type::I64
             | Type::U8
+            | Type::U16
             | Type::U32
             | Type::U64
             | Type::Usize
@@ -240,11 +242,69 @@ pub(crate) fn lower_expr<'a>(ctx: &mut LowerCtx<'a>, expr: &'a Expr) -> Option<R
     lower_expr_with_expected(ctx, expr, None)
 }
 
+/// Inclusive value range an integer literal may take for `ty`.
+///
+/// `u64` and `usize` are deliberately absent: the parser accepts any literal up
+/// to `u64::MAX` and stores it in an `i64`, so a large `u64` literal reaches
+/// lowering already reinterpreted as negative and cannot be checked from that
+/// representation. `char` is absent because char literals are not `Literal::Int`.
+fn int_literal_range(ty: &Type) -> Option<(i128, i128)> {
+    Some(match ty {
+        Type::I8 => (i8::MIN as i128, i8::MAX as i128),
+        Type::I16 => (i16::MIN as i128, i16::MAX as i128),
+        Type::I32 => (i32::MIN as i128, i32::MAX as i128),
+        Type::I64 => (i64::MIN as i128, i64::MAX as i128),
+        Type::U8 => (0, u8::MAX as i128),
+        Type::U16 => (0, u16::MAX as i128),
+        Type::U32 => (0, u32::MAX as i128),
+        _ => return None,
+    })
+}
+
+/// The compile-time value of an integer literal, seeing through a leading `-`
+/// so `-32768` is judged as one value rather than as `32768`.
+fn const_int_literal(expr: &Expr) -> Option<i128> {
+    match expr {
+        Expr::Lit(glyph_core::ast::Literal::Int(i), _) => Some(*i as i128),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+            ..
+        } => const_int_literal(expr).map(|v| -v),
+        _ => None,
+    }
+}
+
+/// Reject `let x: i16 = 40000` where the literal cannot be represented, instead
+/// of letting codegen truncate it into a different value without a word.
+fn check_int_literal_range(ctx: &mut LowerCtx<'_>, expr: &Expr, expected: Option<&Type>) {
+    let Some(ty) = expected else { return };
+    let Some((min, max)) = int_literal_range(ty) else {
+        return;
+    };
+    let Some(value) = const_int_literal(expr) else {
+        return;
+    };
+    if value < min || value > max {
+        ctx.error(
+            format!(
+                "integer literal {} is out of range for '{}' (valid range {}..={})",
+                value,
+                LowerCtx::type_label(ty),
+                min,
+                max
+            ),
+            super::value::expr_span(expr),
+        );
+    }
+}
+
 pub(crate) fn lower_expr_with_expected<'a>(
     ctx: &mut LowerCtx<'a>,
     expr: &'a Expr,
     expected: Option<&Type>,
 ) -> Option<Rvalue> {
+    check_int_literal_range(ctx, expr, expected);
     match expr {
         Expr::Lit(glyph_core::ast::Literal::Int(i), _) => {
             // If we have an expected integer type, create a typed local so the
@@ -1355,6 +1415,15 @@ pub(crate) fn lower_struct_lit<'a>(
             continue;
         }
 
+        // The field's declared type is not threaded into lowering, but it is
+        // what an integer literal has to fit, so range-check against it here.
+        let field_ty = struct_type
+            .fields
+            .iter()
+            .find(|(n, _)| n == &field_name.0)
+            .map(|(_, ty)| ty.clone());
+        check_int_literal_range(ctx, expr, field_ty.as_ref());
+
         match lower_value(ctx, expr) {
             Some(value) => {
                 consume_value_local(ctx, &value, span);
@@ -1841,6 +1910,7 @@ pub(crate) fn lower_value_with_expected<'a>(
     expr: &'a Expr,
     expected: Option<&Type>,
 ) -> Option<MirValue> {
+    check_int_literal_range(ctx, expr, expected);
     match expr {
         Expr::Lit(glyph_core::ast::Literal::Int(i), _) => {
             // If we have an expected integer type, create a typed local so the

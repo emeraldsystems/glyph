@@ -334,7 +334,8 @@ impl CodegenContext {
                             .get(local)
                             .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
                         let target_ty = self.local_llvm_type(func, *local)?;
-                        let signed = matches!(local_ty, Some(Type::I8 | Type::I32 | Type::I64));
+                        let signed =
+                            matches!(local_ty, Some(Type::I8 | Type::I16 | Type::I32 | Type::I64));
                         let val = self.coerce_int_value(val, target_ty, signed);
                         let store = LLVMBuildStore(self.builder, val, *local_ptr);
                         if let Some(Type::Atomic(scalar)) = local_ty {
@@ -392,7 +393,8 @@ impl CodegenContext {
                             gep_name.as_ptr(),
                         );
                         let llvm_field_ty = self.get_llvm_type(&field_ty)?;
-                        let signed = matches!(field_ty, Type::I8 | Type::I32 | Type::I64);
+                        let signed =
+                            matches!(field_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
                         let val = self.coerce_int_value(val, llvm_field_ty, signed);
                         LLVMBuildStore(self.builder, val, field_ptr);
                     }
@@ -507,7 +509,7 @@ impl CodegenContext {
                     }
 
                     let llvm_elem_ty = self.get_llvm_type(&elem_ty)?;
-                    let signed = matches!(elem_ty, Type::I8 | Type::I32 | Type::I64);
+                    let signed = matches!(elem_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
                     val = self.coerce_int_value(val, llvm_elem_ty, signed);
                     // Width-coerce float stores (f64 literal into f32 slot).
                     let val_kind = LLVMGetTypeKind(LLVMTypeOf(val));
@@ -570,7 +572,8 @@ impl CodegenContext {
                         }
                         if let Some(ret_ty) = func.ret_type.as_ref() {
                             let llvm_ret_ty = self.get_llvm_type(ret_ty)?;
-                            let signed = matches!(ret_ty, Type::I8 | Type::I32 | Type::I64);
+                            let signed =
+                                matches!(ret_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
                             ret_val = self.coerce_int_value(ret_val, llvm_ret_ty, signed);
                         }
                         LLVMBuildRet(self.builder, ret_val);

@@ -36,12 +36,26 @@ pub enum BorrowedCallableKind {
     FnMut,
 }
 
+/// # Integer arithmetic promotion
+///
+/// Glyph does **not** promote narrow integers the way C does. A binary
+/// operation whose operands have the same width produces that width, and mixed
+/// widths produce the wider of the two (see
+/// `glyph_frontend::mir_lower::value::infer_numeric_result_type`). So
+/// `i16 + i16` stays `i16` and wraps two's-complement on overflow, exactly as
+/// `i8 + i8` already does; `i16 + i32` is evaluated at 32 bits.
+///
+/// This keeps the 16-bit types honest for their motivating use — packing and
+/// unpacking binary formats, where a value that silently became 32 bits wide
+/// mid-expression is a bug, not a convenience. Widen deliberately with `as`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Type {
     I8,
+    I16,
     I32,
     I64,
     U8,
+    U16,
     U32,
     U64,
     Usize,
@@ -196,9 +210,11 @@ impl Type {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "i8" => Some(Type::I8),
+            "i16" => Some(Type::I16),
             "i32" | "i" => Some(Type::I32),
             "i64" => Some(Type::I64),
             "u8" => Some(Type::U8),
+            "u16" => Some(Type::U16),
             "u32" | "u" => Some(Type::U32),
             "u64" => Some(Type::U64),
             "usize" => Some(Type::Usize),
@@ -222,9 +238,11 @@ impl Type {
         matches!(
             self,
             Type::I8
+                | Type::I16
                 | Type::I32
                 | Type::I64
                 | Type::U8
+                | Type::U16
                 | Type::U32
                 | Type::U64
                 | Type::Usize

@@ -632,9 +632,11 @@ fn extern_parameter_takes_glyph_ownership(ty: &Type) -> bool {
         Type::Array(element, _) => extern_parameter_takes_glyph_ownership(element),
         Type::Tuple(elements) => elements.iter().any(extern_parameter_takes_glyph_ownership),
         Type::I8
+        | Type::I16
         | Type::I32
         | Type::I64
         | Type::U8
+        | Type::U16
         | Type::U32
         | Type::U64
         | Type::Usize
