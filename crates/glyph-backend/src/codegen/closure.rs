@@ -17,9 +17,11 @@ impl CodegenContext {
     fn closure_capture_is_copy(ty: &Type) -> bool {
         match ty {
             Type::I8
+            | Type::I16
             | Type::I32
             | Type::I64
             | Type::U8
+            | Type::U16
             | Type::U32
             | Type::U64
             | Type::Usize

@@ -265,7 +265,7 @@ impl CodegenContext {
                 return Ok(self.coerce_int_value(
                     arg_val,
                     expected,
-                    matches!(param_ty, Type::I8 | Type::I32 | Type::I64),
+                    matches!(param_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64),
                 ));
             }
             if Self::is_float_type_kind(expected_kind)
@@ -291,8 +291,10 @@ impl CodegenContext {
             if Self::is_float_type_kind(expected_kind)
                 && actual_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
             {
-                let unsigned =
-                    matches!(arg_ty, Some(Type::U8 | Type::U32 | Type::U64 | Type::Usize));
+                let unsigned = matches!(
+                    arg_ty,
+                    Some(Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Usize)
+                );
                 return Ok(if unsigned {
                     LLVMBuildUIToFP(
                         self.builder,

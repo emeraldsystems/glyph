@@ -201,7 +201,7 @@ impl CodegenContext {
                 )
             };
             let llvm_field_ty = self.get_llvm_type(&field_ty)?;
-            let signed = matches!(field_ty, Type::I8 | Type::I32 | Type::I64);
+            let signed = matches!(field_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
             llvm_field_val = self.coerce_int_value(llvm_field_val, llvm_field_ty, signed);
             unsafe {
                 LLVMBuildStore(self.builder, llvm_field_val, field_ptr);

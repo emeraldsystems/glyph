@@ -169,8 +169,12 @@ pub(crate) fn lower_print_builtin<'a>(
                 // runtime (runtime/glyph_fmt.c); the externs are declared in
                 // mir_lower::lower_module whenever std/io is available.
                 let fmt_extern: Option<&'static str> = match val_ty.as_ref() {
-                    Some(Type::I32) | Some(Type::I8) => Some("glyph_fmt_write_i32"),
-                    Some(Type::U32) | Some(Type::U8) => Some("glyph_fmt_write_u32"),
+                    Some(Type::I32) | Some(Type::I8) | Some(Type::I16) => {
+                        Some("glyph_fmt_write_i32")
+                    }
+                    Some(Type::U32) | Some(Type::U8) | Some(Type::U16) => {
+                        Some("glyph_fmt_write_u32")
+                    }
                     Some(Type::I64) => Some("glyph_fmt_write_i64"),
                     Some(Type::U64) | Some(Type::Usize) => Some("glyph_fmt_write_u64"),
                     Some(Type::Bool) => Some("glyph_fmt_write_bool"),

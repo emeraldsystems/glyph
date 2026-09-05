@@ -1,0 +1,22 @@
+// 16-bit scalars and the three conversions that must not be confused:
+// i16 -> i32 sign-extends, u16 -> i32 zero-extends, i32 -> i16 truncates.
+fn widen_signed(s: i16) -> i32 {
+  ret s as i32
+}
+
+fn widen_unsigned(u: u16) -> i32 {
+  ret u as i32
+}
+
+fn narrow(n: i32) -> i16 {
+  ret n as i16
+}
+
+fn main() -> i32 {
+  let lo: i16 = -32768;
+  let hi: u16 = 65535;
+  let a: i32 = widen_signed(lo);
+  let b: i32 = widen_unsigned(hi);
+  let c: i16 = narrow(70000);
+  ret a + b + (c as i32)
+}
