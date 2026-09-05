@@ -117,3 +117,70 @@ int32_t glyph_io_ignore_sigpipe(void) {
     return 0;
 #endif
 }
+
+// --------------------------------------------------------------------------
+// Binary file reading
+//
+// Glyph could read files before this, but only as text: File::read_to_string
+// and nothing else. That ruled out every binary format -- audio, images,
+// archives, anything with a header -- because there was no way to get raw
+// bytes into a Glyph value.
+
+// A Glyph Vec as the ABI sees it. Duplicated from glyph_audio.c rather than
+// shared through a header, matching how this runtime is already organized:
+// each file is standalone so a port can take them one at a time.
+typedef struct {
+    void* data;
+    int64_t len;
+    int64_t cap;
+} GlyphIoVec;
+
+// Reads up to `max` bytes of `path` into `out`, returning the count read or
+// a negative errno-style code.
+//
+// THE CALLER SIZES THE BUFFER. `out` must already hold at least `max`
+// elements -- push that many zeros first, or use glyph_file_size to learn
+// the length. This function only ever writes into memory Glyph already
+// owns; it never grows the Vec and never touches len or cap.
+//
+// That constraint is deliberate. Nothing else in this runtime allocates
+// into a Glyph Vec, and doing so would mean C guessing at Glyph's allocator
+// and its ownership rules -- in a language whose whole memory model is
+// single-owner moves. A short read is reported honestly instead.
+//
+// Returns:
+//   >= 0  bytes actually read (may be < max at end of file)
+//   -1    path or out was NULL
+//   -2    the buffer is smaller than max, so the request cannot be honoured
+//   -3    the file could not be opened
+//   -4    a read error occurred partway through
+//
+// Distinct codes on purpose: a caller wants to tell a missing asset from a
+// corrupt one, and "your buffer was too small" from either.
+int64_t glyph_io_read_file_bytes(const char* path, GlyphIoVec* out, int64_t max) {
+    if (path == NULL || out == NULL) {
+        return -1;
+    }
+    if (max <= 0) {
+        return 0;
+    }
+    if (out->data == NULL || out->len < max) {
+        return -2;
+    }
+
+    FILE* f = fopen(path, "rb");
+    if (f == NULL) {
+        return -3;
+    }
+
+    size_t got = fread(out->data, 1, (size_t)max, f);
+    // Short reads are normal at end of file; only a real error is a failure,
+    // so ferror is checked rather than comparing got against max.
+    int failed = ferror(f);
+    fclose(f);
+
+    if (failed) {
+        return -4;
+    }
+    return (int64_t)got;
+}

@@ -363,6 +363,54 @@ pub fn std_modules() -> HashMap<String, Module> {
         span,
     };
 
+    // Reads raw bytes, which read_to_string cannot: it produces text, so
+    // every binary format -- audio, images, archives, anything with a
+    // header -- was previously unreachable from Glyph.
+    //
+    // THE CALLER SIZES THE BUFFER. `out` must already hold at least `max`
+    // elements; push that many zeros, or ask std/net::file_size first. The
+    // runtime writes only into memory Glyph already owns and never grows
+    // the Vec, because nothing else in the runtime allocates into one and
+    // doing so would mean C guessing at the allocator and the ownership
+    // rules of a single-owner move language.
+    //
+    // Returns the count read (which may be short at end of file), or a
+    // negative code: -1 null argument, -2 buffer smaller than max, -3 could
+    // not open, -4 read error. Distinct on purpose -- a caller wants to
+    // tell a missing file from a corrupt one.
+    let read_file_bytes_extern = ExternFunctionDecl {
+        abi: Some("C".into()),
+        name: Ident("read_file_bytes".into()),
+        params: vec![
+            Param {
+                name: Ident("path".into()),
+                ty: Some(tp("str", span)),
+                span,
+            },
+            Param {
+                name: Ident("out".into()),
+                ty: Some(TypeExpr::Ref {
+                    mutability: Mutability::Mutable,
+                    inner: Box::new(TypeExpr::App {
+                        base: Box::new(tp("Vec", span)),
+                        args: vec![tp("u8", span)],
+                        span,
+                    }),
+                    span,
+                }),
+                span,
+            },
+            Param {
+                name: Ident("max".into()),
+                ty: Some(tp("i64", span)),
+                span,
+            },
+        ],
+        ret_type: Some(tp("i64", span)),
+        link_name: Some("glyph_io_read_file_bytes".into()),
+        span,
+    };
+
     let file_struct = StructDef {
         name: Ident("File".into()),
         generic_params: vec![],
@@ -400,6 +448,7 @@ pub fn std_modules() -> HashMap<String, Module> {
             glyph_core::ast::Item::ExternFunction(println_extern),
             glyph_core::ast::Item::ExternFunction(read_line_extern),
             glyph_core::ast::Item::ExternFunction(ignore_sigpipe_extern),
+            glyph_core::ast::Item::ExternFunction(read_file_bytes_extern),
         ],
     };
     modules.insert("std/io".into(), std_io_module);
