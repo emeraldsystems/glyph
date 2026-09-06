@@ -221,9 +221,23 @@ pub(crate) fn lower_function(
         });
     }
 
-    let mut implicit_return =
-        lower_block_with_expected(&mut ctx, &func.body, ret_type.as_ref(), false, true);
     let returns_void = ret_type.as_ref().map_or(true, |ty| is_void_type(ty));
+    // The body must be lowered in "control value context" so that a bare
+    // `if`/`else` (or `while`/`for`) occupying the function's own tail
+    // position is treated as producing the function's return value, the same
+    // way it already is inside nested blocks, closures, and `let` bindings.
+    // A void function has no return value to thread through, but its
+    // `ret_type` may be `None` (no `-> T` annotation) rather than
+    // `Some(Type::Void)`; pass `Some(Type::Void)` explicitly here so that
+    // tail control-flow with no value (e.g. `if flag { println("x") }`)
+    // isn't mistaken for a missing-value error.
+    let body_expected = if returns_void {
+        Some(Type::Void)
+    } else {
+        ret_type.clone()
+    };
+    let mut implicit_return =
+        lower_block_with_expected(&mut ctx, &func.body, body_expected.as_ref(), true, true);
     if returns_void {
         // A void function discards whatever its last expression produced
         // (e.g. a Vec snapshot from a trailing `.push()`); the value's local
@@ -1135,6 +1149,22 @@ pub(crate) fn lower_if_value<'a>(
     expected: Option<&Type>,
 ) -> Option<MirValue> {
     let Some(else_block) = else_blk else {
+        // An `if` with no `else` only ever produces `()`. If the surrounding
+        // context has a concrete, non-void expected type (e.g. this `if` is
+        // a function's tail expression, or the value side of a typed `let`),
+        // there is no way to satisfy it — diagnose instead of silently
+        // returning a unit value where a real value was expected.
+        if let Some(expected_ty) = expected
+            && !is_void_type(expected_ty)
+        {
+            ctx.error(
+                format!(
+                    "if expression is missing an else branch; expected a value of type '{}' but an `if` without `else` only produces '()'",
+                    LowerCtx::type_label(expected_ty)
+                ),
+                Some(then_blk.span),
+            );
+        }
         lower_if(ctx, cond, then_blk, None);
         return Some(MirValue::Unit);
     };
@@ -1215,6 +1245,15 @@ pub(crate) fn lower_if_value<'a>(
     }
 
     ctx.switch_to(join_id);
+    if !any_reaches_join {
+        // Both arms diverge (e.g. each ends in `ret`, `break`, or an infinite
+        // loop), so the join block is unreachable and `result_local` was
+        // never assigned. Report "no value" rather than handing back a read
+        // of an uninitialized local — the caller (e.g. a function's implicit
+        // tail return) should treat this the same as any other diverging
+        // tail expression.
+        return None;
+    }
     if matches!(expected, Some(Type::Void)) {
         Some(MirValue::Unit)
     } else {

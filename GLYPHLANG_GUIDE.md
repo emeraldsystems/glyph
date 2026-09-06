@@ -318,7 +318,7 @@ Dependencies are resolved transitively with cycle detection.
 - `break` and `cont` in loops properly drop locals scoped inside the loop body.
 - `for`/`for-in` `cont` jumps to the loop's continue target (increment/index advance), not directly to condition check.
 - Floats (`f64`) are fully supported: literals, arithmetic, comparisons, int/float promotion, params/returns, `Vec<f64>`, and `as` casts. The one open gap is a negative literal assigned to a float `let` (`let x: f64 = -1`), which is not promoted correctly - see `docs/book/src/limitations.md`.
-- A bare `if`/`else` used as a function body's last statement (no explicit `ret`) does not return the taken branch's value - see `docs/book/src/limitations.md`. Always write `ret if ... { ... } else { ... }` explicitly; `match` in the same tail position works correctly.
+- A bare `if`/`else` used as a function body's last statement (no explicit `ret`) returns the taken branch's value, the same as `match` in the same tail position. An `if` with no `else` there is a compile error in a non-void function (no value to return), not a silent default.
 - `extern` functions must end with `;` and only `extern "C"` is accepted.
 - `const` declarations require an explicit type annotation.
 

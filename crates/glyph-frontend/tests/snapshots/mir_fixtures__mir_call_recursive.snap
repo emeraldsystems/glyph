@@ -58,6 +58,14 @@ MirModule {
                     mutable: false,
                     skip_drop: false,
                 },
+                Local {
+                    name: None,
+                    ty: Some(
+                        I32,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
             ],
             blocks: [
                 MirBlock {
@@ -108,7 +116,7 @@ MirModule {
                     insts: [
                         Assign {
                             local: LocalId(
-                                2,
+                                3,
                             ),
                             value: Binary {
                                 op: Sub,
@@ -124,14 +132,14 @@ MirModule {
                         },
                         Assign {
                             local: LocalId(
-                                3,
+                                4,
                             ),
                             value: Call {
                                 name: "factorial",
                                 args: [
                                     Local(
                                         LocalId(
-                                            2,
+                                            3,
                                         ),
                                     ),
                                 ],
@@ -139,7 +147,7 @@ MirModule {
                         },
                         Assign {
                             local: LocalId(
-                                4,
+                                5,
                             ),
                             value: Binary {
                                 op: Mul,
@@ -150,7 +158,7 @@ MirModule {
                                 ),
                                 rhs: Local(
                                     LocalId(
-                                        3,
+                                        4,
                                     ),
                                 ),
                             },
@@ -159,7 +167,7 @@ MirModule {
                             Some(
                                 Local(
                                     LocalId(
-                                        4,
+                                        5,
                                     ),
                                 ),
                             ),
