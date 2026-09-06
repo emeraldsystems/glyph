@@ -1,10 +1,18 @@
 use super::*;
 
 impl CodegenContext {
+    /// Unify operands for an integer binary op: the narrower operand is
+    /// widened to the wider operand's width. Extension follows that
+    /// narrower operand's OWN signedness (`lhs_unsigned`/`rhs_unsigned`,
+    /// from the source Glyph type via [`Self::int_ext_is_signed`]), not the
+    /// wider operand's — an unsigned narrow value must zero-extend even when
+    /// added to a signed wide one (GLYPH-73).
     pub(super) fn coerce_int_binop(
         &mut self,
         lhs: LLVMValueRef,
         rhs: LLVMValueRef,
+        lhs_unsigned: bool,
+        rhs_unsigned: bool,
     ) -> (LLVMValueRef, LLVMValueRef) {
         unsafe {
             let lhs_ty = LLVMTypeOf(lhs);
@@ -26,16 +34,17 @@ impl CodegenContext {
             let name = CString::new("int.coerce").unwrap();
 
             if lw > rw {
-                // Zero-extend when widening from i1 (bool) to avoid
-                // sign-extending true (i1 1) into i32 -1.
-                let rhs2 = if rw == 1 {
+                // Zero-extend when widening from i1 (bool), or from any
+                // unsigned source, to avoid sign-extending it into a
+                // negative wide value.
+                let rhs2 = if rw == 1 || rhs_unsigned {
                     LLVMBuildZExt(self.builder, rhs, lhs_ty, name.as_ptr())
                 } else {
                     LLVMBuildSExt(self.builder, rhs, lhs_ty, name.as_ptr())
                 };
                 (lhs, rhs2)
             } else {
-                let lhs2 = if lw == 1 {
+                let lhs2 = if lw == 1 || lhs_unsigned {
                     LLVMBuildZExt(self.builder, lhs, rhs_ty, name.as_ptr())
                 } else {
                     LLVMBuildSExt(self.builder, lhs, rhs_ty, name.as_ptr())
@@ -142,6 +151,39 @@ impl CodegenContext {
             } else {
                 LLVMBuildTrunc(self.builder, val, target_ty, name.as_ptr())
             }
+        }
+    }
+
+    /// Whether widening an integer value of Glyph type `ty` should
+    /// sign-extend (signed sources: i8/i16/i32/i64) rather than zero-extend
+    /// (unsigned-like sources: u8/u16/u32/u64/usize, plus char and bool).
+    ///
+    /// This mirrors `codegen_numeric_cast`'s `src_unsigned` check, which
+    /// already gets this right for explicit `expr as T` casts. Implicit
+    /// widening (call arguments, `let`/field/return/binop coercions) must
+    /// use the same SOURCE-derived rule, not the destination type's
+    /// signedness (GLYPH-73: a destination-derived rule sign-extends
+    /// unsigned values with the high bit set into negative wide values).
+    pub(super) fn int_ext_is_signed(ty: &Type) -> bool {
+        !matches!(
+            ty,
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Usize | Type::Char | Type::Bool
+        )
+    }
+
+    /// The Glyph type a plain pass-through `Rvalue` reads its value through,
+    /// when that can differ from the assignment's own declared type: a move
+    /// out of a local, or a dereference of a typed reference, both carry
+    /// their own source type independent of the destination local/field/
+    /// element being written. Other `Rvalue` kinds (`Binary`, `Call`,
+    /// `Cast`, literals, ...) already evaluate to a value of their
+    /// destination's natural width, so callers should fall back to
+    /// destination-derived signedness when this returns `None`.
+    pub(super) fn rvalue_source_type(&self, value: &Rvalue, func: &MirFunction) -> Option<Type> {
+        match value {
+            Rvalue::Move(id) => func.locals.get(id.0 as usize).and_then(|l| l.ty.clone()),
+            Rvalue::Deref { ty, .. } => Some(ty.clone()),
+            _ => None,
         }
     }
 
@@ -684,8 +726,40 @@ impl CodegenContext {
 
                     // Integer literals in MIR are currently untyped and codegen as i32.
                     // Coerce integer widths so operations like `usize + 1` work.
-                    let (lhs_val, rhs_val) = self.coerce_int_binop(lhs_val0, rhs_val0);
+                    // The narrower operand extends per its OWN signedness
+                    // (GLYPH-73), not the wider operand's.
+                    let lhs_unsigned = lhs_ty.as_ref().is_some_and(|t| !Self::int_ext_is_signed(t));
+                    let rhs_unsigned = rhs_ty.as_ref().is_some_and(|t| !Self::int_ext_is_signed(t));
+                    let (lhs_val, rhs_val) =
+                        self.coerce_int_binop(lhs_val0, rhs_val0, lhs_unsigned, rhs_unsigned);
 
+                    // Comparison predicate and Div/Mod instruction selection
+                    // must also follow operand signedness (GLYPH-76): `icmp
+                    // slt`/`sdiv`/`srem` treat the high bit as a sign, so an
+                    // unsigned value with it set (e.g. u32 4000000000)
+                    // compares as negative and divides/remainders wrong.
+                    // `mir_value_type` types an untyped integer literal
+                    // (`MirValue::Int`) as plain `I32`, which isn't a real
+                    // declared signedness to defer to - so a literal
+                    // contributes nothing here and the OTHER, genuinely
+                    // typed operand decides. Two literals together (no typed
+                    // operand at all) default to signed, matching the
+                    // untyped-literal default used everywhere else. Two
+                    // operands that are both genuinely typed but disagree in
+                    // signedness (a separate, already-reported gap: same-
+                    // width signed/unsigned mixing is accepted with no
+                    // diagnostic) resolve to unsigned - the safer of the two
+                    // wrong answers, since it's the one that doesn't turn a
+                    // large magnitude into a negative one.
+                    let lhs_is_untyped_literal = matches!(lhs, MirValue::Int(_));
+                    let rhs_is_untyped_literal = matches!(rhs, MirValue::Int(_));
+                    let unsigned_op = (!lhs_is_untyped_literal && lhs_unsigned)
+                        || (!rhs_is_untyped_literal && rhs_unsigned);
+
+                    use llvm_sys::LLVMIntPredicate::{
+                        LLVMIntEQ, LLVMIntNE, LLVMIntSGE, LLVMIntSGT, LLVMIntSLE, LLVMIntSLT,
+                        LLVMIntUGE, LLVMIntUGT, LLVMIntULE, LLVMIntULT,
+                    };
                     let result = match op {
                         BinaryOp::Add => {
                             LLVMBuildAdd(self.builder, lhs_val, rhs_val, name.as_ptr())
@@ -697,49 +771,49 @@ impl CodegenContext {
                             LLVMBuildMul(self.builder, lhs_val, rhs_val, name.as_ptr())
                         }
                         BinaryOp::Div => {
-                            LLVMBuildSDiv(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            if unsigned_op {
+                                LLVMBuildUDiv(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            } else {
+                                LLVMBuildSDiv(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
                         }
                         BinaryOp::Mod => {
-                            LLVMBuildSRem(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            if unsigned_op {
+                                LLVMBuildURem(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            } else {
+                                LLVMBuildSRem(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
                         }
-                        BinaryOp::Eq => LLVMBuildICmp(
-                            self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntEQ,
-                            lhs_val,
-                            rhs_val,
-                            name.as_ptr(),
-                        ),
-                        BinaryOp::Ne => LLVMBuildICmp(
-                            self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntNE,
-                            lhs_val,
-                            rhs_val,
-                            name.as_ptr(),
-                        ),
+                        BinaryOp::Eq => {
+                            LLVMBuildICmp(self.builder, LLVMIntEQ, lhs_val, rhs_val, name.as_ptr())
+                        }
+                        BinaryOp::Ne => {
+                            LLVMBuildICmp(self.builder, LLVMIntNE, lhs_val, rhs_val, name.as_ptr())
+                        }
                         BinaryOp::Lt => LLVMBuildICmp(
                             self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntSLT,
+                            if unsigned_op { LLVMIntULT } else { LLVMIntSLT },
                             lhs_val,
                             rhs_val,
                             name.as_ptr(),
                         ),
                         BinaryOp::Le => LLVMBuildICmp(
                             self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntSLE,
+                            if unsigned_op { LLVMIntULE } else { LLVMIntSLE },
                             lhs_val,
                             rhs_val,
                             name.as_ptr(),
                         ),
                         BinaryOp::Gt => LLVMBuildICmp(
                             self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntSGT,
+                            if unsigned_op { LLVMIntUGT } else { LLVMIntSGT },
                             lhs_val,
                             rhs_val,
                             name.as_ptr(),
                         ),
                         BinaryOp::Ge => LLVMBuildICmp(
                             self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntSGE,
+                            if unsigned_op { LLVMIntUGE } else { LLVMIntSGE },
                             lhs_val,
                             rhs_val,
                             name.as_ptr(),
@@ -947,7 +1021,7 @@ impl CodegenContext {
                         let mut arg_val = self.codegen_value(arg, func, local_map)?;
 
                         if let Some(Some(param_ty)) = param_types.get(idx) {
-                            let arg_ty = self.mir_value_type(arg, func);
+                            let arg_glyph_ty = self.mir_value_type(arg, func);
 
                             // A non-owning view (skip_drop) passed by value
                             // transfers ownership to the callee, which will
@@ -962,15 +1036,16 @@ impl CodegenContext {
                                         .get(arg_local.0 as usize)
                                         .map_or(false, |l| l.skip_drop);
                                     if is_view && Self::type_needs_clone(param_ty) {
-                                        let clone_ty =
-                                            arg_ty.clone().unwrap_or_else(|| param_ty.clone());
+                                        let clone_ty = arg_glyph_ty
+                                            .clone()
+                                            .unwrap_or_else(|| param_ty.clone());
                                         arg_val =
                                             self.codegen_deep_clone_value(&clone_ty, arg_val)?;
                                     }
                                 }
                             }
 
-                            if let Some(Type::Ref(inner, _)) = arg_ty.as_ref() {
+                            if let Some(Type::Ref(inner, _)) = arg_glyph_ty.as_ref() {
                                 if inner.as_ref() == param_ty {
                                     let inner_llvm_ty = self.get_llvm_type(param_ty)?;
                                     arg_val = LLVMBuildLoad2(
@@ -983,7 +1058,7 @@ impl CodegenContext {
                             }
 
                             if let Type::Ref(inner, _) = param_ty {
-                                if arg_ty.as_ref() == Some(inner.as_ref()) {
+                                if arg_glyph_ty.as_ref() == Some(inner.as_ref()) {
                                     let inner_llvm_ty = self.get_llvm_type(inner)?;
                                     let slot = self.build_entry_alloca(
                                         self.builder,
@@ -996,7 +1071,7 @@ impl CodegenContext {
                             }
 
                             if is_extern {
-                                if let Some(arg_ty) = arg_ty.as_ref() {
+                                if let Some(arg_ty) = arg_glyph_ty.as_ref() {
                                     if (matches!(arg_ty, Type::Str)
                                         && (matches!(param_ty, Type::RawPtr(_))
                                             || matches!(param_ty, Type::Str)))
@@ -1026,9 +1101,19 @@ impl CodegenContext {
                             if expected_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
                                 && arg_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
                             {
-                                let signed = matches!(
-                                    param_ty,
-                                    Type::I8 | Type::I16 | Type::I32 | Type::I64
+                                // Extension follows the ARGUMENT's own
+                                // signedness, not the parameter's: an
+                                // unsigned value with its high bit set must
+                                // zero-extend even into a signed wider
+                                // parameter (GLYPH-73).
+                                let signed = arg_glyph_ty.as_ref().map_or_else(
+                                    || {
+                                        matches!(
+                                            param_ty,
+                                            Type::I8 | Type::I16 | Type::I32 | Type::I64
+                                        )
+                                    },
+                                    |ty| Self::int_ext_is_signed(ty),
                                 );
                                 arg_val = self.coerce_int_value(arg_val, expected_ty, signed);
                             } else if Self::is_float_type_kind(expected_kind)
@@ -1054,7 +1139,6 @@ impl CodegenContext {
                             } else if Self::is_float_type_kind(expected_kind)
                                 && arg_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
                             {
-                                let arg_glyph_ty = self.mir_value_type(arg, func);
                                 let unsigned = matches!(
                                     arg_glyph_ty,
                                     Some(

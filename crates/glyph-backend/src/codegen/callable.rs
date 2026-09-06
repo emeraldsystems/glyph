@@ -262,11 +262,14 @@ impl CodegenContext {
             if expected_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
                 && actual_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
             {
-                return Ok(self.coerce_int_value(
-                    arg_val,
-                    expected,
-                    matches!(param_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64),
-                ));
+                // Extension follows the ARGUMENT's own signedness, not the
+                // parameter's (GLYPH-73); see the direct-call-site fix in
+                // codegen/rvalue.rs for the full rationale.
+                let signed = arg_ty.as_ref().map_or_else(
+                    || matches!(param_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64),
+                    |ty| Self::int_ext_is_signed(ty),
+                );
+                return Ok(self.coerce_int_value(arg_val, expected, signed));
             }
             if Self::is_float_type_kind(expected_kind)
                 && Self::is_float_type_kind(actual_kind)

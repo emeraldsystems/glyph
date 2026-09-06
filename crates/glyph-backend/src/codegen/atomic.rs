@@ -102,9 +102,17 @@ impl CodegenContext {
         func: &MirFunction,
         local_map: &HashMap<LocalId, LLVMValueRef>,
     ) -> Result<LLVMValueRef> {
-        let value = self.codegen_value(value, func, local_map)?;
+        // Extension follows the VALUE's own source signedness, not the
+        // atomic's declared scalar type (GLYPH-73): e.g. storing a `u8`
+        // into an `AtomicI32` must zero-extend the `u8`.
+        let src_ty = self.mir_value_type(value, func);
+        let llvm_value = self.codegen_value(value, func, local_map)?;
         let storage_ty = self.atomic_storage_type(scalar)?;
-        Ok(self.coerce_int_value(value, storage_ty, Self::scalar_is_signed(scalar)))
+        let signed = src_ty.as_ref().map_or_else(
+            || Self::scalar_is_signed(scalar),
+            |ty| Self::int_ext_is_signed(ty),
+        );
+        Ok(self.coerce_int_value(llvm_value, storage_ty, signed))
     }
 
     fn atomic_result_value(&mut self, value: LLVMValueRef, scalar: AtomicScalar) -> LLVMValueRef {

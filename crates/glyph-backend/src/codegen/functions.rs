@@ -350,8 +350,23 @@ impl CodegenContext {
                             .get(local)
                             .ok_or_else(|| anyhow!("undefined local {:?}", local))?;
                         let target_ty = self.local_llvm_type(func, *local)?;
-                        let signed =
-                            matches!(local_ty, Some(Type::I8 | Type::I16 | Type::I32 | Type::I64));
+                        // Extension follows the RVALUE's own source
+                        // signedness when one is available (a plain move or
+                        // deref), not the destination local's declared type
+                        // (GLYPH-73). Other rvalue kinds (Binary, Call,
+                        // Cast, literals, ...) already evaluate to their
+                        // destination's natural width, so fall back to the
+                        // old destination-derived rule for those.
+                        let src_ty = self.rvalue_source_type(value, func);
+                        let signed = src_ty.as_ref().map_or_else(
+                            || {
+                                matches!(
+                                    local_ty,
+                                    Some(Type::I8 | Type::I16 | Type::I32 | Type::I64)
+                                )
+                            },
+                            |ty| Self::int_ext_is_signed(ty),
+                        );
                         let val = self.coerce_int_value(val, target_ty, signed);
                         let store = LLVMBuildStore(self.builder, val, *local_ptr);
                         if let Some(Type::Atomic(scalar)) = local_ty {
@@ -409,8 +424,14 @@ impl CodegenContext {
                             gep_name.as_ptr(),
                         );
                         let llvm_field_ty = self.get_llvm_type(&field_ty)?;
-                        let signed =
-                            matches!(field_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
+                        // See the Assign case above: extend per the
+                        // rvalue's own source signedness when known
+                        // (GLYPH-73), else fall back to the field's type.
+                        let src_ty = self.rvalue_source_type(value, func);
+                        let signed = src_ty.as_ref().map_or_else(
+                            || matches!(field_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64),
+                            |ty| Self::int_ext_is_signed(ty),
+                        );
                         let val = self.coerce_int_value(val, llvm_field_ty, signed);
                         LLVMBuildStore(self.builder, val, field_ptr);
                     }
@@ -525,7 +546,14 @@ impl CodegenContext {
                     }
 
                     let llvm_elem_ty = self.get_llvm_type(&elem_ty)?;
-                    let signed = matches!(elem_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
+                    // See the Assign case above: extend per the rvalue's
+                    // own source signedness when known (GLYPH-73), else
+                    // fall back to the element's type.
+                    let src_ty = self.rvalue_source_type(value, func);
+                    let signed = src_ty.as_ref().map_or_else(
+                        || matches!(elem_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64),
+                        |ty| Self::int_ext_is_signed(ty),
+                    );
                     val = self.coerce_int_value(val, llvm_elem_ty, signed);
                     // Width-coerce float stores (f64 literal into f32 slot).
                     let val_kind = LLVMGetTypeKind(LLVMTypeOf(val));
@@ -588,8 +616,14 @@ impl CodegenContext {
                         }
                         if let Some(ret_ty) = func.ret_type.as_ref() {
                             let llvm_ret_ty = self.get_llvm_type(ret_ty)?;
-                            let signed =
-                                matches!(ret_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
+                            // Extension follows the RETURNED VALUE's own
+                            // signedness, not the declared return type's
+                            // (GLYPH-73).
+                            let src_ty = self.mir_value_type(v, func);
+                            let signed = src_ty.as_ref().map_or_else(
+                                || matches!(ret_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64),
+                                |ty| Self::int_ext_is_signed(ty),
+                            );
                             ret_val = self.coerce_int_value(ret_val, llvm_ret_ty, signed);
                         }
                         LLVMBuildRet(self.builder, ret_val);
