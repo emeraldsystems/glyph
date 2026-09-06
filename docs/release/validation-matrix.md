@@ -227,3 +227,15 @@ Per the integrator's brief, these are cited by ticket rather than re-filed:
   triggered by any row in this matrix.
 - GLYPH-72, GLYPH-73, GLYPH-74, GLYPH-76 — fixed and merged into this base
   (56e9cb9); nothing in this matrix regressed them.
+
+## Integrator re-run — 2026-09-06, commit 673cafe
+
+Re-run from the main checkout after every branch from the 2026-09-06 sweep
+was merged (GLYPH-72, 73, 74, 76, 3, 4, 13, 11): **20 PASS, 1 SKIP
+(sequencer live engine, NON-GOAL), 1 FAIL** — `apex`, the known blocker
+GLYPH-80. Identical to the 56e9cb9 run above. The full `cargo test` suite on
+the same tree: 900 passed, 0 failed across 107 test binaries.
+
+Open release blockers as of this run: GLYPH-80 (apex move-checker error),
+GLYPH-83 (`glyph-cli run` JIT segfaults on `println`), GLYPH-84 (bare
+`if`/`else` tail expression returns a wrong value).
