@@ -1,7 +1,7 @@
 // JSON Parser Demo - Using the std library JSON parser
 //
 // This example validates that parsing returns the expected *shape* for nested
-// JSON (arrays/objects). It will fail if the parser is stubbed/broken.
+// JSON (arrays/objects) using the full std/json/parser implementation.
 
 from std/io import puts
 from std/enums import Option

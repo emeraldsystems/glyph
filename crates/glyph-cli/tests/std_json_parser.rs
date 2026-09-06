@@ -1270,3 +1270,58 @@ fn std_json_parser_stringify_roundtrip() {
 
     assert_eq!(build_and_run_exit_code(source), 0);
 }
+
+/// Regression guard for GLYPH-9: `stdlib.rs` must embed the full
+/// `crates/glyph-frontend/src/stdlib/json/parser.glyph` (shipped via
+/// `build.rs` into `OUT_DIR/json_parser_source.txt`), never the historical
+/// `parser_inline.glyph` stub. That stub defined only a single `parse`
+/// function which unconditionally returned `Ok(JsonValue::Null())` no
+/// matter the input; it has since been deleted, but this test pins the
+/// *mechanism* (what `glyph_frontend::std_modules()` actually registers
+/// for `"std/json/parser"`) so a future change can't silently reintroduce
+/// a stub without this test catching it. No codegen/linking is needed:
+/// this only inspects the parsed AST that stdlib.rs hands to the rest of
+/// the compiler.
+#[test]
+fn std_json_parser_embeds_full_parser_not_stub() {
+    let modules = glyph_frontend::std_modules();
+    let parser_module = modules
+        .get("std/json/parser")
+        .expect("std/json/parser module must be registered by stdlib.rs");
+
+    let fn_names: std::collections::HashSet<&str> = parser_module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            glyph_core::ast::Item::Function(f) => Some(f.name.0.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // Present only in the full parser.glyph; the historical stub defined
+    // nothing but `parse`.
+    let full_parser_only = [
+        "json_get_string",
+        "json_get_number",
+        "json_get_bool",
+        "json_is_null",
+        "json_get_array",
+        "json_get_object",
+        "stringify",
+        "stringify_string",
+        "stringify_array",
+        "stringify_object",
+    ];
+    for name in full_parser_only {
+        assert!(
+            fn_names.contains(name),
+            "std/json/parser is missing `{name}` - the embedded source \
+             looks like the historical stub, not the full parser.glyph"
+        );
+    }
+
+    assert!(
+        fn_names.contains("parse"),
+        "std/json/parser must still export `parse`"
+    );
+}

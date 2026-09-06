@@ -1273,9 +1273,11 @@ pub fn std_modules() -> HashMap<String, Module> {
         span,
     };
 
-    // TODO: Add parse function implementation
-    // For now, std/json only provides the types (JsonValue, ParseError)
-    // A full parser implementation requires more advanced language features
+    // std/json provides the JsonValue/ParseError/ParseResult types. The
+    // parser itself (parse, accessors, stringify) lives in std/json/parser,
+    // registered below as embedded Glyph source - see that module for the
+    // full, release-shipping implementation
+    // (crates/glyph-frontend/src/stdlib/json/parser.glyph).
     let json_items = vec![
         glyph_core::ast::Item::Enum(json_value_enum),
         glyph_core::ast::Item::Struct(parse_error_struct),

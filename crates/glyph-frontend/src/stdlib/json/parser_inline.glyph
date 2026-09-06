@@ -1,9 +1,0 @@
-// Minimal stub to keep std/json/parser module parsable while frontend parser is fixed.
-
-from std/json import JsonValue, ParseError, ParseResult
-
-// Minimal parse function for the stdlib build: always succeeds with Null.
-fn parse(input: &str) -> ParseResult<JsonValue> {
-    let _unused = input.len()
-    ret Ok(JsonValue::Null())
-}
