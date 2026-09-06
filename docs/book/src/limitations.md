@@ -146,13 +146,11 @@ fn classify(n: i32) -> i32 {
 }
 ```
 
-**Supported** (note the explicit `ret` - see
-[`if`/`else` as an implicit tail return](#ifelse-as-an-implicit-tail-return-untracked)
-below for why it's needed here)
+**Supported**
 
 ```glyph
 fn classify(n: i32) -> i32 {
-  ret if n == 0 { 100 } else if n == 1 { 200 } else { 300 }
+  if n == 0 { 100 } else if n == 1 { 200 } else { 300 }
 }
 ```
 
@@ -555,49 +553,40 @@ Both a `while true` with an internal `break` and a truly infinite `while
 true` (no `break`) compile as the last statement of a non-void function
 without an extra `ret`.
 
-### `if`/`else` as an implicit tail return (untracked)
+### `if`/`else` as an implicit tail return
 
-Glyph is advertised as expression-oriented ("the last expression in a block
-is the value"), and this holds for plain expressions and for `match` used as
-a function's tail expression. It does **not** currently hold for `if`/`else`:
-when an `if`/`else` is the last statement of a function body with no
-explicit `ret`, the function silently returns a default value instead of the
-taken branch's value - for **every** branch, not just one side.
-
-**Not supported (silently wrong, no diagnostic)**
+Glyph is expression-oriented ("the last expression in a block is the
+value"), and this holds for plain expressions, for `match`, and for
+`if`/`else` alike when any of them is a function's tail expression (GLYPH-84,
+fixed). A bare `if`/`else` occupying a function body's own tail position - no
+explicit `ret` needed - returns the taken branch's value, the same as it
+already did when bound to a `let` or nested inside a `{ }` block:
 
 ```glyph
-from std/io import println
+from std import println
 
 fn pick(n: i32) -> i32 {
-  if n == 0 { 100 } else { 300 }   // no `ret`
+  if n == 0 { 100 } else { 300 }   // no `ret` needed
 }
 
 fn main() -> i32 {
-  println($"{pick(0)}")   // prints 0, not 100
-  println($"{pick(1)}")   // prints 0, not 300
+  println($"{pick(0)}")   // prints 100
+  println($"{pick(1)}")   // prints 300
   ret 0
 }
 ```
 
-`match` in the exact same tail position works correctly (prints the right
-value for both arms), and `if`/`else` bound to a `let` (`let x = if ... {
-...} else { ... }`, including as the tail of a nested `{ }` block) also
-works correctly. The bug is specific to a bare `if`/`else` occupying a
-function body's outermost tail position.
-
-**Supported** - always use an explicit `ret`:
+This requires an `else`: a tail `if` with no `else` has nothing to return in
+a non-void function, and is a compile error (`if expression is missing an
+else branch`) rather than a silently wrong value. A tail `if` with no `else`
+in a `void` function is unaffected - there is no return value to produce
+either way.
 
 ```glyph
 fn pick(n: i32) -> i32 {
-  ret if n == 0 { 100 } else { 300 }
+  if n == 0 { 100 }   // error: missing an else branch
 }
 ```
-
-Found while writing this page; needs a ticket. Given that omitting `ret`
-before a tail `if`/`else` is a natural, commonly-generated pattern and fails
-silently rather than with a diagnostic, this is a good candidate for a HIGH
-priority bug.
 
 ## Views and ownership
 
@@ -708,12 +697,6 @@ compiler bug with a minimal repro.
 
 ## Known issues (open tickets)
 
-- **Untracked, high priority** - a bare `if`/`else` in a function body's
-  outermost tail position (no explicit `ret`) silently returns a default
-  value instead of the taken branch's value, for every branch. `match` in
-  the same position, and `if`/`else` bound to a `let`, both work correctly.
-  See [`if`/`else` as an implicit tail return](#ifelse-as-an-implicit-tail-return-untracked)
-  above. Found while writing this page; needs a ticket.
 - **GLYPH-66** - no integer-literal `match` patterns; use `if`/`else`.
 - **GLYPH-75** - a large literal used inline as an `as` operand truncates to
   `i32` range before the cast is applied.

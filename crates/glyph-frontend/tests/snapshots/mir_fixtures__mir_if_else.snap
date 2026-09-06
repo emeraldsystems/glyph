@@ -9,7 +9,16 @@ MirModule {
             name: "main",
             ret_type: None,
             params: [],
-            locals: [],
+            locals: [
+                Local {
+                    name: None,
+                    ty: Some(
+                        Void,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+            ],
             blocks: [
                 MirBlock {
                     insts: [

@@ -18,6 +18,22 @@ MirModule {
                     mutable: false,
                     skip_drop: false,
                 },
+                Local {
+                    name: None,
+                    ty: Some(
+                        Void,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
+                Local {
+                    name: None,
+                    ty: Some(
+                        Void,
+                    ),
+                    mutable: false,
+                    skip_drop: false,
+                },
             ],
             blocks: [
                 MirBlock {
