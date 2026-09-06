@@ -201,7 +201,14 @@ impl CodegenContext {
                 )
             };
             let llvm_field_ty = self.get_llvm_type(&field_ty)?;
-            let signed = matches!(field_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64);
+            // Extension follows the FIELD VALUE's own source signedness,
+            // not the declared field type's (GLYPH-73): `S { v: u }` with
+            // `u: u8` and field `v: i64` must zero-extend `u`.
+            let src_ty = self.mir_value_type(value, func);
+            let signed = src_ty.as_ref().map_or_else(
+                || matches!(field_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64),
+                |ty| Self::int_ext_is_signed(ty),
+            );
             llvm_field_val = self.coerce_int_value(llvm_field_val, llvm_field_ty, signed);
             unsafe {
                 LLVMBuildStore(self.builder, llvm_field_val, field_ptr);

@@ -580,6 +580,89 @@ fn jit_calls_non_capturing_function_value_with_scalar_result() {
     assert!(ir.contains("call.indirect"));
 }
 
+/// GLYPH-73: `codegen_callable_argument` (codegen/callable.rs) must derive
+/// sign/zero extension from the ARGUMENT's own Glyph type, not the
+/// callable's declared parameter type. The frontend resolver requires an
+/// exact type match at a `function(value)` invocation site, so this
+/// width-mismatched argument can't be produced by compiling Glyph source
+/// (see `calling_a_callable_value_directly_requires_an_exact_type_match` in
+/// `crates/glyph-cli/tests/codegen_int_widening.rs`); this test constructs
+/// the MIR directly to exercise the coercion in isolation and guard against
+/// a future resolver relaxation reintroducing the sign-extension bug.
+#[test]
+fn jit_calls_function_value_zero_extends_unsigned_argument() {
+    let signature = Type::Function {
+        params: vec![Type::I64],
+        ret: Box::new(Type::I64),
+    };
+    let mut ctx = CodegenContext::new("callable_unsigned_widen").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        extern_functions: vec![],
+        functions: vec![
+            MirFunction {
+                name: "identity64".into(),
+                ret_type: Some(Type::I64),
+                params: vec![LocalId(0)],
+                locals: vec![typed_local(Type::I64)],
+                blocks: vec![MirBlock {
+                    insts: vec![MirInst::Return(Some(MirValue::Local(LocalId(0))))],
+                }],
+            },
+            MirFunction {
+                name: "main".into(),
+                ret_type: Some(Type::I32),
+                params: vec![],
+                // 0: the callable value; 1: a u32 arg holding all bits set
+                // (4294967295); 2: the i64 call result.
+                locals: vec![
+                    typed_local(signature.clone()),
+                    typed_local(Type::U32),
+                    typed_local(Type::I64),
+                ],
+                blocks: vec![MirBlock {
+                    insts: vec![
+                        MirInst::Assign {
+                            local: LocalId(0),
+                            value: Rvalue::FunctionRef {
+                                name: "identity64".into(),
+                                signature: signature.clone(),
+                            },
+                        },
+                        MirInst::Assign {
+                            local: LocalId(1),
+                            value: Rvalue::ConstInt(4294967295),
+                        },
+                        MirInst::Assign {
+                            local: LocalId(2),
+                            value: Rvalue::CallIndirect {
+                                callee: LocalId(0),
+                                signature,
+                                args: vec![MirValue::Local(LocalId(1))],
+                            },
+                        },
+                        MirInst::Return(Some(MirValue::Int(0))),
+                    ],
+                }],
+            },
+        ],
+    };
+
+    ctx.codegen_module(&mir).unwrap();
+    let ir = ctx.dump_ir();
+    assert!(
+        ir.contains("zext i32") && ir.contains("to i64"),
+        "u32 argument to an indirect call must zero-extend:\n{}",
+        ir
+    );
+    assert!(
+        !ir.contains("sext i32"),
+        "u32 argument to an indirect call must not sign-extend:\n{}",
+        ir
+    );
+}
+
 #[test]
 fn jit_calls_zero_argument_unit_function_value() {
     let signature = Type::Function {
