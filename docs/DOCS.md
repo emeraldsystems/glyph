@@ -19,6 +19,11 @@ Where things live under `docs/`:
 - **`docs/todo/`** — open work-tracking notes per subsystem (case system,
   compiler diagnostics, extern C, formatting, JSON parsing, modules,
   stdlib I/O, `Vec`).
+- **`docs/design/`** — design notes, APIs, formatting summaries, and other
+  architectural write-ups (local working notes; not tracked in git).
+- **`docs/language_expansion/`** — implementation-ready roadmap and feature
+  specs for the language + stdlib expansion cycle (local working notes; not
+  tracked in git).
 - **`docs/reports/`** — standalone analysis reports (e.g. LLM
   reasoning-efficiency study).
 
