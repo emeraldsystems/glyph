@@ -2,6 +2,7 @@ pub mod ast;
 pub mod atomic;
 pub mod diag;
 pub mod mir;
+pub mod mir_verify;
 pub mod span;
 pub mod thread;
 pub mod thread_safety;
