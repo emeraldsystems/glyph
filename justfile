@@ -27,6 +27,10 @@ test:
 demo:
     ./demo.sh
 
+# Run the release validation matrix (builds glyph-cli, exercises example programs)
+release-matrix:
+    ./scripts/release-matrix.sh
+
 # Uninstall all glyph binaries
 uninstall:
     cargo uninstall glyph glyph-cli
