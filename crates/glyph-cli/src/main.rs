@@ -318,73 +318,21 @@ fn run(path: &PathBuf) -> Result<()> {
         let mut ctx = CodegenContext::new("glyph_module")?;
         ctx.codegen_module(&output.mir)?;
 
-        // Provide runtime symbols that are normally supplied by the AOT runtime library.
-        // When running via JIT, we need to make them available in-process.
+        // Runtime symbols that are normally supplied by the AOT runtime
+        // library. This map is now just an *optional override* point: every
+        // runtime/*.c function (glyph_fmt_*, glyph_json_*, glyph_time_*,
+        // glyph_term_*, glyph_process_run, glyph_net_*, glyph_audio_*, ...)
+        // is force-loaded into this binary's process image (see
+        // build.rs::force_load_runtime_archive) and gets resolved
+        // automatically by `jit_execute_i32_with_symbols` via a
+        // process-wide symbol search for anything not listed here
+        // (glyph-backend/src/codegen/emit.rs, GLYPH-83). The thread runtime
+        // symbols are still registered explicitly because
+        // `thread_runtime::register_symbols`'s doc comment notes a second
+        // reason for referencing them directly from Rust: doing so is what
+        // keeps those particular archive members retained in the first
+        // place for other (non-force-loaded) build configurations.
         let mut symbols = HashMap::new();
-        symbols.insert(
-            "glyph_byte_at".to_string(),
-            glyph_byte_at as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_time_now".to_string(),
-            glyph_time_now as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_time_monotonic_ns".to_string(),
-            glyph_time_monotonic_ns as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_time_sleep_ms".to_string(),
-            glyph_time_sleep_ms as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_time_sleep_us".to_string(),
-            glyph_time_sleep_us as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_time_sleep_until_ns".to_string(),
-            glyph_time_sleep_until_ns as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_time_to_human_readable".to_string(),
-            glyph_time_to_human_readable as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_process_run".to_string(),
-            glyph_process_run as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_term_stdout".to_string(),
-            glyph_term_stdout as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_term_enter_ui_session".to_string(),
-            glyph_term_enter_ui_session as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_term_session_end".to_string(),
-            glyph_term_session_end as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_term_move_to".to_string(),
-            glyph_term_move_to as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_term_clear_line".to_string(),
-            glyph_term_clear_line as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_term_write_str".to_string(),
-            glyph_term_write_str as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_term_flush".to_string(),
-            glyph_term_flush as *const () as usize as u64,
-        );
-        symbols.insert(
-            "glyph_term_poll_event".to_string(),
-            glyph_term_poll_event as *const () as usize as u64,
-        );
         thread_runtime::register_symbols(&mut symbols);
 
         let exit = ctx.jit_execute_i32_with_symbols("main", &symbols)?;
@@ -401,326 +349,21 @@ fn run(path: &PathBuf) -> Result<()> {
     }
 }
 
-// Runtime helper used by std/string::byte_at (link_name = "glyph_byte_at").
-// This mirrors runtime/glyph_json.c so JIT execution can resolve the symbol.
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_byte_at(s: *const std::ffi::c_char, index: usize) -> u8 {
-    if s.is_null() {
-        return 0;
-    }
-    unsafe {
-        let mut p = s as *const u8;
-        let mut i: usize = 0;
-        loop {
-            let b = *p;
-            if b == 0 {
-                return 0;
-            }
-            if i == index {
-                return b;
-            }
-            i += 1;
-            p = p.add(1);
-        }
-    }
-}
-
-#[cfg(feature = "codegen")]
-std::thread_local! {
-    static GLYPH_TIME_BUFFER: std::cell::UnsafeCell<[u8; 20]> =
-        const { std::cell::UnsafeCell::new([0; 20]) };
-}
-
-#[cfg(feature = "codegen")]
-fn glyph_time_buffer_ptr() -> *const std::ffi::c_char {
-    GLYPH_TIME_BUFFER.with(|buffer| buffer.get().cast::<u8>().cast::<std::ffi::c_char>())
-}
-
-#[cfg(feature = "codegen")]
-unsafe fn glyph_time_buffer_mut_ptr() -> *mut u8 {
-    GLYPH_TIME_BUFFER.with(|buffer| buffer.get().cast::<u8>())
-}
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_now() -> u64 {
-    let t = unsafe { libc::time(std::ptr::null_mut()) };
-    if t == -1 { 0 } else { t as u64 }
-}
-
-#[cfg(all(feature = "codegen", unix))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_monotonic_ns() -> u64 {
-    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
-        return 0;
-    }
-    (now.tv_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(now.tv_nsec as u64)
-}
-
-#[cfg(all(feature = "codegen", unix))]
-fn glyph_time_sleep_duration(seconds: libc::time_t, nanos: libc::c_long) -> i32 {
-    let requested = libc::timespec {
-        tv_sec: seconds,
-        tv_nsec: nanos,
-    };
-    if unsafe { libc::nanosleep(&requested, std::ptr::null_mut()) } == 0 {
-        0
-    } else {
-        -1
-    }
-}
-
-#[cfg(all(feature = "codegen", unix))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_sleep_ms(ms: u32) -> i32 {
-    glyph_time_sleep_duration(
-        (ms / 1_000) as libc::time_t,
-        ((ms % 1_000) * 1_000_000) as _,
-    )
-}
-
-#[cfg(all(feature = "codegen", unix))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_sleep_us(us: u32) -> i32 {
-    glyph_time_sleep_duration(
-        (us / 1_000_000) as libc::time_t,
-        ((us % 1_000_000) * 1_000) as _,
-    )
-}
-
-#[cfg(all(feature = "codegen", unix))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_sleep_until_ns(deadline_ns: u64) -> i32 {
-    loop {
-        let now = glyph_time_monotonic_ns();
-        if now == 0 {
-            return -1;
-        }
-        if now >= deadline_ns {
-            return 0;
-        }
-        let remaining = deadline_ns - now;
-        let rc = glyph_time_sleep_duration(
-            (remaining / 1_000_000_000) as libc::time_t,
-            (remaining % 1_000_000_000) as libc::c_long,
-        );
-        if rc == 0 {
-            return 0;
-        }
-        let interrupted = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
-        if !interrupted {
-            return -1;
-        }
-    }
-}
-
-#[cfg(all(feature = "codegen", not(unix)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_monotonic_ns() -> u64 {
-    0
-}
-
-#[cfg(all(feature = "codegen", not(unix)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_sleep_ms(_ms: u32) -> i32 {
-    -1
-}
-
-#[cfg(all(feature = "codegen", not(unix)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_sleep_us(_us: u32) -> i32 {
-    -1
-}
-
-#[cfg(all(feature = "codegen", not(unix)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_sleep_until_ns(_deadline_ns: u64) -> i32 {
-    -1
-}
-
-#[cfg(all(feature = "codegen", unix))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_to_human_readable(ts: u64) -> *const std::ffi::c_char {
-    let t = ts as libc::time_t;
-    unsafe {
-        *glyph_time_buffer_mut_ptr() = 0;
-    }
-    if t as u64 != ts {
-        return glyph_time_buffer_ptr();
-    }
-
-    let mut tm_out: libc::tm = unsafe { std::mem::zeroed() };
-    let t_copy = t;
-    let res =
-        unsafe { libc::gmtime_r(&t_copy as *const libc::time_t, &mut tm_out as *mut libc::tm) };
-    if res.is_null() {
-        return glyph_time_buffer_ptr();
-    }
-
-    let formatted = format!(
-        "{:02}/{:02}/{:04} {:02}:{:02}:{:02}",
-        tm_out.tm_mday,
-        tm_out.tm_mon + 1,
-        tm_out.tm_year + 1900,
-        tm_out.tm_hour,
-        tm_out.tm_min,
-        tm_out.tm_sec
-    );
-    let bytes = formatted.as_bytes();
-    if bytes.len() != 19 {
-        unsafe {
-            *glyph_time_buffer_mut_ptr() = 0;
-        }
-        return glyph_time_buffer_ptr();
-    }
-    unsafe {
-        let ptr = glyph_time_buffer_mut_ptr();
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, 19);
-        *ptr.add(19) = 0;
-    }
-
-    glyph_time_buffer_ptr()
-}
-
-#[cfg(all(feature = "codegen", not(unix)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_time_to_human_readable(_ts: u64) -> *const std::ffi::c_char {
-    unsafe {
-        *glyph_time_buffer_mut_ptr() = 0;
-    }
-    glyph_time_buffer_ptr()
-}
-
-#[cfg(feature = "codegen")]
-#[repr(C)]
-pub struct GlyphVec {
-    pub data: *mut std::ffi::c_void,
-    pub len: i64,
-    pub cap: i64,
-}
-
-// Runtime helper used by std/process::run (link_name = "glyph_process_run").
-// The AOT path provides this via runtime/glyph_process.c; the JIT path needs an
-// in-process implementation.
-#[cfg(all(feature = "codegen", unix))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_process_run(cmd: *const std::ffi::c_char, args: GlyphVec) -> i32 {
-    use std::ffi::CStr;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::Command;
-
-    if cmd.is_null() {
-        return -(libc::EINVAL as i32);
-    }
-    if args.len < 0 {
-        return -(libc::EINVAL as i32);
-    }
-
-    let cmd_bytes = unsafe { CStr::from_ptr(cmd) }.to_bytes();
-    let cmd_os = std::ffi::OsStr::from_bytes(cmd_bytes);
-
-    let mut child = Command::new(cmd_os);
-
-    let arg_ptrs = args.data as *const *const std::ffi::c_char;
-    for i in 0..args.len {
-        let p = unsafe { *arg_ptrs.offset(i as isize) };
-        if p.is_null() {
-            continue;
-        }
-        let bytes = unsafe { CStr::from_ptr(p) }.to_bytes();
-        child.arg(std::ffi::OsStr::from_bytes(bytes));
-    }
-
-    match child.status() {
-        Ok(status) => {
-            if let Some(code) = status.code() {
-                code as i32
-            } else if let Some(sig) = status.signal() {
-                128 + sig
-            } else {
-                -(libc::EINVAL as i32)
-            }
-        }
-        Err(e) => -(e.raw_os_error().unwrap_or(1) as i32),
-    }
-}
-
-#[cfg(all(feature = "codegen", not(unix)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_process_run(_cmd: *const std::ffi::c_char, _args: GlyphVec) -> i32 {
-    -(libc::ENOSYS as i32)
-}
-
-#[cfg(feature = "codegen")]
-static mut GLYPH_TERM_ACTIVE_SESSION: i32 = 0;
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_term_stdout() -> i32 {
-    1
-}
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_term_enter_ui_session(term_id: i32) -> i32 {
-    if term_id != 1 {
-        return -2;
-    }
-    unsafe {
-        if GLYPH_TERM_ACTIVE_SESSION != 0 {
-            return -1;
-        }
-        GLYPH_TERM_ACTIVE_SESSION = 1;
-    }
-    0
-}
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_term_session_end(term_id: i32) -> i32 {
-    if term_id != 1 {
-        return -2;
-    }
-    unsafe {
-        GLYPH_TERM_ACTIVE_SESSION = 0;
-    }
-    0
-}
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_term_move_to(term_id: i32, _row: u32, _col: u32) -> i32 {
-    if term_id != 1 { -2 } else { 0 }
-}
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_term_clear_line(term_id: i32) -> i32 {
-    if term_id != 1 { -2 } else { 0 }
-}
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_term_write_str(term_id: i32, _s: *const std::ffi::c_char) -> i32 {
-    if term_id != 1 { -2 } else { 0 }
-}
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_term_flush(term_id: i32) -> i32 {
-    if term_id != 1 { -2 } else { 0 }
-}
-
-#[cfg(feature = "codegen")]
-#[unsafe(no_mangle)]
-pub extern "C" fn glyph_term_poll_event(term_id: i32, _timeout_ms: u32) -> i32 {
-    if term_id != 1 { -2 } else { 0 }
-}
+// GLYPH-83: this file used to carry hand-written Rust re-implementations of
+// glyph_byte_at, glyph_time_*, glyph_process_run, and glyph_term_* here so
+// the JIT path in `run()` above could register their addresses (the real
+// runtime/*.c definitions of those same functions were never linked into
+// this binary, because nothing in Rust referenced them, so the static
+// archive dropped those .o members). That is no longer true: build.rs now
+// force-loads the entire runtime archive into this crate's binaries (see
+// `force_load_runtime_archive` there), so every runtime/*.c function is
+// present in-process, and `CodegenContext::jit_execute_i32_with_symbols`
+// resolves any extern not in its explicit `symbols` map by searching the
+// process image directly (glyph-backend/src/codegen/emit.rs). Keeping both
+// the Rust duplicates and the force-loaded C originals would double-define
+// the same symbol names and fail to link, so the duplicates were deleted;
+// the real runtime/*.c implementations (already exercised by the AOT path)
+// are now the single implementation for both JIT and AOT execution.
 
 #[cfg(test)]
 mod tests {
@@ -773,7 +416,19 @@ mod tests {
     #[test]
     fn jit_time_format_buffer_is_thread_local() {
         use std::ffi::CStr;
+        use std::ffi::c_char;
         use std::sync::{Arc, Barrier};
+
+        // GLYPH-83: glyph_time_to_human_readable no longer has a Rust
+        // duplicate in this crate (see the comment above `mod tests`) — it
+        // is provided by the force-loaded runtime/glyph_time.c archive
+        // member, exactly as the AOT path already used. Declare it here to
+        // exercise the real, shared implementation's thread-local scratch
+        // buffer directly, the same way thread_runtime.rs's tests declare
+        // the thread/mutex runtime symbols they exercise.
+        unsafe extern "C" {
+            fn glyph_time_to_human_readable(ts: u64) -> *const c_char;
+        }
 
         let first_formatted = Arc::new(Barrier::new(2));
         let second_formatted = Arc::new(Barrier::new(2));
@@ -781,7 +436,7 @@ mod tests {
         let first_ready = Arc::clone(&first_formatted);
         let second_ready = Arc::clone(&second_formatted);
         let first = std::thread::spawn(move || {
-            let view = glyph_time_to_human_readable(0);
+            let view = unsafe { glyph_time_to_human_readable(0) };
             first_ready.wait();
             second_ready.wait();
             unsafe { CStr::from_ptr(view) }
@@ -793,7 +448,7 @@ mod tests {
         let second_ready = Arc::clone(&second_formatted);
         let second = std::thread::spawn(move || {
             first_ready.wait();
-            let view = glyph_time_to_human_readable(86_400);
+            let view = unsafe { glyph_time_to_human_readable(86_400) };
             let value = unsafe { CStr::from_ptr(view) }
                 .to_string_lossy()
                 .into_owned();

@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 build = "build.rs"
+# Exposes DEP_GLYPH_RUNTIME_RUNTIME_ARCHIVE to direct dependents' build
+# scripts (see build.rs) so glyph-cli can force-load the whole runtime
+# archive into its binaries for JIT symbol resolution (GLYPH-83).
+links = "glyph_runtime"
 
 [features]
 default = []
