@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2189d824.js";
+            window.path_to_searchindex_js = "searchindex-7d31c47f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-c681401e.js"></script>
+        <script src="toc-559cdf70.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,6 +178,9 @@
                         <h1 id="glyph"><a class="header" href="#glyph">Glyph</a></h1>
 <p>Glyph is a compact, compiled language designed to be readable by humans and efficient for LLMs to generate.
 This book collects the essentials for getting started and building small, reliable tools.</p>
+<p>Before relying on a specific value-category, inference, or ABI rule, check the
+<a href="#limitations">Limitations</a> page - it documents the current release’s real
+sharp edges with verified examples of what does and doesn’t compile.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
 <p>Build the toolchain with Cargo, then use the <code>glyph</code> utility for day-to-day work:</p>
@@ -1471,6 +1474,536 @@ fn main() -&gt; i32 {
 <li>negative values: an OS error code (typically <code>-errno</code>)</li>
 </ul>
 <p>Platform note: currently implemented on Unix; on other platforms it returns <code>-ENOSYS</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="limitations"><a class="header" href="#limitations">Limitations</a></h1>
+<p>Glyph’s type system and codegen have real, sharp-edged limits. This page is
+the authoritative list of value-category, inference, and ABI rules that are
+part of the current release contract, not scattered caveats. Every rule below
+was verified against the current compiler by compiling a small program; the
+exact diagnostic is quoted where one is produced. For a broader pass/fail
+matrix across language features, see <code>docs/release/validation-matrix.md</code>.</p>
+<h2 id="collection-constructors"><a class="header" href="#collection-constructors">Collection constructors</a></h2>
+<p>Bare <code>Vec::new()</code> / <code>Map::new()</code> infer their type parameters from later use in
+the same function (a <code>push</code>/<code>add</code> call, the enclosing <code>let</code>’s annotation, or
+the function’s declared return type) - an explicit annotation is not
+required.</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">fn main() -&gt; i32 {
+  let mut v = Vec::new()
+  v.push(String::from_str("a"))
+  v.push(String::from_str("bb"))
+  ret v.len() as i32
+}
+</code></pre>
+<pre><code class="language-glyph">fn make() -&gt; Vec&lt;String&gt; {
+  ret Vec::new()  // element type inferred from the return type
+}
+</code></pre>
+<p>An annotation is still useful for readability, and is required if nothing in
+the function ever constrains the type parameter (in that case the compiler
+falls back to a default rather than erroring).</p>
+<h2 id="local-receiver-requirement-and-struct-collection-fields"><a class="header" href="#local-receiver-requirement-and-struct-collection-fields">Local-receiver requirement and struct collection fields</a></h2>
+<p>A struct field of collection or array type (<code>Vec&lt;T&gt;</code>, <code>Map&lt;K,V&gt;</code>, <code>[T; N]</code>)
+cannot have a method called on it, be indexed, or be moved out of the struct
+directly. <code>glyph-cli check</code> (type-check only) does not catch this - only
+<code>glyph-cli build</code> (and <code>glyph run</code>) does, because the check happens during MIR
+lowering, later than type-checking.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>cannot move field 'items' out of a struct; borrow it (...), clone it (...), or move the whole struct</code>)</p>
+<pre><code class="language-glyph">struct Holder { items: Vec&lt;i32&gt; }
+
+fn main() -&gt; i32 {
+  let mut h = Holder { items: Vec::new() }
+  h.items.push(1)          // error, and so does h.items.len(), h.items.clone()
+  ret h.items.len() as i32
+}
+</code></pre>
+<p><strong>Supported</strong> - borrow the field into a function parameter:</p>
+<pre><code class="language-glyph">struct Holder { items: Vec&lt;i32&gt; }
+
+fn push_one(v: &amp;mut Vec&lt;i32&gt;) -&gt; i32 {
+  v.push(1)
+  ret v.len() as i32
+}
+
+fn main() -&gt; i32 {
+  let mut h = Holder { items: Vec::new() }
+  ret push_one(&amp;mut h.items)   // 1
+}
+</code></pre>
+<p>This also affects fixed-size array fields (<code>[T; N]</code>) - see
+<a href="#array-typed-struct-fields-glyph-79">Array-typed struct fields</a> below.</p>
+<h2 id="cross-module-field-access"><a class="header" href="#cross-module-field-access">Cross-module field access</a></h2>
+<p>Accessing a struct’s fields from another module requires importing the struct
+<strong>type</strong> itself, not just the functions that construct or return it.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>struct 'Point' has no field named 'x'</code>)</p>
+<pre><code class="language-glyph">// main.glyph
+from point import make_point   // Point itself is not imported
+
+fn main() -&gt; i32 {
+  let p = make_point(3, 4)
+  ret p.x + p.y               // error
+}
+</code></pre>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">from point import make_point, Point
+
+fn main() -&gt; i32 {
+  let p = make_point(3, 4)
+  ret p.x + p.y                // 7
+}
+</code></pre>
+<h2 id="match-consumption-exhaustiveness-patterns"><a class="header" href="#match-consumption-exhaustiveness-patterns">Match: consumption, exhaustiveness, patterns</a></h2>
+<p><code>match</code> moves (consumes) its scrutinee by value; the matched local cannot be
+used again afterward.</p>
+<p><strong>Not supported</strong> (diagnostic: <code> `use of moved value `o` of type `Option&lt;i32&gt;</code> ``)</p>
+<pre><code class="language-glyph">from std/enums import Option
+
+fn main() -&gt; i32 {
+  let o = Option::Some(5)
+  let r = match o { Some(v) =&gt; v, None =&gt; 0 }
+  let r2 = match o { Some(v) =&gt; v, None =&gt; 0 }  // error: o already moved
+  ret r + r2
+}
+</code></pre>
+<p><code>match</code> must be exhaustive.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>`non-exhaustive match: cover all variants or add `_` arm`</code>)</p>
+<pre><code class="language-glyph">from std/enums import Option
+
+fn main() -&gt; i32 {
+  let o = Option::Some(5)
+  ret match o { Some(v) =&gt; v }   // missing None
+}
+</code></pre>
+<p>Integer-literal patterns are not supported (GLYPH-66) - use <code>if</code>/<code>else</code>
+instead.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>expected variant name</code>)</p>
+<pre><code class="language-glyph">fn classify(n: i32) -&gt; i32 {
+  ret match n { 0 =&gt; 100, 1 =&gt; 200, _ =&gt; 300 }   // error
+}
+</code></pre>
+<p><strong>Supported</strong> (note the explicit <code>ret</code> - see
+<a href="#ifelse-as-an-implicit-tail-return-untracked"><code>if</code>/<code>else</code> as an implicit tail return</a>
+below for why it’s needed here)</p>
+<pre><code class="language-glyph">fn classify(n: i32) -&gt; i32 {
+  ret if n == 0 { 100 } else if n == 1 { 200 } else { 300 }
+}
+</code></pre>
+<p>Bare unit enum variants construct and match without parentheses.</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">enum Val { Nil, Num(i32) }
+
+fn main() -&gt; i32 {
+  let v = Val::Nil
+  ret match v { Nil =&gt; 0, Num(_n) =&gt; 1 }   // 0
+}
+</code></pre>
+<h2 id="references-are-local-only"><a class="header" href="#references-are-local-only">References are local-only</a></h2>
+<p><code>&amp;T</code> / <code>&amp;mut T</code> can only be taken to a local variable, cannot be stored in a
+struct field, and cannot be returned from a function.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>a borrowed reference or callable cannot be stored in an aggregate; keep it in a direct lexical binding</code>)</p>
+<pre><code class="language-glyph">struct Holder { r: &amp;i32 }
+
+fn main() -&gt; i32 {
+  let x = 5
+  let h = Holder { r: &amp;x }   // error
+  ret 0
+}
+</code></pre>
+<p><strong>Not supported</strong> (diagnostic: <code>borrowed references cannot escape through return; return owned data instead</code>)</p>
+<pre><code class="language-glyph">fn get_ref(x: &amp;i32) -&gt; &amp;i32 {
+  ret x   // error
+}
+</code></pre>
+<p>Field access through a reference does auto-dereference:</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">struct Point { x: i32 }
+
+fn get_x(p: &amp;Point) -&gt; i32 {
+  ret p.x
+}
+
+fn main() -&gt; i32 {
+  let point = Point { x: 4 }
+  ret get_x(&amp;point)   // 4 - note &amp;point, not &amp;Point{x:4}: references
+                       // can only be taken to locals, not temporaries
+}
+</code></pre>
+<p><strong>Known issue (untracked, found while verifying this page):</strong> binary
+operators do <strong>not</strong> auto-dereference a <code>&amp;i32</code> the way field access does.
+<code>ret x + 1</code> where <code>x: &amp;i32</code> incorrectly reports <code>scoped or borrowed value cannot escape through return</code> (a misleading diagnostic - the result is a
+plain <code>i32</code>, not a reference). Worse, if the same expression is not directly
+returned (e.g. <code>let v = x; let sum = v + 1; ret 0</code>), the compiler emits
+invalid LLVM IR and crashes with <code>LLVM module verification failed: Both operands to a binary operator are not of the same type! %binop = add ptr %load1, i32 1</code> instead of producing any diagnostic. The same applies to
+comparisons (<code>x == 5</code>). This reproduces on current master and should be
+filed as a new bug; workaround: copy the referenced value into a local via
+a struct/function boundary that already dereferences it (e.g. field access),
+rather than doing arithmetic directly on a <code>&amp;i32</code> parameter.</p>
+<h2 id="array-literals"><a class="header" href="#array-literals">Array literals</a></h2>
+<p>Fixed-size arrays (<code>[T; N]</code>) work, and the element type follows the
+annotation.</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">fn main() -&gt; i32 {
+  let a: [i32; 3] = [1, 2, 3]
+  ret a[0] + a[1] + a[2]   // 6
+}
+</code></pre>
+<p>An element literal that is out of range for the declared element type is now
+a compile error (GLYPH-74).</p>
+<p><strong>Not supported</strong> (diagnostic: <code>integer literal 300 is out of range for 'u8' (valid range 0..=255)</code>)</p>
+<pre><code class="language-glyph">fn main() -&gt; i32 {
+  let a: [u8; 2] = [300, 1]   // error
+  ret a[0] as i32
+}
+</code></pre>
+<p><strong>Known issue (untracked):</strong> a literal with <strong>more elements than the
+declared size</strong> is not rejected - <code>let a: [i32; 2] = [1, 2, 3]</code> compiles and
+runs without any diagnostic (indexing only the first two slots). This looks
+like a gap in the same check that GLYPH-74 added for out-of-range values, and
+should be filed as a follow-up.</p>
+<h3 id="array-typed-struct-fields-glyph-79"><a class="header" href="#array-typed-struct-fields-glyph-79">Array-typed struct fields (GLYPH-79)</a></h3>
+<p>Still open. Both moving an array field out of a struct and indexing into it
+directly - even through a <code>&amp;Struct</code> parameter - hit the same “cannot move
+field out of a struct” diagnostic as collection fields (see
+<a href="#local-receiver-requirement-and-struct-collection-fields">Local-receiver requirement</a>
+above); there is currently no working pattern to read an individual element
+of an array-typed struct field.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>cannot move field 'xs' out of a struct; borrow it (...), clone it (...), or move the whole struct</code>)</p>
+<pre><code class="language-glyph">struct Holder { xs: [i32; 3] }
+
+fn get(h: &amp;Holder) -&gt; i32 {
+  ret h.xs[1]   // error, even through a reference
+}
+</code></pre>
+<h3 id="negative-literal-into-a-float-type-glyph-78"><a class="header" href="#negative-literal-into-a-float-type-glyph-78">Negative literal into a float type (GLYPH-78)</a></h3>
+<p>Still open, and worse than “not promoted”: it is a silent wrong-value bug,
+not a rejection.</p>
+<p><strong>Not supported (silently wrong, no diagnostic)</strong></p>
+<pre><code class="language-glyph">from std/io import println
+
+fn main() -&gt; i32 {
+  let x: f64 = -1
+  println($"{x}")   // prints 4.2439915814e-314, not -1
+  ret 0
+}
+</code></pre>
+<h3 id="large-literal-as-an-inline-as-operand-glyph-75"><a class="header" href="#large-literal-as-an-inline-as-operand-glyph-75">Large literal as an inline <code>as</code> operand (GLYPH-75)</a></h3>
+<p>Still open: a literal that doesn’t fit <code>i32</code> is truncated to <code>i32</code> range
+<em>before</em> the <code>as</code> cast is applied, when it appears directly as the cast’s
+operand.</p>
+<p><strong>Not supported (silently wrong, no diagnostic)</strong></p>
+<pre><code class="language-glyph">from std/io import println
+
+fn main() -&gt; i32 {
+  let x = 6300000000 as u64
+  println($"{x}")   // prints 2005032704 (6300000000 mod 2^32), not 6300000000
+  ret 0
+}
+</code></pre>
+<p>Workaround: bind the value to an explicitly <code>u64</code>-typed <code>let</code> first, or use a
+literal that already fits <code>i32</code> before widening.</p>
+<h2 id="integers"><a class="header" href="#integers">Integers</a></h2>
+<p>Widths: <code>i8</code>/<code>i16</code>/<code>i32</code>/<code>i64</code>, <code>u8</code>/<code>u16</code>/<code>u32</code>/<code>u64</code>, <code>usize</code>. There are
+<strong>no shift operators</strong>.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>unexpected token in expression</code>)</p>
+<pre><code class="language-glyph">fn main() -&gt; i32 {
+  ret 1 &lt;&lt; 3   // error - not part of the grammar
+}
+</code></pre>
+<p>Arithmetic wraps at each width’s boundary.</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">from std/io import println
+
+fn main() -&gt; i32 {
+  let x: i8 = 127
+  println($"{x + 1}")   // -128
+  ret 0
+}
+</code></pre>
+<p>Implicit <strong>lossless widening</strong> at call/let/field/return boundaries is
+accepted, and an unsigned source zero-extends.</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">fn take_i64(x: i64) -&gt; i64 { ret x }
+
+fn main() -&gt; i32 {
+  let a: i32 = 42
+  ret take_i64(a) as i32   // 42, i32 -&gt; i64 widens implicitly
+}
+</code></pre>
+<p>Unsigned <code>&lt;</code>, <code>/</code>, and <code>%</code> use unsigned semantics (GLYPH-76).</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">fn main() -&gt; i32 {
+  let a: u32 = 4294967295   // u32::MAX
+  let b: u32 = 2
+  ret if a &lt; b { 1 } else { 0 }   // 0 - correctly unsigned, not -1 &lt; 2
+}
+</code></pre>
+<p><code>Vec&lt;u8&gt;</code> works at any size (GLYPH-72; previously corrupted the heap above a
+threshold).</p>
+<p><strong>Supported</strong> - pushing 5000 <code>u8</code> elements works and reports the correct
+length.</p>
+<p><strong>Known issue, decision pending (GLYPH-77):</strong> implicit <strong>narrowing</strong> (e.g.
+<code>i64</code> -&gt; <code>i32</code> parameter) silently truncates, and a same-width signed &lt;-&gt;
+unsigned conversion is silently accepted as a bit-reinterpretation. Neither
+produces a diagnostic today; an explicit <code>as</code> is recommended at these
+boundaries until GLYPH-77 is decided.</p>
+<p><strong>Currently silent (no diagnostic)</strong></p>
+<pre><code class="language-glyph">fn take_i32(x: i32) -&gt; i32 { ret x }
+
+fn main() -&gt; i32 {
+  let big: i64 = 4294967297     // 2^32 + 1
+  ret take_i32(big)             // 1, truncated silently
+}
+</code></pre>
+<pre><code class="language-glyph">from std/io import println
+
+fn take_u32(x: u32) -&gt; u32 { ret x }
+
+fn main() -&gt; i32 {
+  let s: i32 = -1
+  println($"{take_u32(s)}")   // 4294967295 (u32::MAX) - bits reinterpreted
+  ret 0
+}
+</code></pre>
+<h2 id="floats"><a class="header" href="#floats">Floats</a></h2>
+<p>Fully supported: literals, arithmetic, comparisons, int/float promotion,
+<code>f64</code> params/returns, <code>Vec&lt;f64&gt;</code>, <code>as</code> casts with Rust semantics, and
+<code>std/math</code>.</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">from std/vec import Vec
+
+fn add(a: f64, b: f64) -&gt; f64 { ret a + b }
+
+fn main() -&gt; i32 {
+  let z = add(1.5, 2.5)
+  let mut v: Vec&lt;f64&gt; = Vec::new()
+  v.push(z)
+  ret if v[0] &gt; 3.0 { 0 } else { 1 }   // 0
+}
+</code></pre>
+<p>See <a href="#negative-literal-into-a-float-type-glyph-78">Negative literal into a float type</a>
+above for the one open gap (negative literals specifically).</p>
+<h2 id="extern-c-abi"><a class="header" href="#extern-c-abi"><code>extern "C"</code> ABI</a></h2>
+<p>Scalars (<code>i8</code>..<code>i64</code>, <code>u8</code>..<code>u64</code>, <code>f32</code>/<code>f64</code>, <code>bool</code>) and <code>str</code> (as
+<code>char*</code>) cross the FFI boundary correctly.</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">extern "C" fn sqrt(x: f64) -&gt; f64;
+extern "C" fn strlen(s: str) -&gt; i64;
+
+fn main() -&gt; i32 {
+  let r = sqrt(9.0) as i32     // 3
+  let n = strlen("hello")       // 5
+  ret r
+}
+</code></pre>
+<p>Droppable/owned Glyph types (<code>Vec&lt;T&gt;</code>, structs, <code>String</code>) cannot be passed
+<strong>by value</strong>; pass a reference instead.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>extern function 'some_fn' parameter 'v' cannot take ownership of Glyph droppable type 'Vec&lt;i32&gt;' by value; pass a reference or an ABI-safe scalar/RawPtr instead</code>)</p>
+<pre><code class="language-glyph">from std/vec import Vec
+
+extern "C" fn some_fn(v: Vec&lt;i32&gt;) -&gt; i32;   // error
+</code></pre>
+<p><strong>Supported</strong> - a struct passed by reference:</p>
+<pre><code class="language-glyph">struct Point { x: i32, y: i32 }
+
+extern "C" fn some_fn(p: &amp;Point) -&gt; i32;   // fine
+</code></pre>
+<p>Library linking is configured via <code>glyph.toml</code>’s <code>[link]</code> section
+(<code>libs</code>/<code>search_paths</code>), which plumbs through to the linker.</p>
+<h2 id="strings"><a class="header" href="#strings">Strings</a></h2>
+<p><code>str</code> is a borrowed slice; <code>String</code> is owned (heap-allocated). Coercing an
+owned <code>String</code> to <code>str</code> <strong>moves</strong> it - the original <code>String</code> local can no
+longer be used afterward.</p>
+<p><strong>Not supported</strong> (diagnostic: <code> `use of moved value `owned` of type `String</code> ``)</p>
+<pre><code class="language-glyph">fn main() -&gt; i32 {
+  let owned = String::from_str("hi")
+  let sr: str = owned      // moves `owned`
+  ret owned.len() as i32   // error - use `owned.clone()` to keep both
+}
+</code></pre>
+<p><code>print</code>/<code>println</code> only accept a string literal, an interpolated string, or a
+<code>str</code>/<code>String</code> value - not a bare number or other scalar. Interpolate with
+<code>$"{expr}"</code> to print non-string values.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>print/println require a string literal, interpolated string, or str/String value</code>)</p>
+<pre><code class="language-glyph">from std/io import println
+
+fn main() -&gt; i32 {
+  println(5)   // error
+  ret 0
+}
+</code></pre>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">from std/io import println
+
+fn main() -&gt; i32 {
+  println($"{5}")
+  ret 0
+}
+</code></pre>
+<h2 id="ret-is-a-statement-not-an-expression"><a class="header" href="#ret-is-a-statement-not-an-expression"><code>ret</code> is a statement, not an expression</a></h2>
+<p><code>ret</code> cannot appear in expression position, such as inside a <code>match</code> arm used
+as a value.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>unexpected token in expression</code>)</p>
+<pre><code class="language-glyph">from std/enums import Result
+
+fn maybe() -&gt; Result&lt;i32, str&gt; {
+  let x = match 1 { _ =&gt; ret Err("bad") }   // error - ret is not an expression
+  ret Ok(x)
+}
+</code></pre>
+<p>Use match-as-statement with blocks instead:</p>
+<pre><code class="language-glyph">from std/enums import Option, Result
+
+fn maybe(o: Option&lt;i32&gt;) -&gt; Result&lt;i32, str&gt; {
+  match o {
+    None =&gt; { ret Err("bad") },
+    Some(_v) =&gt; {},
+  }
+  ret Ok(1)
+}
+</code></pre>
+<p><code>cont</code> means <code>continue</code>; <code>break</code> means <code>break</code>.</p>
+<p>Note: <code>while true { ... }</code> no longer needs a trailing unreachable <code>ret</code> after
+it on the current compiler - a prior version of this guidance said it did.
+Both a <code>while true</code> with an internal <code>break</code> and a truly infinite <code>while true</code> (no <code>break</code>) compile as the last statement of a non-void function
+without an extra <code>ret</code>.</p>
+<h3 id="ifelse-as-an-implicit-tail-return-untracked"><a class="header" href="#ifelse-as-an-implicit-tail-return-untracked"><code>if</code>/<code>else</code> as an implicit tail return (untracked)</a></h3>
+<p>Glyph is advertised as expression-oriented (“the last expression in a block
+is the value”), and this holds for plain expressions and for <code>match</code> used as
+a function’s tail expression. It does <strong>not</strong> currently hold for <code>if</code>/<code>else</code>:
+when an <code>if</code>/<code>else</code> is the last statement of a function body with no
+explicit <code>ret</code>, the function silently returns a default value instead of the
+taken branch’s value - for <strong>every</strong> branch, not just one side.</p>
+<p><strong>Not supported (silently wrong, no diagnostic)</strong></p>
+<pre><code class="language-glyph">from std/io import println
+
+fn pick(n: i32) -&gt; i32 {
+  if n == 0 { 100 } else { 300 }   // no `ret`
+}
+
+fn main() -&gt; i32 {
+  println($"{pick(0)}")   // prints 0, not 100
+  println($"{pick(1)}")   // prints 0, not 300
+  ret 0
+}
+</code></pre>
+<p><code>match</code> in the exact same tail position works correctly (prints the right
+value for both arms), and <code>if</code>/<code>else</code> bound to a <code>let</code> (<code>let x = if ... { ...} else { ... }</code>, including as the tail of a nested <code>{ }</code> block) also
+works correctly. The bug is specific to a bare <code>if</code>/<code>else</code> occupying a
+function body’s outermost tail position.</p>
+<p><strong>Supported</strong> - always use an explicit <code>ret</code>:</p>
+<pre><code class="language-glyph">fn pick(n: i32) -&gt; i32 {
+  ret if n == 0 { 100 } else { 300 }
+}
+</code></pre>
+<p>Found while writing this page; needs a ticket. Given that omitting <code>ret</code>
+before a tail <code>if</code>/<code>else</code> is a natural, commonly-generated pattern and fails
+silently rather than with a diagnostic, this is a good candidate for a HIGH
+priority bug.</p>
+<h2 id="views-and-ownership"><a class="header" href="#views-and-ownership">Views and ownership</a></h2>
+<p><code>Map::get</code>, <code>Vec</code> indexing, and struct field views deep-clone at
+ownership-escape points, so taking a nested value out of a <code>Map</code> by value
+(including a <code>Map</code> nested inside another <code>Map</code>-held <code>enum</code> payload) is safe -
+no dangling references or double frees, even under repeated allocation and
+drop.</p>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">from std/enums import Option
+from std/map import Map
+
+fn main() -&gt; i32 {
+  let mut i: i32 = 0
+  let mut failed = 0
+  while i &lt; 100 {
+    let mut m: Map&lt;String, i32&gt; = Map::new()
+    let _ = m.add(String::from_str("k"), 1)
+    let got = m.get(String::from_str("k"))
+    match got {
+      Some(_v) =&gt; {},
+      None =&gt; { failed = 1 },
+    }
+    i = i + 1
+  }
+  ret failed   // 0
+}
+</code></pre>
+<h2 id="closures-threads-and-sendsync"><a class="header" href="#closures-threads-and-sendsync">Closures, threads, and Send/Sync</a></h2>
+<p>Closures use arrow syntax (<code>x -&gt; x + 1</code>, <code>move</code>) and are typed as
+<code>FnOnce&lt;Args, Return&gt;</code>, <code>Fn&lt;Args, Return&gt;</code>, or <code>FnMut&lt;Args, Return&gt;</code>. See
+<a href="#closures-and-callable-values">Closures and Callable Values</a> for the full syntax.
+<code>std/thread</code> provides <code>spawn</code>/scoped threads and typed <code>JoinHandle&lt;T&gt;</code>;
+<code>std/sync</code> provides <code>Arc&lt;T&gt;</code>, <code>Mutex&lt;T&gt;</code>, SPSC channels, and atomics.</p>
+<p>Calling a value of callable type directly requires an <strong>exact</strong> argument
+type match - unlike an ordinary function call, no implicit widening happens
+at that call site.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>argument 1 to 'g' has type 'i32', expected 'i64'</code>)</p>
+<pre><code class="language-glyph">fn main() -&gt; i32 {
+  let g: FnOnce&lt;i64, i64&gt; = a -&gt; a + 1
+  let x: i32 = 5
+  ret g(x) as i32   // error - x must already be i64
+}
+</code></pre>
+<p><code>Vec</code>, <code>Map</code>, <code>Option</code>, and <code>Result</code> are <code>Send</code> when their element/payload
+type is <code>Send</code> (GLYPH-63). <code>Shared&lt;T&gt;</code> is single-threaded and is never
+<code>Send</code>, including inside a collection - <code>Arc&lt;T&gt;</code> is the thread-safe
+alternative.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>`spawn task.capture `v`.value` is not Send: `Shared&lt;T&gt;` is not synchronized and cannot cross threads</code>)</p>
+<pre><code class="language-glyph">from std/vec import Vec
+import spawn from std/thread
+
+fn main() -&gt; i32 {
+  let mut v: Vec&lt;Shared&lt;i32&gt;&gt; = Vec::new()
+  v.push(Shared::new(1))
+  let task: FnOnce&lt;(), ()&gt; = move () -&gt; { let n = v.len() }
+  ret spawn(task)   // error
+}
+</code></pre>
+<p><strong>Supported</strong> - <code>Arc&lt;T&gt;</code> crossing into a spawned task works.</p>
+<h2 id="imports-2"><a class="header" href="#imports-2">Imports</a></h2>
+<p>Matching a stdlib <code>Result</code> (its <code>Ok</code>/<code>Err</code> constructors, or using <code>Result</code>
+as a type) requires importing it explicitly - a module’s internal imports do
+not propagate to its consumers.</p>
+<p><strong>Not supported</strong> (diagnostic: <code>unknown function 'Ok'</code> / <code>unknown enum type 'Result'</code>)</p>
+<pre><code class="language-glyph">fn get() -&gt; Result&lt;i32, str&gt; { ret Ok(5) }   // error without the import below
+</code></pre>
+<p><strong>Supported</strong></p>
+<pre><code class="language-glyph">from std/enums import Result
+
+fn get() -&gt; Result&lt;i32, str&gt; { ret Ok(5) }
+</code></pre>
+<p><code>import std</code> before a <code>from std/x import Y</code> line no longer misparses
+(previously GLYPH-30).</p>
+<h2 id="compiler-internal-diagnostics"><a class="header" href="#compiler-internal-diagnostics">Compiler-internal diagnostics</a></h2>
+<p>A MIR verifier runs before codegen (GLYPH-3). If you see <code>MIR verification failed before codegen (N error(s)): ...</code>, that indicates a compiler-internal
+invariant was violated, not a mistake in your source - please report it as a
+compiler bug with a minimal repro.</p>
+<h2 id="known-issues-open-tickets"><a class="header" href="#known-issues-open-tickets">Known issues (open tickets)</a></h2>
+<ul>
+<li><strong>Untracked, high priority</strong> - a bare <code>if</code>/<code>else</code> in a function body’s
+outermost tail position (no explicit <code>ret</code>) silently returns a default
+value instead of the taken branch’s value, for every branch. <code>match</code> in
+the same position, and <code>if</code>/<code>else</code> bound to a <code>let</code>, both work correctly.
+See <a href="#ifelse-as-an-implicit-tail-return-untracked"><code>if</code>/<code>else</code> as an implicit tail return</a>
+above. Found while writing this page; needs a ticket.</li>
+<li><strong>GLYPH-66</strong> - no integer-literal <code>match</code> patterns; use <code>if</code>/<code>else</code>.</li>
+<li><strong>GLYPH-75</strong> - a large literal used inline as an <code>as</code> operand truncates to
+<code>i32</code> range before the cast is applied.</li>
+<li><strong>GLYPH-77</strong> - implicit narrowing and same-width signed/unsigned
+conversions are silently accepted with no diagnostic; decision pending on
+whether to require an explicit <code>as</code>.</li>
+<li><strong>GLYPH-78</strong> - a negative integer literal assigned to a float-typed <code>let</code>
+produces a silently wrong runtime value instead of being promoted or
+rejected.</li>
+<li><strong>GLYPH-79</strong> - array-typed struct fields cannot be read or indexed, only
+written at construction time.</li>
+<li><strong>Untracked</strong> - binary operators (<code>+</code>, <code>==</code>, …) do not auto-dereference a
+<code>&amp;i32</code> (unlike field access through <code>&amp;Struct</code>, which does); depending on
+context this produces either a misleading “value cannot escape through
+return” diagnostic or an outright LLVM IR verifier crash. Found while
+writing this page; needs a ticket.</li>
+<li><strong>Untracked</strong> - an array literal with more elements than its declared
+fixed size (<code>let a: [i32; 2] = [1, 2, 3]</code>) is silently accepted instead of
+being rejected the way an out-of-range element value now is (GLYPH-74).
+Found while writing this page; needs a ticket.</li>
+</ul>
 
                     </main>
 
