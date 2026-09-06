@@ -7,6 +7,7 @@ use crate::resolver::{ConstValue, ResolvedSymbol};
 
 use super::call::{call_types_compatible, lower_call, lower_method_call};
 use super::context::{LocalState, LowerCtx};
+use super::enums::find_variant;
 use super::flow::{
     lower_block_with_expected, lower_closure_rvalue, lower_for, lower_for_in, lower_if_value,
     lower_while,
@@ -952,10 +953,8 @@ pub(crate) fn lower_match<'a>(
                 break;
             }
             glyph_core::ast::MatchPattern::Variant { name, .. } => {
-                let variant_index = enum_def
-                    .variants
-                    .iter()
-                    .position(|v| v.name == name.0)
+                let variant_index = find_variant(&enum_def, &name.0)
+                    .map(|resolved| resolved.variant_index)
                     .unwrap_or_else(|| {
                         ctx.error(
                             format!("unknown variant '{}' for enum '{}'", name.0, enum_name),
@@ -1023,8 +1022,8 @@ pub(crate) fn lower_match<'a>(
 
         if let glyph_core::ast::MatchPattern::Variant { name, binding } = &arm.pattern {
             if let Some(bind_ident) = binding {
-                if let Some(variant) = enum_def.variants.iter().find(|v| v.name == name.0) {
-                    if let Some(payload_ty) = variant.payload.clone() {
+                if let Some(resolved) = find_variant(&enum_def, &name.0) {
+                    if let Some(payload_ty) = resolved.payload {
                         let payload_ty = substitute_match_params(&payload_ty, enum_args.as_deref());
                         let binding_local = ctx.fresh_local(Some(&bind_ident.0));
                         ctx.locals[binding_local.0 as usize].ty = Some(payload_ty.clone());
@@ -1034,12 +1033,7 @@ pub(crate) fn lower_match<'a>(
                             local: binding_local,
                             value: Rvalue::EnumPayload {
                                 base: scrut_local,
-                                variant_index: enum_def
-                                    .variants
-                                    .iter()
-                                    .position(|v| v.name == name.0)
-                                    .unwrap_or(0)
-                                    as u32,
+                                variant_index: resolved.variant_index,
                                 payload_type: payload_ty,
                             },
                         });
@@ -1121,21 +1115,16 @@ fn resolve_try_variant(
     enum_args: Option<&[Type]>,
     span: Span,
 ) -> Option<(u32, Option<Type>)> {
-    let (index, variant) = enum_def
-        .variants
-        .iter()
-        .enumerate()
-        .find(|(_, variant)| variant.name == variant_name)
-        .or_else(|| {
-            ctx.error(
-                format!(
-                    "enum '{}' is missing '{}' variant required by `?`",
-                    enum_name, variant_name
-                ),
-                Some(span),
-            );
-            None
-        })?;
+    let resolved = find_variant(enum_def, variant_name).or_else(|| {
+        ctx.error(
+            format!(
+                "enum '{}' is missing '{}' variant required by `?`",
+                enum_name, variant_name
+            ),
+            Some(span),
+        );
+        None
+    })?;
 
     let generic_payload = match (enum_name, variant_name, enum_args) {
         ("Result", "Ok", Some(args)) => args.first().cloned(),
@@ -1145,8 +1134,8 @@ fn resolve_try_variant(
     };
 
     Some((
-        index as u32,
-        generic_payload.or_else(|| variant.payload.clone()),
+        resolved.variant_index,
+        generic_payload.or_else(|| resolved.payload),
     ))
 }
 
