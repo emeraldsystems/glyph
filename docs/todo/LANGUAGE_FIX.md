@@ -1,5 +1,13 @@
 # Language Fix: Proper Typed Int Literals + Enum/Match Soundness
 
+> **Status: RESOLVED (GLYPH-9).** All milestones below are complete. The full
+> `std/json/parser.glyph` is the only parser shipped (`parser_inline.glyph`
+> has been deleted), it compiles and runs cleanly, and nested/Unicode parsing
+> is covered by `crates/glyph-cli/tests/std_json_parser.rs`. This document is
+> kept for its historical technical record of the integer-literal-typing and
+> enum/match soundness work; for the current JSON API and status, see
+> `docs/book/src/json.md`.
+
 This document captures the plan for a *proper language-level fix* (not a stdlib workaround) to support the full `std/json/parser.glyph` implementation, especially nested JSON parsing.
 
 ## Problem Statement

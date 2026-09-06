@@ -6,7 +6,7 @@ Demonstrates using Glyph's standard-library JSON parser: `std/json/parser::parse
 
 - Calls `parse(...)` on a handful of JSON inputs.
 - Uses pattern matching to verify the parsed value has the expected shape (including nested arrays/objects).
-- Exits non-zero if parsing fails (including the current stubbed parser).
+- Exits non-zero if parsing fails.
 
 ## Build and run
 
@@ -27,6 +27,7 @@ fn parse(input: &str) -> ParseResult<JsonValue>
 
 ## Parser notes
 
-The stdlib parser is currently a minimal placeholder (it always returns `Null`).
-
-This example is written to detect that: it inspects nested results and exits non-zero until the full parser is shipped.
+`std/json/parser::parse` is the full, release-shipping implementation (an
+iterative recursive-descent parser with full Unicode escape support). This
+example's nested-array/object and trailing-input checks exercise real parse
+results, not a placeholder.

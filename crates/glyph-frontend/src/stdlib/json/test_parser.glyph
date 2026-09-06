@@ -1,8 +1,0 @@
-// Minimal test parser to verify the loading mechanism works
-
-from std/json import JsonValue, ParseError
-from std/enums import Result
-
-fn test_parse() -> i32 {
-    ret 42
-}

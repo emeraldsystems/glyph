@@ -2,6 +2,8 @@
 
 Glyph is a small, expression-oriented compiled language designed for predictable LLM output. This guide summarizes the current language surface and highlights pitfalls that frequently trip up generated code.
 
+For the authoritative, compiler-verified list of value-category, inference, and ABI limits (with quoted diagnostics for what does and doesn't compile), see [`docs/book/src/limitations.md`](docs/book/src/limitations.md).
+
 ## Quick Start
 
 ```glyph
@@ -307,15 +309,16 @@ Dependencies are resolved transitively with cycle detection.
   - Bad: `String::from_str("hi").len()`
 - Struct fields are not moveable by value. Borrow (`let x: str = s.field`), clone (`s.field.clone()`), or move the whole struct.
 - String interpolation with `{expr}` is supported in `print`/`println`, but not in general expressions.
-- `Vec::new()` defaults to `Vec<i32>`; annotate when using other element types.
-- Assignment targets can be identifiers or struct/tuple fields. Index assignment is not supported.
+- Bare `Vec::new()`/`Map::new()` infer their type parameters from later use in the same function (a push/add call, the enclosing `let`'s annotation, or the function's return type); annotate for readability or when nothing else constrains the type.
+- Assignment targets can be identifiers, struct/tuple fields, or an index expression (`xs[i] = v`).
 - References can only be taken to locals (`&local`), not to temporaries.
 - Array `.len()` only works on local array variables.
 - The `?` operator works on `Result` types for error propagation (e.g. `let val = expr?`). The enclosing function must return `Result`.
 - Enum variants with owned-type payloads (e.g. `Option<String>`, `Result<String, E>`) are properly drop-managed — the active variant's payload is freed automatically when the enum goes out of scope.
 - `break` and `cont` in loops properly drop locals scoped inside the loop body.
 - `for`/`for-in` `cont` jumps to the loop's continue target (increment/index advance), not directly to condition check.
-- Floating-point literals parse, but arithmetic is mostly integer-focused; avoid floats unless you have verified support.
+- Floats (`f64`) are fully supported: literals, arithmetic, comparisons, int/float promotion, params/returns, `Vec<f64>`, and `as` casts. The one open gap is a negative literal assigned to a float `let` (`let x: f64 = -1`), which is not promoted correctly - see `docs/book/src/limitations.md`.
+- A bare `if`/`else` used as a function body's last statement (no explicit `ret`) does not return the taken branch's value - see `docs/book/src/limitations.md`. Always write `ret if ... { ... } else { ... }` explicitly; `match` in the same tail position works correctly.
 - `extern` functions must end with `;` and only `extern "C"` is accepted.
 - `const` declarations require an explicit type annotation.
 

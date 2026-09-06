@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d2df5439.js";
+            window.path_to_searchindex_js = "searchindex-7d31c47f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-c681401e.js"></script>
+        <script src="toc-559cdf70.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -216,15 +216,79 @@ fn main() -&gt; i32 {
   }
 }
 </code></pre>
-<p>The parser handles objects, arrays, strings and escapes, numbers, booleans,
-<code>null</code>, nested values, trailing-input rejection, and parse errors with source
-positions.</p>
+<p>The parser handles objects, arrays, strings and escapes (including <code>\uXXXX</code>
+and surrogate pairs, decoded to full Unicode), numbers, booleans, <code>null</code>,
+nested values, trailing-input rejection, and parse errors with source
+positions. It is an iterative implementation (no recursive-descent stack
+depth limits from Glyph call frames).</p>
+<h2 id="accessors"><a class="header" href="#accessors">Accessors</a></h2>
+<p><code>std/json/parser</code> also exports typed accessors for pulling values out of a
+<code>JsonValue</code> without writing a <code>match</code> by hand:</p>
+<pre><code class="language-glyph">from std/json import JsonValue, ParseResult
+from std/enums import Option
+from std/json/parser import parse, json_get_string, json_get_number,
+  json_get_bool, json_is_null, json_get_array, json_get_object
+
+fn main() -&gt; i32 {
+  let r = parse("{\"name\": \"glyph\", \"count\": 3}")
+  ret match r {
+    Ok(value) =&gt; match json_get_object(value) {
+      Some(obj) =&gt; if obj.has(String::from_str("name")) { 0 } else { 1 },
+      None =&gt; 2,
+    },
+    Err(_err) =&gt; 3,
+  }
+}
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Function</th><th>Signature</th></tr>
+</thead>
+<tbody>
+<tr><td><code>json_get_string</code></td><td><code>(value: JsonValue) -&gt; Option&lt;String&gt;</code></td></tr>
+<tr><td><code>json_get_number</code></td><td><code>(value: JsonValue) -&gt; Option&lt;f64&gt;</code></td></tr>
+<tr><td><code>json_get_bool</code></td><td><code>(value: JsonValue) -&gt; Option&lt;bool&gt;</code></td></tr>
+<tr><td><code>json_is_null</code></td><td><code>(value: JsonValue) -&gt; bool</code></td></tr>
+<tr><td><code>json_get_array</code></td><td><code>(value: JsonValue) -&gt; Option&lt;Vec&lt;JsonValue&gt;&gt;</code></td></tr>
+<tr><td><code>json_get_object</code></td><td><code>(value: JsonValue) -&gt; Option&lt;Map&lt;String, JsonValue&gt;&gt;</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Each accessor returns <code>None</code> (or <code>false</code> for <code>json_is_null</code>) when the value
+is a different variant, rather than panicking.</p>
+<h2 id="serializing"><a class="header" href="#serializing">Serializing</a></h2>
+<p><code>std/json/parser</code> also exports <code>stringify(value: JsonValue) -&gt; String</code>,
+which round-trips through <code>parse</code>: strings are escaped, numbers use a
+shortest-round-trip representation, and arrays/objects are serialized
+recursively via <code>stringify_array</code> and <code>stringify_object</code>.</p>
+<pre><code class="language-glyph">from std/json import ParseResult
+from std/json/parser import parse, stringify
+
+fn main() -&gt; i32 {
+  ret match parse("[1, 2, 3]") {
+    Ok(value) =&gt; {
+      let s: str = stringify(value)
+      if s.len() &gt; 0 { 0 } else { 1 }
+    },
+    Err(_err) =&gt; 2,
+  }
+}
+</code></pre>
 <h2 id="status"><a class="header" href="#status">Status</a></h2>
-<p><code>std/json</code> provides the JSON types, and <code>std/json/parser::parse</code> is the shipped
-parser. Current ownership semantics around map-owned <code>JsonValue</code> snapshots are
-still being tightened: avoid APIs that keep by-value snapshots from <code>Map::get</code>;
-move the owning value, borrow where possible, or clone/deep-copy when that API is
-available.</p>
+<p><code>std/json/parser::parse</code> (an iterative, full-Unicode recursive-descent-style
+parser), its accessors, and <code>stringify</code> are the shipped, release-gated JSON
+API — this is the only parser the compiler embeds. There is no stub fallback:
+<code>crates/glyph-cli/tests/std_json_parser.rs</code> includes a regression test
+(<code>std_json_parser_embeds_full_parser_not_stub</code>) asserting the compiler
+embeds the full implementation, alongside coverage for nested/trailing
+input, string escapes, Unicode, hardening matrices, accessors, and
+stringify round-trips.</p>
+<p>Map-owned <code>JsonValue</code> snapshots (e.g. taking a <code>JsonValue</code> by value out of a
+<code>Map::get</code> on a nested object) are covered and safe: views deep-clone at
+ownership-escape points, so there is no dangling or double-free risk. See
+<code>docs/book/src/limitations.md</code> for value-category and inference rules that
+apply generally (not specific to JSON).</p>
 
                     </main>
 

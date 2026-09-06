@@ -235,6 +235,13 @@ https://glyph-lang.github.io/glyph/book/. Build it with:
 mdbook build docs/book
 ```
 
+Before relying on a specific value-category, inference, or ABI rule, check the
+[Limitations](https://glyph-lang.github.io/glyph/book/limitations.html) page -
+it documents real, verified sharp edges (collection constructors, struct
+field ownership, `match`/reference rules, integer/float gaps, `extern "C"`
+ABI, and known open bugs) with compiling examples of what does and doesn't
+work today.
+
 **Design documents** in `docs/design/` cover:
 - `LLMS.md` — Token efficiency and LLM-oriented design principles
 - `GENERICS.md` — Generic type system implementation
