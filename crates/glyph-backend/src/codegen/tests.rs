@@ -1,6 +1,6 @@
 use super::*;
 use glyph_core::mir::{
-    BorrowKind, CaptureTransfer, Local, LocalId, MirBlock, MirBorrowCapture, MirCapture,
+    BlockId, BorrowKind, CaptureTransfer, Local, LocalId, MirBlock, MirBorrowCapture, MirCapture,
     MirExternFunction, MirFunction, MirInst, MirModule, MirValue, Rvalue,
 };
 use glyph_core::types::BorrowedCallableKind;
@@ -1614,5 +1614,57 @@ fn closure_rejects_bitwise_copy_of_ownership_bearing_capture() {
         error
             .to_string()
             .contains("cannot copy ownership-bearing type")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GLYPH-3: `codegen_module` must run the MIR verifier before any LLVM
+// lowering. `glyph_core::mir_verify` has its own exhaustive unit tests for
+// the check logic itself; this test is only about the wiring — that
+// `codegen_module` (the single chokepoint every LLVM path, including this
+// test file's own `CodegenContext::new` + `codegen_module` pattern, goes
+// through) actually calls it and fails closed before touching LLVM.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codegen_module_rejects_malformed_mir_before_any_llvm_lowering() {
+    let mut ctx = CodegenContext::new("test").unwrap();
+    let mir = MirModule {
+        struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        functions: vec![MirFunction {
+            name: "main".into(),
+            ret_type: Some(Type::I32),
+            params: vec![],
+            locals: vec![],
+            blocks: vec![MirBlock {
+                // `Goto` to a block that does not exist: verifier must catch
+                // this before `create_named_types`/`codegen_function_body`
+                // ever run, so no partial LLVM module is left behind either.
+                insts: vec![MirInst::Goto(BlockId(41))],
+            }],
+        }],
+        extern_functions: Vec::new(),
+    };
+
+    let error = ctx.codegen_module(&mir).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("MIR verification failed"),
+        "expected the verifier's bail message, got: {}",
+        message
+    );
+    assert!(
+        message.contains("out-of-range block"),
+        "expected the specific verifier error to be included, got: {}",
+        message
+    );
+
+    // Nothing should have been emitted into the module on the failing path.
+    let ir = ctx.dump_ir();
+    assert!(
+        !ir.contains("define"),
+        "codegen must not lower anything once verification fails:\n{}",
+        ir
     );
 }

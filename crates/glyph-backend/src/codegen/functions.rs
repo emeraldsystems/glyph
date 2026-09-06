@@ -2,6 +2,22 @@ use super::*;
 
 impl CodegenContext {
     pub fn codegen_module(&mut self, mir_module: &MirModule) -> Result<()> {
+        // GLYPH-3: verify MIR invariants backend codegen otherwise trusts
+        // silently (in-range block/local ids, terminators, valid declared
+        // types, enum variant bounds, ...) before any LLVM lowering starts.
+        // This is the single chokepoint every LLVM path passes through: the
+        // `LlvmBackend` trait impl, the CLI's direct `CodegenContext`
+        // construction sites, `thread_runtime`, and every codegen test
+        // harness all call `codegen_module`.
+        let verify_errors = glyph_core::mir_verify::verify_module(mir_module);
+        if !verify_errors.is_empty() {
+            bail!(
+                "MIR verification failed before codegen ({} error(s)):\n{}",
+                verify_errors.len(),
+                glyph_core::mir_verify::format_errors(&verify_errors)
+            );
+        }
+
         self.init_target_data()?;
         self.debug_log("create_named_types start");
         self.create_named_types(mir_module)?;
