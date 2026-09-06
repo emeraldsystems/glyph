@@ -87,7 +87,7 @@ the row under test.
 
 ## Failures
 
-### BLOCKER — apex webserver build (known: GLYPH-80)
+### BLOCKER — apex webserver build (known: GLYPH-80) — FIXED
 
 `examples/apex` fails to build with a move-checker false positive:
 
@@ -106,6 +106,24 @@ bug in the example. Filed today as GLYPH-80 (per the integrator's brief);
 this run confirms the diagnostic is exactly as described. `curl` was not
 exercised since the binary never builds. **This must be fixed before
 release** — it is the toolchain's own reference webserver example.
+
+**Update (GLYPH-80, fixed):** the diagnostic was correct, not a checker gap —
+`serve_request(request: HttpRequest, doc_root: str, stream: TcpStream) -> i32`
+takes `stream` by value and returns only an `i32` status code; it never
+returns ownership of the stream to `main`, so `main`'s later
+`stream.close()` genuinely was a use-after-move. The earlier read above (a
+missing "move-out-and-back" signal in the checker) does not hold. The fix
+was to the example: `serve_request` in `examples/apex/src/server.glyph` now
+closes its owned stream on every return path (400, 405, 403, 404, both 200s),
+and `main.glyph` no longer calls `stream.close()` after handing `stream` off
+to `serve_request`. `examples/apex` now builds via `glyph build`, and a live
+`curl` round-trip against the running server (`GET /`, `HEAD /about.html`,
+`GET /nope.html`) returns the expected 200/200/404. A regression test,
+`apex_full_project_compiles_with_no_diagnostics` in
+`crates/glyph-cli/tests/apex_webserver.rs`, now frontend-compiles the actual
+`main.glyph` + `http.glyph` + `server.glyph` project (not a stubbed `main`)
+and asserts zero diagnostics, so this class of regression fails `cargo test`
+directly rather than only `scripts/release-matrix.sh`.
 
 ### NON_GOAL — sequencer live engine / stdio server
 

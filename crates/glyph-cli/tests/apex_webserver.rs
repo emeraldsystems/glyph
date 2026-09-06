@@ -141,6 +141,69 @@ fn apex_source_compiles() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 1b: The *actual* multi-module project (main.glyph + http.glyph +
+// server.glyph, with real inter-module imports, not `combine_sources`'s
+// stand-in) frontend-compiles with zero diagnostics.
+//
+// GLYPH-80 regression test: `apex_source_compiles` above never actually
+// exercises main.glyph — it discards it and substitutes a trivial stub, so
+// it stayed green while `examples/apex` failed to build with a real
+// move-checker error ("use of moved value `stream`" at main.glyph:48,
+// caused by main.glyph moving `stream` into `serve_request` and then still
+// calling `stream.close()`). This test compiles the project the same way
+// `glyph build`/`glyph-cli` do (`compile_modules` over the module graph,
+// keyed by module id, with real `from http import ...` / `from server
+// import ...` edges) so a regression here fails `cargo test`, not just the
+// release matrix.
+// ---------------------------------------------------------------------------
+#[cfg(all(feature = "codegen", unix))]
+#[test]
+fn apex_full_project_compiles_with_no_diagnostics() {
+    use glyph_frontend::{ParseOutput, compile_modules, lex, parse};
+    use std::collections::HashMap;
+
+    let sources: [(&str, &str); 3] = [
+        ("main", include_str!("../../../examples/apex/src/main.glyph")),
+        ("http", include_str!("../../../examples/apex/src/http.glyph")),
+        ("server", include_str!("../../../examples/apex/src/server.glyph")),
+    ];
+
+    let mut modules = HashMap::new();
+    for (id, src) in sources {
+        let lex_out = lex(src);
+        assert!(
+            lex_out.diagnostics.is_empty(),
+            "{id}: lex diagnostics: {:?}",
+            lex_out.diagnostics
+        );
+        let ParseOutput { module, diagnostics } = parse(&lex_out.tokens, src);
+        assert!(
+            diagnostics.is_empty(),
+            "{id}: parse diagnostics: {:?}",
+            diagnostics
+        );
+        modules.insert(id.to_string(), module);
+    }
+
+    let output = compile_modules(
+        modules,
+        "main",
+        FrontendOptions {
+            emit_mir: true,
+            include_std: true,
+        },
+    );
+
+    assert!(
+        output.diagnostics.is_empty(),
+        "examples/apex failed to compile as the real multi-module project \
+         `glyph build` compiles (a TcpStream moved into a helper function \
+         and not reused by the caller is the GLYPH-80 shape). Diagnostics: {:?}",
+        output.diagnostics
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 2: Parse a well-formed GET request
 // ---------------------------------------------------------------------------
 #[cfg(all(feature = "codegen", unix))]

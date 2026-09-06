@@ -44,8 +44,8 @@ fn main() -> i32 {
     }
 
     let request = parse_request(raw)
+    // serve_request takes ownership of `stream` and closes it on every path.
     let _ = serve_request(request, "www", stream)
-    let _ = stream.close()
   }
 
   ret 0

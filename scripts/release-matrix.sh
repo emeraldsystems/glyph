@@ -364,24 +364,33 @@ expect() {
 
 # ===========================================================================
 # Row 18: apex — webserver build, then a live curl round-trip if it builds.
-# Known blocker: GLYPH-80, a move-checker false positive on `stream` at
-# examples/apex/src/main.glyph:48. This row is EXPECTED to fail until
-# GLYPH-80 is fixed, and that failure correctly keeps this script's exit
-# status non-zero (the release should stay blocked while apex can't build).
+# GLYPH-80 (a move-checker error on `stream` at examples/apex/src/main.glyph:48,
+# caused by main.glyph moving `stream` into serve_request() and then still
+# calling stream.close() on it) is fixed: serve_request() now owns and closes
+# the stream on every return path, and main.glyph no longer double-closes it.
+# The `if [[ "$RC" -ne 0 ]]` branch below is kept as a guard in case of a
+# future regression, rather than assuming the build always succeeds.
 # ===========================================================================
 {
   run_in_dir "$REPO_ROOT/examples/apex" "$GLYPH" build
   if [[ "$RC" -ne 0 ]]; then
     if grep -qF "use of moved value \`stream\`" <<<"$OUT" && grep -qF "main.glyph:48" <<<"$OUT"; then
-      record_row "apex (glyph build)" BLOCKER FAIL "known blocker GLYPH-80: use-of-moved-value on 'stream' at main.glyph:48" "$SECS"
+      record_row "apex (glyph build)" BLOCKER FAIL "regression of GLYPH-80: use-of-moved-value on 'stream' at main.glyph:48 is back" "$SECS"
     else
-      record_row "apex (glyph build)" BLOCKER FAIL "build failed with an UNEXPECTED diagnostic (not the known GLYPH-80 signature) :: $(truncate_note "$OUT")" "$SECS"
+      record_row "apex (glyph build)" BLOCKER FAIL "build failed with an UNEXPECTED diagnostic (not the former GLYPH-80 signature) :: $(truncate_note "$OUT")" "$SECS"
     fi
   else
-    # GLYPH-80 appears fixed — exercise the actual server.
-    APEX_BIN="$REPO_ROOT/examples/apex/target/debug/apex"
+    # Exercise the actual server. Its document root ("www") is a path
+    # relative to the process's own working directory (see
+    # examples/apex/README.md's "Build and run" section: it is documented to
+    # be launched from inside examples/apex/) — so the binary must be started
+    # with that directory as its cwd, not this script's. `exec` inside the
+    # backgrounded subshell replaces the subshell with the apex process so
+    # `$!` below is the apex PID itself, not the subshell wrapping it.
+    APEX_DIR="$REPO_ROOT/examples/apex"
+    APEX_BIN="$APEX_DIR/target/debug/apex"
     if [[ -x "$APEX_BIN" ]]; then
-      "$APEX_BIN" >"$SCRATCH/apex.log" 2>&1 &
+      (cd "$APEX_DIR" && exec "$APEX_BIN") >"$SCRATCH/apex.log" 2>&1 &
       apex_pid=$!
       sleep 1
       if curl_out="$(timeout_run 5 curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/)"; then

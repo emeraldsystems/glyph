@@ -223,6 +223,8 @@ fn handle_request(request: HttpRequest, doc_root: str) -> String {
 // Streaming request handler for binary file serving.
 // Sends headers then streams file body via TcpStream, bypassing String system.
 // This allows binary files (images, fonts, PDFs) to be served correctly.
+// Takes ownership of `stream`: it is the sole owner from here on, so every
+// return path below closes it before returning the HTTP status code.
 fn serve_request(request: HttpRequest, doc_root: str, stream: TcpStream) -> i32 {
   let mut s = stream
 
@@ -232,6 +234,7 @@ fn serve_request(request: HttpRequest, doc_root: str, stream: TcpStream) -> i32 
     let er: str = err_resp
     let _ = s.send(er)
     let _ = log_request("-", "-", 400)
+    let _ = s.close()
     ret 400
   }
 
@@ -257,6 +260,7 @@ fn serve_request(request: HttpRequest, doc_root: str, stream: TcpStream) -> i32 
       let er: str = err_resp
       let _ = s.send(er)
       let _ = log_request(m_check, p_check, 405)
+      let _ = s.close()
       ret 405
     }
   }
@@ -269,6 +273,7 @@ fn serve_request(request: HttpRequest, doc_root: str, stream: TcpStream) -> i32 
     let er: str = err_resp
     let _ = s.send(er)
     let _ = log_request(m_check, p_check, 403)
+    let _ = s.close()
     ret 403
   }
 
@@ -279,6 +284,7 @@ fn serve_request(request: HttpRequest, doc_root: str, stream: TcpStream) -> i32 
     let er: str = err_resp
     let _ = s.send(er)
     let _ = log_request(m_check, p_check, 404)
+    let _ = s.close()
     ret 404
   }
 
@@ -291,6 +297,7 @@ fn serve_request(request: HttpRequest, doc_root: str, stream: TcpStream) -> i32 
     let hs: str = headers
     let _ = s.send(hs)
     let _ = log_request(m_check, p_check, 200)
+    let _ = s.close()
     ret 200
   }
 
@@ -300,5 +307,6 @@ fn serve_request(request: HttpRequest, doc_root: str, stream: TcpStream) -> i32 
   let _ = s.send(hs)
   let _ = s.send_file(resolved_str)
   let _ = log_request(m_check, p_check, 200)
+  let _ = s.close()
   ret 200
 }
