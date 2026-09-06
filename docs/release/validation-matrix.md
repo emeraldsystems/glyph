@@ -258,3 +258,11 @@ the same tree: 900 passed, 0 failed across 107 test binaries.
 Open release blockers as of this run: GLYPH-80 (apex move-checker error),
 GLYPH-83 (`glyph-cli run` JIT segfaults on `println`), GLYPH-84 (bare
 `if`/`else` tail expression returns a wrong value).
+
+## Integrator re-run — 2026-09-06, commit 957b81b (GLYPH-80/83/84 landed)
+
+After the three release blockers were fixed and merged: **21 PASS, 1 SKIP
+(sequencer live engine, NON-GOAL), 0 FAIL**, script exit 0. The apex row now
+builds and answers HTTP 200; the new `std_hello via glyph-cli run (JIT)` row
+passes. Full `cargo test` on the same tree: 920 passed, 0 failed across 109
+test binaries. No open release blockers from this matrix.
