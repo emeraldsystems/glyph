@@ -288,6 +288,7 @@ fn lowers_match_arm_block_expression_values() {
         arms: vec![
             MatchArm {
                 pattern: MatchPattern::Variant {
+                    qualifier: None,
                     name: Ident("Some".into()),
                     binding: Some(Ident("n".into())),
                 },
@@ -299,6 +300,7 @@ fn lowers_match_arm_block_expression_values() {
             },
             MatchArm {
                 pattern: MatchPattern::Variant {
+                    qualifier: None,
                     name: Ident("None".into()),
                     binding: None,
                 },
@@ -482,6 +484,7 @@ fn match_merge_ignores_terminated_arms_for_drops() {
         arms: vec![
             MatchArm {
                 pattern: MatchPattern::Variant {
+                    qualifier: None,
                     name: Ident("Yes".into()),
                     binding: None,
                 },
@@ -503,6 +506,7 @@ fn match_merge_ignores_terminated_arms_for_drops() {
             },
             MatchArm {
                 pattern: MatchPattern::Variant {
+                    qualifier: None,
                     name: Ident("No".into()),
                     binding: None,
                 },
