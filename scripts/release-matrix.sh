@@ -206,6 +206,26 @@ expect() {
 }
 
 # ===========================================================================
+# Row 1b: std_hello via `glyph-cli run` — the JIT execution path, distinct
+# from row 1's AOT build+execute above and from `glyph run` (the project
+# tool, used by every other row here). This is also the README's own
+# "Try It Out" command, verbatim. GLYPH-83: this used to segfault (exit
+# 139, no output) on any program reaching the formatting runtime — the
+# JIT's symbol table never covered glyph_fmt_write_*/glyph_json_*/etc.,
+# because those runtime/*.c object files were never linked into the
+# glyph-cli binary in the first place. Fixed by force-loading the whole
+# runtime archive into glyph-cli/glyph and resolving JIT externs via a
+# process-wide symbol search (see crates/glyph-cli/build.rs and
+# crates/glyph-backend/src/codegen/emit.rs).
+# ===========================================================================
+{
+  workdir="$SCRATCH/std_hello_jit"
+  mkdir -p "$workdir"
+  run_in_dir "$workdir" "$GLYPH_CLI" run "$REPO_ROOT/examples/std_hello/hello.glyph"
+  expect "std_hello via glyph-cli run (JIT, GLYPH-83)" BLOCKER 0 "hello world"
+}
+
+# ===========================================================================
 # Row 2: puts_hello — extern "C" FFI, single-file build + run
 # ===========================================================================
 {

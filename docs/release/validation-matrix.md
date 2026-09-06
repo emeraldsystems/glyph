@@ -56,6 +56,7 @@ table (and the Failures section) with what it reports then.
 | # | Row | Command | Expected | Result |
 |---|-----|---------|----------|--------|
 | 1 | std_hello | `glyph-cli build examples/std_hello/hello.glyph --emit exe && ./hello` | exit 0, stdout contains `hello world` | PASS |
+| 1b | std_hello via `glyph-cli run` (JIT, GLYPH-83) | `glyph-cli run examples/std_hello/hello.glyph` | exit 0, stdout contains `hello world` | PASS |
 | 2 | puts_hello (extern C) | `glyph-cli build examples/puts_hello/hello.glyph --emit exe && ./hello` | exit 0, stdout `Hello World!` | PASS |
 | 3 | extern_putchar.glyph fixture | `glyph-cli check ./extern_putchar.glyph` (copied to an isolated dir — see note) | exit 0, `check ok` | PASS |
 | 4 | vector | `glyph run` in `examples/vector` | exit **2**, stdout contains `vector demo ran` and `status Some(30)` | PASS |

@@ -107,6 +107,18 @@ fn main() {
         println!("cargo:rustc-link-lib=pthread");
     }
 
+    // Expose the archive's path to direct dependents' build scripts via the
+    // `links = "glyph_runtime"` manifest key (Cargo forwards this as
+    // DEP_GLYPH_RUNTIME_RUNTIME_ARCHIVE). A plain `-lglyph_runtime` only
+    // pulls in the .o members that resolve a symbol some other object
+    // already references, so runtime functions nothing in Rust calls
+    // directly (e.g. glyph_fmt_write_str, glyph_json_*, glyph_net_*,
+    // glyph_audio_*) get silently dropped from the final binary. glyph-cli
+    // reads this path to force-load the *entire* archive into its binaries,
+    // so every runtime symbol is present in-process for the JIT to resolve
+    // (GLYPH-83).
+    println!("cargo:runtime_archive={}", runtime_lib.display());
+
     println!(
         "cargo:warning=Runtime library built successfully at {}",
         runtime_lib.display()
