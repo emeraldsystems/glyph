@@ -19,9 +19,18 @@ impl CodegenContext {
 
         let i32_ty = unsafe { LLVMInt32TypeInContext(self.context) };
         let zero = unsafe { LLVMConstInt(i32_ty, 0, 0) };
+        let llvm_elem_ty = self.get_llvm_type(elem_type)?;
+        let elem_signed = matches!(elem_type, Type::I8 | Type::I16 | Type::I32 | Type::I64);
 
         for (idx, element) in elements.iter().enumerate() {
-            let elem_val = self.codegen_value(element, func, local_map)?;
+            let mut elem_val = self.codegen_value(element, func, local_map)?;
+            // An element's own computed value can come out at a different
+            // integer width than the array's declared element type (e.g. a
+            // negated literal, still computed at i32, going into an `[i8; N]`
+            // literal) - coerce it to match before storing, the same way
+            // `codegen_struct_literal` coerces a field value to its declared
+            // field type. A no-op when the widths already agree.
+            elem_val = self.coerce_int_value(elem_val, llvm_elem_ty, elem_signed);
             let index_const = unsafe { LLVMConstInt(i32_ty, idx as u64, 0) };
             let mut indices = vec![zero, index_const];
             let gep_name = CString::new(format!("array.elem{}", idx))?;
