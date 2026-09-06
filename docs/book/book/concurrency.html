@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d2df5439.js";
+            window.path_to_searchindex_js = "searchindex-2189d824.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-c681401e.js"></script>
@@ -272,11 +272,12 @@ system call per message. They are therefore the intended primitive for a
 pre-allocated sequencer-to-render event path. Endpoint destruction can drain
 values and free memory, so arrange for final endpoint drops on an ordinary
 control or render thread.</p>
-<p>The tracked sequencer acceptance example and its metric definitions are in
-<a href="../../../examples/sequencer/README.html"><code>examples/sequencer</code></a>. Its offline
-golden uses sample-frame timestamps for deterministic rendering; its opt-in
-live producer uses absolute monotonic <code>sleep_until_ns</code> deadlines and reports
-scheduler jitter without ever running Glyph code in the device callback.</p>
+<p>The tracked sequencer acceptance example and its metric definitions now
+live with the GlyphAudio engine; <a href="sequencer.html">the sequencer chapter</a>
+walks through it. Its offline golden uses sample-frame timestamps for
+deterministic rendering; its opt-in live producer uses absolute monotonic
+<code>sleep_until_ns</code> deadlines and reports scheduler jitter without ever
+running Glyph code in the device callback.</p>
 <h2 id="hard-real-time-boundary"><a class="header" href="#hard-real-time-boundary">Hard real-time boundary</a></h2>
 <p>Do not use <code>Mutex</code>, <code>Arc</code>, thread creation/join, or closure allocation and drop
 on a hard-real-time device callback. Mutex operations may block in the kernel;

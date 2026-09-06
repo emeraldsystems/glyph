@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d2df5439.js";
+            window.path_to_searchindex_js = "searchindex-2189d824.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-c681401e.js"></script>
@@ -828,11 +828,12 @@ system call per message. They are therefore the intended primitive for a
 pre-allocated sequencer-to-render event path. Endpoint destruction can drain
 values and free memory, so arrange for final endpoint drops on an ordinary
 control or render thread.</p>
-<p>The tracked sequencer acceptance example and its metric definitions are in
-<a href="../../../examples/sequencer/README.html"><code>examples/sequencer</code></a>. Its offline
-golden uses sample-frame timestamps for deterministic rendering; its opt-in
-live producer uses absolute monotonic <code>sleep_until_ns</code> deadlines and reports
-scheduler jitter without ever running Glyph code in the device callback.</p>
+<p>The tracked sequencer acceptance example and its metric definitions now
+live with the GlyphAudio engine; <a href="#building-the-sequencer">the sequencer chapter</a>
+walks through it. Its offline golden uses sample-frame timestamps for
+deterministic rendering; its opt-in live producer uses absolute monotonic
+<code>sleep_until_ns</code> deadlines and reports scheduler jitter without ever
+running Glyph code in the device callback.</p>
 <h2 id="hard-real-time-boundary"><a class="header" href="#hard-real-time-boundary">Hard real-time boundary</a></h2>
 <p>Do not use <code>Mutex</code>, <code>Arc</code>, thread creation/join, or closure allocation and drop
 on a hard-real-time device callback. Mutex operations may block in the kernel;
@@ -844,17 +845,28 @@ never invokes Glyph code. Running Glyph DSP or SPSC operations directly in
 that callback is a future protocol, not a current guarantee.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="building-the-sequencer"><a class="header" href="#building-the-sequencer">Building the sequencer</a></h1>
-<p><code>examples/sequencer</code> is a 16-voice synthesizer and pattern sequencer written
+<p>The sequencer is a 16-voice synthesizer and pattern sequencer written
 entirely in Glyph. It is worth walking through because it is the first
 program in this book that has to be correct in three dimensions at once:
 it is concurrent, it is real-time, and it is deterministic. Each of those
 pushed back on the design, and the shape the program ended up with is mostly
 a record of that argument.</p>
-<p>Run it with:</p>
-<pre><code class="language-sh">cd examples/sequencer
+<p>It began life here as <code>examples/sequencer</code> and has since become the audio
+engine of <strong>GlyphAudio</strong>, a separate application, where it lives in that
+project’s <code>engine/</code> directory. That move is why this chapter describes the
+program rather than shipping it: it is application code that outgrew being
+an example. What it demonstrates about the language is unchanged, and it
+remains the largest Glyph program written — which is most of why it is
+worth reading.</p>
+<p>From a GlyphAudio checkout:</p>
+<pre><code class="language-sh">cd engine
 glyph run                        # live playback (macOS)
 glyph run -- --offline out.wav   # the identical audio, rendered to a file
+glyph run -- --server            # newline-delimited JSON on stdin/stdout
 </code></pre>
+<p>The language-level contracts this chapter leans on are still exercised in
+this repository by <code>tests/fixtures/sequencer/</code>, so the ideas below cannot
+quietly stop compiling.</p>
 <h2 id="two-threads-one-owner-per-thing"><a class="header" href="#two-threads-one-owner-per-thing">Two threads, one owner per thing</a></h2>
 <p>The whole program is two threads that never share memory:</p>
 <pre><code>CONTROL THREAD (main)                 ENGINE THREAD (spawned FnOnce)
@@ -1016,14 +1028,22 @@ through the render loop leaked a little stack, and a spawned thread only has
 <p>The fix was to hoist those allocas to the entry block. It is mentioned here
 because it is the kind of bug that only a long-running loop finds, and an
 audio engine is the most patient loop you will write.</p>
+<p>Relying on that is not a testing strategy, though, so the regression is now
+pinned directly: <code>tests/fixtures/codegen/loop_body_locals.glyph</code> leaks
+nothing but stack if the hoist regresses, and its driver also reads the
+emitted IR and insists every <code>alloca</code> sits in its function’s entry block.
+That check runs in milliseconds and names the offending function, instead
+of waiting for an audio engine to die three layers away.</p>
 <h2 id="where-to-look-next"><a class="header" href="#where-to-look-next">Where to look next</a></h2>
 <ul>
-<li><a href="https://github.com/emeraldsystems/glyph/tree/master/examples/sequencer"><code>examples/sequencer/README.md</code></a>
-— the file-by-file map and the JSON command surface.</li>
 <li><code>docs/design/SEQUENCER_CORE.md</code> — the full contract, including every
 message and the verified platform constraints behind it.</li>
-<li><code>crates/glyph-cli/tests/seq_acceptance.rs</code> — determinism, command floods,
-transport chaos, a long-run heap check, and the latency bound.</li>
+<li><code>tests/fixtures/sequencer/</code> — the language-level contract and SPSC
+proofs, which stayed in this repository.</li>
+<li>The GlyphAudio project — the engine itself, its <code>engine/README.md</code>
+file-by-file map, the JSON command surface, and the acceptance suite
+covering determinism, command floods, transport chaos, the long-run heap
+check, and the latency bound.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="imports-1"><a class="header" href="#imports-1">Imports</a></h1>
@@ -1356,15 +1376,79 @@ fn main() -&gt; i32 {
   }
 }
 </code></pre>
-<p>The parser handles objects, arrays, strings and escapes, numbers, booleans,
-<code>null</code>, nested values, trailing-input rejection, and parse errors with source
-positions.</p>
+<p>The parser handles objects, arrays, strings and escapes (including <code>\uXXXX</code>
+and surrogate pairs, decoded to full Unicode), numbers, booleans, <code>null</code>,
+nested values, trailing-input rejection, and parse errors with source
+positions. It is an iterative implementation (no recursive-descent stack
+depth limits from Glyph call frames).</p>
+<h2 id="accessors"><a class="header" href="#accessors">Accessors</a></h2>
+<p><code>std/json/parser</code> also exports typed accessors for pulling values out of a
+<code>JsonValue</code> without writing a <code>match</code> by hand:</p>
+<pre><code class="language-glyph">from std/json import JsonValue, ParseResult
+from std/enums import Option
+from std/json/parser import parse, json_get_string, json_get_number,
+  json_get_bool, json_is_null, json_get_array, json_get_object
+
+fn main() -&gt; i32 {
+  let r = parse("{\"name\": \"glyph\", \"count\": 3}")
+  ret match r {
+    Ok(value) =&gt; match json_get_object(value) {
+      Some(obj) =&gt; if obj.has(String::from_str("name")) { 0 } else { 1 },
+      None =&gt; 2,
+    },
+    Err(_err) =&gt; 3,
+  }
+}
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Function</th><th>Signature</th></tr>
+</thead>
+<tbody>
+<tr><td><code>json_get_string</code></td><td><code>(value: JsonValue) -&gt; Option&lt;String&gt;</code></td></tr>
+<tr><td><code>json_get_number</code></td><td><code>(value: JsonValue) -&gt; Option&lt;f64&gt;</code></td></tr>
+<tr><td><code>json_get_bool</code></td><td><code>(value: JsonValue) -&gt; Option&lt;bool&gt;</code></td></tr>
+<tr><td><code>json_is_null</code></td><td><code>(value: JsonValue) -&gt; bool</code></td></tr>
+<tr><td><code>json_get_array</code></td><td><code>(value: JsonValue) -&gt; Option&lt;Vec&lt;JsonValue&gt;&gt;</code></td></tr>
+<tr><td><code>json_get_object</code></td><td><code>(value: JsonValue) -&gt; Option&lt;Map&lt;String, JsonValue&gt;&gt;</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Each accessor returns <code>None</code> (or <code>false</code> for <code>json_is_null</code>) when the value
+is a different variant, rather than panicking.</p>
+<h2 id="serializing"><a class="header" href="#serializing">Serializing</a></h2>
+<p><code>std/json/parser</code> also exports <code>stringify(value: JsonValue) -&gt; String</code>,
+which round-trips through <code>parse</code>: strings are escaped, numbers use a
+shortest-round-trip representation, and arrays/objects are serialized
+recursively via <code>stringify_array</code> and <code>stringify_object</code>.</p>
+<pre><code class="language-glyph">from std/json import ParseResult
+from std/json/parser import parse, stringify
+
+fn main() -&gt; i32 {
+  ret match parse("[1, 2, 3]") {
+    Ok(value) =&gt; {
+      let s: str = stringify(value)
+      if s.len() &gt; 0 { 0 } else { 1 }
+    },
+    Err(_err) =&gt; 2,
+  }
+}
+</code></pre>
 <h2 id="status"><a class="header" href="#status">Status</a></h2>
-<p><code>std/json</code> provides the JSON types, and <code>std/json/parser::parse</code> is the shipped
-parser. Current ownership semantics around map-owned <code>JsonValue</code> snapshots are
-still being tightened: avoid APIs that keep by-value snapshots from <code>Map::get</code>;
-move the owning value, borrow where possible, or clone/deep-copy when that API is
-available.</p>
+<p><code>std/json/parser::parse</code> (an iterative, full-Unicode recursive-descent-style
+parser), its accessors, and <code>stringify</code> are the shipped, release-gated JSON
+API — this is the only parser the compiler embeds. There is no stub fallback:
+<code>crates/glyph-cli/tests/std_json_parser.rs</code> includes a regression test
+(<code>std_json_parser_embeds_full_parser_not_stub</code>) asserting the compiler
+embeds the full implementation, alongside coverage for nested/trailing
+input, string escapes, Unicode, hardening matrices, accessors, and
+stringify round-trips.</p>
+<p>Map-owned <code>JsonValue</code> snapshots (e.g. taking a <code>JsonValue</code> by value out of a
+<code>Map::get</code> on a nested object) are covered and safe: views deep-clone at
+ownership-escape points, so there is no dangling or double-free risk. See
+<code>docs/book/src/limitations.md</code> for value-category and inference rules that
+apply generally (not specific to JSON).</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="external-processes"><a class="header" href="#external-processes">External Processes</a></h1>
 <p>To launch external (non-Glyph) programs, use <code>std/process::run</code>.</p>
