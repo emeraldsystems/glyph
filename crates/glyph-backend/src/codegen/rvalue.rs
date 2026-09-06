@@ -733,6 +733,33 @@ impl CodegenContext {
                     let (lhs_val, rhs_val) =
                         self.coerce_int_binop(lhs_val0, rhs_val0, lhs_unsigned, rhs_unsigned);
 
+                    // Comparison predicate and Div/Mod instruction selection
+                    // must also follow operand signedness (GLYPH-76): `icmp
+                    // slt`/`sdiv`/`srem` treat the high bit as a sign, so an
+                    // unsigned value with it set (e.g. u32 4000000000)
+                    // compares as negative and divides/remainders wrong.
+                    // `mir_value_type` types an untyped integer literal
+                    // (`MirValue::Int`) as plain `I32`, which isn't a real
+                    // declared signedness to defer to - so a literal
+                    // contributes nothing here and the OTHER, genuinely
+                    // typed operand decides. Two literals together (no typed
+                    // operand at all) default to signed, matching the
+                    // untyped-literal default used everywhere else. Two
+                    // operands that are both genuinely typed but disagree in
+                    // signedness (a separate, already-reported gap: same-
+                    // width signed/unsigned mixing is accepted with no
+                    // diagnostic) resolve to unsigned - the safer of the two
+                    // wrong answers, since it's the one that doesn't turn a
+                    // large magnitude into a negative one.
+                    let lhs_is_untyped_literal = matches!(lhs, MirValue::Int(_));
+                    let rhs_is_untyped_literal = matches!(rhs, MirValue::Int(_));
+                    let unsigned_op = (!lhs_is_untyped_literal && lhs_unsigned)
+                        || (!rhs_is_untyped_literal && rhs_unsigned);
+
+                    use llvm_sys::LLVMIntPredicate::{
+                        LLVMIntEQ, LLVMIntNE, LLVMIntSGE, LLVMIntSGT, LLVMIntSLE, LLVMIntSLT,
+                        LLVMIntUGE, LLVMIntUGT, LLVMIntULE, LLVMIntULT,
+                    };
                     let result = match op {
                         BinaryOp::Add => {
                             LLVMBuildAdd(self.builder, lhs_val, rhs_val, name.as_ptr())
@@ -744,49 +771,49 @@ impl CodegenContext {
                             LLVMBuildMul(self.builder, lhs_val, rhs_val, name.as_ptr())
                         }
                         BinaryOp::Div => {
-                            LLVMBuildSDiv(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            if unsigned_op {
+                                LLVMBuildUDiv(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            } else {
+                                LLVMBuildSDiv(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
                         }
                         BinaryOp::Mod => {
-                            LLVMBuildSRem(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            if unsigned_op {
+                                LLVMBuildURem(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            } else {
+                                LLVMBuildSRem(self.builder, lhs_val, rhs_val, name.as_ptr())
+                            }
                         }
-                        BinaryOp::Eq => LLVMBuildICmp(
-                            self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntEQ,
-                            lhs_val,
-                            rhs_val,
-                            name.as_ptr(),
-                        ),
-                        BinaryOp::Ne => LLVMBuildICmp(
-                            self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntNE,
-                            lhs_val,
-                            rhs_val,
-                            name.as_ptr(),
-                        ),
+                        BinaryOp::Eq => {
+                            LLVMBuildICmp(self.builder, LLVMIntEQ, lhs_val, rhs_val, name.as_ptr())
+                        }
+                        BinaryOp::Ne => {
+                            LLVMBuildICmp(self.builder, LLVMIntNE, lhs_val, rhs_val, name.as_ptr())
+                        }
                         BinaryOp::Lt => LLVMBuildICmp(
                             self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntSLT,
+                            if unsigned_op { LLVMIntULT } else { LLVMIntSLT },
                             lhs_val,
                             rhs_val,
                             name.as_ptr(),
                         ),
                         BinaryOp::Le => LLVMBuildICmp(
                             self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntSLE,
+                            if unsigned_op { LLVMIntULE } else { LLVMIntSLE },
                             lhs_val,
                             rhs_val,
                             name.as_ptr(),
                         ),
                         BinaryOp::Gt => LLVMBuildICmp(
                             self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntSGT,
+                            if unsigned_op { LLVMIntUGT } else { LLVMIntSGT },
                             lhs_val,
                             rhs_val,
                             name.as_ptr(),
                         ),
                         BinaryOp::Ge => LLVMBuildICmp(
                             self.builder,
-                            llvm_sys::LLVMIntPredicate::LLVMIntSGE,
+                            if unsigned_op { LLVMIntUGE } else { LLVMIntSGE },
                             lhs_val,
                             rhs_val,
                             name.as_ptr(),
