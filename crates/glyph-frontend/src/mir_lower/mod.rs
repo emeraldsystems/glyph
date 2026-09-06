@@ -8,6 +8,7 @@ use crate::resolver::ResolverContext;
 mod builtins;
 mod call;
 mod context;
+pub(crate) mod enums;
 mod expr;
 mod flow;
 mod signatures;

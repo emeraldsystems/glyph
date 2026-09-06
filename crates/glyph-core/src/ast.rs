@@ -179,7 +179,14 @@ pub enum InterpSegment {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MatchPattern {
     Wildcard,
-    Variant { name: Ident, binding: Option<Ident> },
+    Variant {
+        /// The enum-name segment of a qualified pattern (`Enum::Variant`),
+        /// e.g. `A` in `A::Some`. `None` for an unqualified pattern such as
+        /// bare `Some(x)` or `None`.
+        qualifier: Option<Ident>,
+        name: Ident,
+        binding: Option<Ident>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

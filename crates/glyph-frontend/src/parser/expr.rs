@@ -262,12 +262,17 @@ impl<'a> Parser<'a> {
 
         let variant_tok = self.consume(TokenKind::Ident, "expected variant name")?;
         let mut name = Ident(self.slice(variant_tok));
+        let mut qualifier = None;
         while self.at(TokenKind::ColonColon) {
             self.advance();
             let seg_tok = self.consume(
                 TokenKind::Ident,
                 "expected identifier after `::` in match pattern",
             )?;
+            // Preserve the segment immediately preceding the final one as the
+            // pattern's qualifier (the enum name in `Enum::Variant`), rather
+            // than silently discarding it (GLYPH-13).
+            qualifier = Some(name);
             name = Ident(self.slice(seg_tok));
         }
         let mut binding = None;
@@ -279,7 +284,11 @@ impl<'a> Parser<'a> {
             self.consume(TokenKind::RParen, "expected `)` after binding")?;
         }
 
-        Some(MatchPattern::Variant { name, binding })
+        Some(MatchPattern::Variant {
+            qualifier,
+            name,
+            binding,
+        })
     }
 
     pub(super) fn parse_binary_expr(&mut self) -> Option<Expr> {
