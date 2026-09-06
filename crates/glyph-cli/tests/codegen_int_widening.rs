@@ -76,6 +76,40 @@ fn compile_ir_source(source: &str) -> String {
     ir
 }
 
+/// Like `compile_ir_source`, but with the stdlib included: `Vec`/`Map`/etc.
+/// generic templates are only registered when `include_std` is set.
+#[cfg(feature = "codegen")]
+fn compile_ir_source_with_std(source: &str) -> String {
+    let out = compile_source(
+        source,
+        FrontendOptions {
+            emit_mir: true,
+            include_std: true,
+        },
+    );
+    assert!(
+        out.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        out.diagnostics
+    );
+
+    let backend = LlvmBackend::default();
+    let artifact = backend
+        .emit(
+            &out.mir,
+            &CodegenOptions {
+                emit: EmitKind::LlvmIr,
+                ..Default::default()
+            },
+        )
+        .expect("backend emit");
+    let ir = artifact.llvm_ir.expect("llvm ir");
+    if std::env::var("GLYPH_DEBUG_IR").is_ok() {
+        eprintln!("{}", ir);
+    }
+    ir
+}
+
 #[cfg(all(feature = "codegen", unix))]
 fn build_and_run_exit_code(source: &str) -> i32 {
     build_and_run_stdout(source).0
@@ -500,6 +534,50 @@ fn binary_op_widening_unsigned_operand_emits_zext_not_sext() {
     assert!(
         !ir.contains("sext i8"),
         "widening an unsigned operand in a binary op must not sign-extend:\n{}",
+        ir
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Vec push: `v.push(u)` (codegen/vec.rs coerce_vec_elem_for_store, GLYPH-73
+// reconciled with GLYPH-72's element-width fix)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "codegen", unix))]
+#[test]
+fn vec_push_of_unsigned_source_zero_extends_runtime() {
+    let source = r#"
+        fn main() -> i32 {
+          let u: u8 = 200;
+          let mut v: Vec<i64> = Vec::new();
+          v.push(u);
+          if v[0] != 200 { ret 1 }
+          ret 0
+        }
+    "#;
+    assert_eq!(build_and_run_exit_code(source), 0);
+}
+
+#[cfg(feature = "codegen")]
+#[test]
+fn vec_push_of_unsigned_source_emits_zext_not_sext() {
+    let ir = compile_ir_source_with_std(
+        r#"
+        fn g() {
+          let u: u8 = 200;
+          let mut v: Vec<i64> = Vec::new();
+          v.push(u);
+        }
+        "#,
+    );
+    assert!(
+        ir.contains("zext i8") && ir.contains("to i64"),
+        "pushing an unsigned source into a wider Vec element must zero-extend:\n{}",
+        ir
+    );
+    assert!(
+        !ir.contains("sext i8"),
+        "pushing an unsigned source into a wider Vec element must not sign-extend:\n{}",
         ir
     );
 }

@@ -185,7 +185,11 @@ impl CodegenContext {
                 CString::new("vec.elem.ptr")?.as_ptr(),
             )
         };
-        let value = self.coerce_vec_elem_for_store(value, elem_type, elem_llvm_ty)?;
+        // No MirValue is available here (compiler-internal callers pass an
+        // already-built LLVMValueRef whose type already equals elem_type),
+        // so there's no distinct source Glyph type to derive signedness
+        // from beyond the element type itself.
+        let value = self.coerce_vec_elem_for_store(value, elem_type, elem_llvm_ty, None)?;
         unsafe { LLVMBuildStore(self.builder, value, elem_ptr) };
         let new_len = unsafe {
             LLVMBuildAdd(
@@ -211,13 +215,26 @@ impl CodegenContext {
     ///
     /// Mirrors the coercion already applied to indexed-assignment stores in
     /// `functions.rs` (`xs[i] = v`, GLYPH-64).
+    ///
+    /// Sign/zero extension follows `source_type`'s signedness when the
+    /// caller has one, not the element type's (GLYPH-73): pushing a `u8`
+    /// into a `Vec<i64>` must zero-extend, even though the destination
+    /// element type alone is signed. Callers with no distinct source value
+    /// (compiler-generated stores where the pushed value's type already
+    /// equals `elem_type`) pass `None` and get the old element-type-derived
+    /// rule, which is correct in that case since there's nothing else to
+    /// derive it from.
     pub(super) fn coerce_vec_elem_for_store(
         &mut self,
         value: LLVMValueRef,
         elem_type: &Type,
         elem_llvm_ty: LLVMTypeRef,
+        source_type: Option<&Type>,
     ) -> Result<LLVMValueRef> {
-        let signed = matches!(elem_type, Type::I8 | Type::I16 | Type::I32 | Type::I64);
+        let signed = source_type.map_or_else(
+            || matches!(elem_type, Type::I8 | Type::I16 | Type::I32 | Type::I64),
+            Self::int_ext_is_signed,
+        );
         let mut value = self.coerce_int_value(value, elem_llvm_ty, signed);
         unsafe {
             let val_kind = LLVMGetTypeKind(LLVMTypeOf(value));
@@ -921,7 +938,16 @@ impl CodegenContext {
             )
         };
         let value_val = self.codegen_value_owned(value, elem_type, func, local_map)?;
-        let value_val = self.coerce_vec_elem_for_store(value_val, elem_type, elem_llvm_ty)?;
+        // Extension follows the PUSHED VALUE's own source signedness, not
+        // the element type's (GLYPH-73): `v.push(u)` with `u: u8` and
+        // `v: Vec<i64>` must zero-extend `u`.
+        let source_type = self.mir_value_type(value, func);
+        let value_val = self.coerce_vec_elem_for_store(
+            value_val,
+            elem_type,
+            elem_llvm_ty,
+            source_type.as_ref(),
+        )?;
         unsafe { LLVMBuildStore(self.builder, value_val, elem_ptr) };
         let new_len = unsafe {
             LLVMBuildAdd(
