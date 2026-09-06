@@ -319,6 +319,19 @@ pub(crate) fn lower_expr_with_expected<'a>(
                     });
                     return Some(Rvalue::Move(tmp));
                 }
+                // An expected float type (e.g. `let x: f64 = 1`, or an int
+                // literal inside a `[f64; N]` array literal) promotes the
+                // literal to a float constant of that width instead of
+                // reinterpreting the integer's raw bits as a float.
+                if ty.is_float() {
+                    let tmp = ctx.fresh_local(None);
+                    ctx.locals[tmp.0 as usize].ty = Some(ty.clone());
+                    ctx.push_inst(MirInst::Assign {
+                        local: tmp,
+                        value: Rvalue::ConstFloat(*i as f64),
+                    });
+                    return Some(Rvalue::Move(tmp));
+                }
             }
             Some(Rvalue::ConstInt(*i))
         }
@@ -396,7 +409,7 @@ pub(crate) fn lower_expr_with_expected<'a>(
         }
         Expr::Unary { op, expr, span } => match op {
             UnaryOp::Not => lower_unary_not(ctx, expr, *span),
-            UnaryOp::Neg => lower_unary_neg(ctx, expr, *span),
+            UnaryOp::Neg => lower_unary_neg(ctx, expr, *span, expected),
         },
         Expr::Binary { op, lhs, rhs, .. } => match *op {
             glyph_core::ast::BinaryOp::And | glyph_core::ast::BinaryOp::Or => {
@@ -449,7 +462,7 @@ pub(crate) fn lower_expr_with_expected<'a>(
             mutability,
             span,
         } => lower_ref_expr(ctx, expr, *mutability, *span),
-        Expr::ArrayLit { elements, span } => lower_array_lit(ctx, elements, *span),
+        Expr::ArrayLit { elements, span } => lower_array_lit(ctx, elements, *span, expected),
         Expr::Index { base, index, span } => lower_array_index(ctx, base, index, *span),
         Expr::MethodCall {
             receiver,
@@ -592,10 +605,25 @@ fn lower_unary_not<'a>(ctx: &mut LowerCtx<'a>, expr: &'a Expr, _span: Span) -> O
     Some(Rvalue::Move(tmp))
 }
 
-fn lower_unary_neg<'a>(ctx: &mut LowerCtx<'a>, expr: &'a Expr, _span: Span) -> Option<Rvalue> {
+fn lower_unary_neg<'a>(
+    ctx: &mut LowerCtx<'a>,
+    expr: &'a Expr,
+    _span: Span,
+    expected: Option<&Type>,
+) -> Option<Rvalue> {
     let value = lower_value(ctx, expr)?;
     let tmp = ctx.fresh_local(None);
-    let ty = infer_value_type(&value, ctx).unwrap_or(Type::I32);
+    // An expected integer type (from an annotation, an array element type, a
+    // struct field, ...) decides the width the negation computes at, so e.g.
+    // `-100` inside a `[i8; N]` literal produces an i8 tmp directly instead of
+    // computing at i32 and relying on a scalar-only coercion elsewhere to
+    // truncate it back down. Floats are left to the existing inference: they
+    // don't have the same per-element aggregate-store gap that ints do here.
+    let ty = expected
+        .filter(|ty| ty.is_int())
+        .cloned()
+        .or_else(|| infer_value_type(&value, ctx))
+        .unwrap_or(Type::I32);
     let zero = if ty.is_float() {
         MirValue::Float(0.0)
     } else {
@@ -1415,16 +1443,18 @@ pub(crate) fn lower_struct_lit<'a>(
             continue;
         }
 
-        // The field's declared type is not threaded into lowering, but it is
-        // what an integer literal has to fit, so range-check against it here.
+        // Thread the field's declared type into lowering (GLYPH-74) so a
+        // literal in field position - an array literal in particular -
+        // adopts it instead of defaulting to i32/f64. `lower_value_with_expected`
+        // performs the integer-literal range check against it too, so it is
+        // not duplicated here.
         let field_ty = struct_type
             .fields
             .iter()
             .find(|(n, _)| n == &field_name.0)
             .map(|(_, ty)| ty.clone());
-        check_int_literal_range(ctx, expr, field_ty.as_ref());
 
-        match lower_value(ctx, expr) {
+        match lower_value_with_expected(ctx, expr, field_ty.as_ref()) {
             Some(value) => {
                 consume_value_local(ctx, &value, span);
                 lowered_fields.push((field_name.0.clone(), value));
@@ -1530,6 +1560,7 @@ pub(crate) fn lower_array_lit<'a>(
     ctx: &mut LowerCtx<'a>,
     elements: &'a [Expr],
     span: Span,
+    expected: Option<&Type>,
 ) -> Option<Rvalue> {
     // Check for empty array literal
     if elements.is_empty() {
@@ -1537,19 +1568,51 @@ pub(crate) fn lower_array_lit<'a>(
         return None;
     }
 
-    // Lower all elements
+    // An annotation (`let x: [T; N] = ...`, a function parameter/return typed
+    // `[T; N]`, a struct field typed `[T; N]`, or an outer array literal for a
+    // nested `[[T; N]; M]`) says what every element's type has to be.
+    // Consulting it here - instead of inferring the element type from the
+    // first element alone - is the fix for GLYPH-74: an untyped integer
+    // literal defaults to i32, so every array literal used to be laid out as
+    // i32 regardless of the declared element type, corrupting reads back
+    // through narrower or wider types.
+    let mut elem_type: Option<Type> = match expected {
+        Some(Type::Array(elem_ty, _)) => Some(elem_ty.as_ref().clone()),
+        _ => None,
+    };
+
+    // Lower all elements, feeding each one the element type as soon as it is
+    // known so literals (int, float, char, nested array literals, ...) adopt
+    // it via the same expected-type mechanism `let x: T = <literal>` uses,
+    // rather than a parallel one.
     let mut mir_elements = Vec::new();
     for elem in elements {
-        let mir_val = lower_value(ctx, elem)?;
+        let mir_val = if let Some(ty) = elem_type.clone() {
+            lower_value_with_expected(ctx, elem, Some(&ty))?
+        } else {
+            lower_value(ctx, elem)?
+        };
         consume_value_local(ctx, &mir_val, span);
+
+        if elem_type.is_none() {
+            // No annotation is in scope: the first element with no declared
+            // type sets the type for the rest of the literal. This covers
+            // `[a, 1]` where `a: i8` - `1` should adopt `i8`, not silently
+            // default to i32 - the same way it would if written `let b: i8 =
+            // 1` right after `a`.
+            elem_type = infer_value_type(&mir_val, ctx);
+        }
+
         mir_elements.push(mir_val);
     }
 
-    // Infer element type from first element
-    let elem_type = infer_value_type(&mir_elements[0], ctx)?;
+    let elem_type = elem_type?;
 
-    // Validate all elements have same type
-    for (i, val) in mir_elements.iter().enumerate().skip(1) {
+    // Validate every element actually has the element type. Elements lowered
+    // above already adopted it via `lower_value_with_expected`; this remains
+    // a real check for values that don't (e.g. an ident whose own declared
+    // type disagrees with the annotation or with the first element).
+    for (i, val) in mir_elements.iter().enumerate() {
         let val_ty = infer_value_type(val, ctx)?;
         if val_ty != elem_type {
             ctx.error(
@@ -1925,6 +1988,19 @@ pub(crate) fn lower_value_with_expected<'a>(
                     });
                     return Some(MirValue::Local(tmp));
                 }
+                // An expected float type (e.g. an int literal inside a
+                // `[f64; N]` array literal) promotes the literal to a float
+                // constant of that width instead of reinterpreting the
+                // integer's raw bits as a float.
+                if ty.is_float() {
+                    let tmp = ctx.fresh_local(None);
+                    ctx.locals[tmp.0 as usize].ty = Some(ty.clone());
+                    ctx.push_inst(MirInst::Assign {
+                        local: tmp,
+                        value: Rvalue::ConstFloat(*i as f64),
+                    });
+                    return Some(MirValue::Local(tmp));
+                }
             }
             Some(MirValue::Int(*i))
         }
@@ -2034,7 +2110,7 @@ pub(crate) fn lower_value_with_expected<'a>(
         }
         Expr::Unary { op, expr, span } => match op {
             UnaryOp::Not => lower_unary_not(ctx, expr, *span).and_then(rvalue_to_value),
-            UnaryOp::Neg => lower_unary_neg(ctx, expr, *span).and_then(rvalue_to_value),
+            UnaryOp::Neg => lower_unary_neg(ctx, expr, *span, expected).and_then(rvalue_to_value),
         },
         Expr::Cast { expr, target, span } => {
             lower_cast(ctx, expr, target, *span).and_then(rvalue_to_value)
@@ -2087,7 +2163,7 @@ pub(crate) fn lower_value_with_expected<'a>(
             Some(MirValue::Local(tmp))
         }
         Expr::ArrayLit { elements, span } => {
-            lower_array_lit(ctx, elements, *span).and_then(rvalue_to_value)
+            lower_array_lit(ctx, elements, *span, expected).and_then(rvalue_to_value)
         }
         Expr::Index { base, index, span } => {
             lower_array_index(ctx, base, index, *span).and_then(rvalue_to_value)
