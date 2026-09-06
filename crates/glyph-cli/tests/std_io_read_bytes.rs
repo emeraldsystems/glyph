@@ -113,15 +113,15 @@ fn reports_a_short_read_at_end_of_file() {
     // discover the length when you did not ask first. The count must be
     // honest rather than the requested max.
     //
-    // BUFFER SIZE IS CAPPED AT 24 BECAUSE OF A LANGUAGE BUG, NOT BY CHOICE.
-    // Vec<u8> corrupts the heap when it grows past 32 elements (GLYPH-72),
-    // non-deterministically -- this test at 64 failed roughly one run in
-    // five. The cap keeps the suite honest rather than intermittently red;
-    // raise it once that bug is fixed, because a real caller reading a
-    // sample needs millions of elements, not two dozen.
+    // The buffer used to be capped at 24 elements as a workaround for
+    // GLYPH-72 (Vec<u8> corrupted the heap non-deterministically once it
+    // grew past 32 elements via `push`). That bug is fixed, so this drives
+    // the buffer past the old 32-element threshold with a real file larger
+    // than 32 bytes, growing well beyond the once-unsafe zone.
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("short.bin");
-    fs::write(&path, [9u8, 8, 7]).unwrap();
+    let data: Vec<u8> = (0u8..40).collect();
+    fs::write(&path, &data).unwrap();
 
     let src = format!(
         r#"
@@ -131,13 +131,16 @@ from std/vec import Vec
 {FILL}
 fn main() -> i32 {{
   let mut buf: Vec<u8> = Vec::new()
-  let _f = fill_zeros(&mut buf, 24)
-  let got = read_file_bytes("{path}", &mut buf, 24)
-  if got != 3 {{ ret 10 }}
-  if buf[0] != 9 {{ ret 20 }}
-  if buf[2] != 7 {{ ret 21 }}
+  let _f = fill_zeros(&mut buf, 64)
+  let got = read_file_bytes("{path}", &mut buf, 64)
+  if got != 40 {{ ret 10 }}
+  if buf[0] != 0 {{ ret 20 }}
+  if buf[1] != 1 {{ ret 21 }}
+  if buf[32] != 32 {{ ret 22 }}
+  if buf[39] != 39 {{ ret 23 }}
   // Past the data the caller's own zeros must still be there, untouched.
-  if buf[3] != 0 {{ ret 30 }}
+  if buf[40] != 0 {{ ret 30 }}
+  if buf[63] != 0 {{ ret 31 }}
   ret 0
 }}
 "#,

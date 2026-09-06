@@ -185,6 +185,7 @@ impl CodegenContext {
                 CString::new("vec.elem.ptr")?.as_ptr(),
             )
         };
+        let value = self.coerce_vec_elem_for_store(value, elem_type, elem_llvm_ty)?;
         unsafe { LLVMBuildStore(self.builder, value, elem_ptr) };
         let new_len = unsafe {
             LLVMBuildAdd(
@@ -196,6 +197,61 @@ impl CodegenContext {
         };
         unsafe { LLVMBuildStore(self.builder, new_len, len_ptr) };
         Ok(())
+    }
+
+    /// Width-coerce a value about to be stored into a Vec element slot.
+    ///
+    /// `codegen_value`/`codegen_value_owned` materialize untyped integer
+    /// literals as i32 and don't know the destination element width, so a
+    /// `Vec<u8>.push(0)` would otherwise store a 4-byte i32 through a
+    /// 1-byte-element pointer, overrunning the buffer by 3 bytes per element
+    /// (GLYPH-72). LLVM's opaque pointers carry no pointee-type information,
+    /// so a mismatched store like that is valid IR that silently corrupts
+    /// adjacent heap memory instead of failing to compile or verify.
+    ///
+    /// Mirrors the coercion already applied to indexed-assignment stores in
+    /// `functions.rs` (`xs[i] = v`, GLYPH-64).
+    pub(super) fn coerce_vec_elem_for_store(
+        &mut self,
+        value: LLVMValueRef,
+        elem_type: &Type,
+        elem_llvm_ty: LLVMTypeRef,
+    ) -> Result<LLVMValueRef> {
+        let signed = matches!(elem_type, Type::I8 | Type::I16 | Type::I32 | Type::I64);
+        let mut value = self.coerce_int_value(value, elem_llvm_ty, signed);
+        unsafe {
+            let val_kind = LLVMGetTypeKind(LLVMTypeOf(value));
+            let elem_kind = LLVMGetTypeKind(elem_llvm_ty);
+            if Self::is_float_type_kind(val_kind)
+                && Self::is_float_type_kind(elem_kind)
+                && LLVMTypeOf(value) != elem_llvm_ty
+            {
+                value = if matches!(elem_type, Type::F64) {
+                    LLVMBuildFPExt(
+                        self.builder,
+                        value,
+                        elem_llvm_ty,
+                        CString::new("vec.push.fpext")?.as_ptr(),
+                    )
+                } else {
+                    LLVMBuildFPTrunc(
+                        self.builder,
+                        value,
+                        elem_llvm_ty,
+                        CString::new("vec.push.fptrunc")?.as_ptr(),
+                    )
+                };
+            }
+        }
+        if unsafe { LLVMTypeOf(value) } != elem_llvm_ty {
+            bail!(
+                "internal compiler error: Vec<{:?}> push value type does not match \
+                 the element type after coercion; this indicates a codegen bug, not \
+                 an error in the Glyph program",
+                elem_type
+            );
+        }
+        Ok(value)
     }
 
     pub(super) fn codegen_vec_struct_init(
@@ -865,6 +921,7 @@ impl CodegenContext {
             )
         };
         let value_val = self.codegen_value_owned(value, elem_type, func, local_map)?;
+        let value_val = self.coerce_vec_elem_for_store(value_val, elem_type, elem_llvm_ty)?;
         unsafe { LLVMBuildStore(self.builder, value_val, elem_ptr) };
         let new_len = unsafe {
             LLVMBuildAdd(
