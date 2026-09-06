@@ -243,6 +243,11 @@ mdbook build docs/book
 - `INTERFACES_DESIGN.md` — Trait/interface system
 - Plus many more covering enums, ownership, networking, formatting, etc.
 
+See [`docs/DOCS.md`](docs/DOCS.md) for the full documentation index,
+including the [release validation matrix](docs/release/validation-matrix.md)
+(`just release-matrix`) that builds and runs a battery of the `examples/`
+programs as a release gate.
+
 ---
 
 ## 🏗️ Project Workflow

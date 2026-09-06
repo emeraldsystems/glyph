@@ -2,12 +2,14 @@
 **/target
 **/.DS_Store
 docs/*
+!docs/DOCS.md
 !docs/index.html
 !docs/llm-token-cost.html
 !docs/reports/
 !docs/book/
 !docs/plan/
 !docs/todo/
+!docs/release/
 .opencode
 .env
 video/
