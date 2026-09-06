@@ -43,9 +43,19 @@
 //!   see).
 //! - Within a single straight-line block: a local is never read again after
 //!   an explicit [`MirInst::Drop`] of it, unless a later [`MirInst::Assign`]
-//!   in that same block reinitializes it first.
+//!   in that same block reinitializes it first ([`MirInst::DrainThreadScope`]
+//!   is exempt from this — see below).
 //!
 //! # What is deliberately NOT checked, and why
+//! - **A `DrainThreadScope` of a local already `Drop`-ed in the same
+//!   block.** Its operand is always the fieldless, non-owning public
+//!   `std::thread::Scope` view a scope callback closure receives (never the
+//!   private raw scope owner `DropThreadScope` manages), so a generic `Drop`
+//!   of it is a confirmed runtime no-op and `DrainThreadScope` — documented
+//!   as something scope callbacks "emit ... on every exit" — is designed to
+//!   run repeatedly and safely interleaved with it. See the exemption's own
+//!   comment in `collect_read_locals_in_inst` for the concrete backend
+//!   evidence (`scoped_thread_values::scoped_borrowed_children_join_and_drain_in_jit`).
 //! - **Dropping the same local twice in a block.** This looks like an
 //!   obvious companion to the use-after-drop check above, and an earlier
 //!   version of this pass rejected it — until
@@ -87,7 +97,6 @@
 //!   reimplement backend's canonical-alias table (`Stdout`, `File`, ...) or
 //!   risk a false positive on it drifting out of sync.
 
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 
@@ -701,6 +710,25 @@ fn collect_read_locals_in_inst(inst: &MirInst, out: &mut Vec<LocalId>) {
         // so this must not be treated as a "read" that would trip the
         // use-after-drop check on a second `Drop` of the same local.
         MirInst::Drop(_) => {}
+        // `DrainThreadScope`'s operand is always the canonical public
+        // `std::thread::Scope` *view* local a scope callback closure
+        // receives, not the private raw owner `ThreadScopeCreate`/
+        // `DropThreadScope` manage. `struct Scope {}` (`stdlib/thread.glyph`)
+        // is a fieldless, non-owning view, so a generic `MirInst::Drop` of
+        // it is a confirmed runtime no-op (`codegen_drop_named_slot` finds
+        // no fields to touch): the view's underlying pointer value is
+        // unaffected. `DrainThreadScope` is also documented as something
+        // "callback bodies emit ... on every exit" — i.e. designed to run
+        // repeatedly and safely, interleaved with that no-op `Drop`, at
+        // every overlapping lexical-scope-exit cleanup point
+        // (`drain_scoped_callback_scopes` in `mir_lower/context.rs` is
+        // called from three separate cleanup paths that can all fire for
+        // the same registered scope on one exit). Integration test
+        // `crates/glyph-cli/tests/scoped_thread_values.rs`'s
+        // `scoped_borrowed_children_join_and_drain_in_jit` exercises exactly
+        // `DrainThreadScope(s); ...; Drop(s); DrainThreadScope(s);`
+        // in one block, so this must not be treated as a "read" either.
+        MirInst::DrainThreadScope(_) => {}
         _ => collect_all_locals_in_inst(inst, out),
     }
 }
@@ -989,6 +1017,7 @@ mod tests {
     use crate::atomic::AtomicScalar;
     use crate::mir::{Local, MirBlock};
     use crate::types::{EnumType, EnumVariant, Mutability, StructType};
+    use std::collections::HashMap;
 
     fn simple_function(blocks: Vec<MirBlock>, locals: Vec<Local>) -> MirFunction {
         MirFunction {
@@ -1511,6 +1540,37 @@ mod tests {
                     skip_drop: false,
                 },
             ],
+        );
+        assert!(verify_module(&module_with(func)).is_empty());
+    }
+
+    #[test]
+    fn draining_a_thread_scope_after_dropping_its_view_is_accepted() {
+        // Mirrors integration test
+        // `scoped_thread_values::scoped_borrowed_children_join_and_drain_in_jit`:
+        // a scope callback closure's exit sequence emits
+        // `DrainThreadScope(scope); ...; Drop(scope); DrainThreadScope(scope);`
+        // because `drain_scoped_callback_scopes` (mir_lower/context.rs) is
+        // called from more than one overlapping lexical-scope-exit cleanup
+        // path. `scope`'s type here is the fieldless, non-owning public
+        // `std::thread::Scope` view, so the `Drop` in between is a runtime
+        // no-op and the second `DrainThreadScope` is a legitimate repeat, not
+        // a use-after-drop.
+        let func = simple_function(
+            vec![MirBlock {
+                insts: vec![
+                    MirInst::DrainThreadScope(LocalId(0)),
+                    MirInst::Drop(LocalId(0)),
+                    MirInst::DrainThreadScope(LocalId(0)),
+                    MirInst::Return(None),
+                ],
+            }],
+            vec![Local {
+                name: None,
+                ty: Some(Type::Named("std::thread::Scope".into())),
+                mutable: false,
+                skip_drop: false,
+            }],
         );
         assert!(verify_module(&module_with(func)).is_empty());
     }
