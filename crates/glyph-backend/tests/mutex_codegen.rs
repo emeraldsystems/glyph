@@ -14,7 +14,6 @@ struct GlyphMutex {
     _private: [u8; 0],
 }
 
-#[link(name = "glyph_runtime", kind = "static")]
 unsafe extern "C" {
     fn glyph_mutex_create(out: *mut *mut GlyphMutex) -> i32;
     fn glyph_mutex_lock(mutex: *mut GlyphMutex) -> i32;

@@ -100,23 +100,39 @@ fn main() {
         panic!("Failed to create static library. Make sure ar is installed.");
     }
 
-    // Tell cargo where to find the runtime library
+    // Tell cargo where to find the runtime library, and link it WHOLE,
+    // exactly once, at every final link (GLYPH-83).
+    //
+    // A plain `static=glyph_runtime` only pulls in the .o members that
+    // resolve a symbol some Rust object already references, so runtime
+    // functions nothing in Rust calls directly (glyph_fmt_write_str,
+    // glyph_json_*, glyph_net_*, glyph_audio_*, ...) were silently dropped
+    // from the glyph-cli/glyph binaries and the JIT could not resolve them.
+    // `+whole-archive` makes rustc emit the platform's keep-every-member
+    // flag itself (-force_load on macOS, --whole-archive on ELF,
+    // /WHOLEARCHIVE on MSVC). `-bundle` keeps the archive OUT of the rlib:
+    // with the default bundling, the rlib carried a copy of these objects
+    // and any second force-load of the .a (glyph-cli's build script used to
+    // add one) produced duplicate-symbol link errors on ELF, because lld
+    // had already extracted glyph_thread.o/glyph_mutex.o from the rlib to
+    // satisfy thread_runtime.rs's externs before the whole-archive flag
+    // was seen. With one unbundled, whole-archived copy there is nothing to
+    // collide with, on any linker.
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=glyph_runtime");
+    println!("cargo:rustc-link-lib=static:+whole-archive,-bundle=glyph_runtime");
     if matches!(target_os.as_str(), "macos" | "linux") {
         println!("cargo:rustc-link-lib=pthread");
+    }
+    if target_os == "macos" {
+        // runtime/glyph_audio.c's AudioQueue playback path is now in every
+        // link, so its AudioToolbox import has to resolve everywhere too.
+        println!("cargo:rustc-link-lib=framework=AudioToolbox");
     }
 
     // Expose the archive's path to direct dependents' build scripts via the
     // `links = "glyph_runtime"` manifest key (Cargo forwards this as
-    // DEP_GLYPH_RUNTIME_RUNTIME_ARCHIVE). A plain `-lglyph_runtime` only
-    // pulls in the .o members that resolve a symbol some other object
-    // already references, so runtime functions nothing in Rust calls
-    // directly (e.g. glyph_fmt_write_str, glyph_json_*, glyph_net_*,
-    // glyph_audio_*) get silently dropped from the final binary. glyph-cli
-    // reads this path to force-load the *entire* archive into its binaries,
-    // so every runtime symbol is present in-process for the JIT to resolve
-    // (GLYPH-83).
+    // DEP_GLYPH_RUNTIME_RUNTIME_ARCHIVE) for tooling that wants it; the link
+    // itself no longer needs it.
     println!("cargo:runtime_archive={}", runtime_lib.display());
 
     println!(

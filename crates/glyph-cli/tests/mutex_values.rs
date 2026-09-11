@@ -20,7 +20,6 @@ struct GlyphMutex {
 
 type ThreadEntry = unsafe extern "C" fn(*mut c_void);
 
-#[link(name = "glyph_runtime", kind = "static")]
 unsafe extern "C" {
     fn glyph_thread_spawn(
         out: *mut *mut GlyphThread,

@@ -1,5 +1,13 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
+// Link glyph-backend even when no backend API is used here: its build
+// script links libglyph_runtime.a whole into every binary that depends
+// on the crate, and the `extern "C"` block below resolves against that
+// (see glyph-backend/build.rs). A bare `#[link]` on the extern block
+// would add a second, plain copy of the archive and duplicate symbols
+// on ELF linkers.
+use glyph_backend as _;
+
 use std::process::{Child, Command, ExitStatus};
 use std::ptr;
 use std::sync::{Arc, Barrier};
@@ -32,7 +40,6 @@ struct GlyphMutex {
     _private: [u8; 0],
 }
 
-#[link(name = "glyph_runtime", kind = "static")]
 unsafe extern "C" {
     fn glyph_mutex_create(out: *mut *mut GlyphMutex) -> i32;
     fn glyph_mutex_lock(mutex: *mut GlyphMutex) -> i32;
