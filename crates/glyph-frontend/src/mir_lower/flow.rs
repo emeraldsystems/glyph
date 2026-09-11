@@ -11,7 +11,9 @@ use crate::resolver::ResolverContext;
 use crate::{CaptureAccess, CaptureOwnership, analyze_function_closure_ownership};
 
 use super::context::{LocalState, LowerCtx};
-use super::expr::{lower_expr, lower_expr_with_expected, lower_value, lower_value_with_expected};
+use super::expr::{
+    lower_expr, lower_expr_with_expected, lower_match, lower_value, lower_value_with_expected,
+};
 use super::types::{resolve_type_name, type_expr_to_string, vec_elem_type_from_type};
 use super::value::{
     coerce_to_bool, expr_span, infer_value_type, local_struct_name, rvalue_from_value,
@@ -77,7 +79,7 @@ fn type_contains_borrow(
 /// and nothing was reported along the way, emit a diagnostic instead of
 /// letting the statement quietly become a Nop (the pattern that let float
 /// and char literals miscompile silently for a long time).
-fn ensure_lowering_reported(
+pub(crate) fn ensure_lowering_reported(
     ctx: &mut LowerCtx<'_>,
     diags_before: usize,
     what: &str,
@@ -904,6 +906,21 @@ pub(crate) fn lower_block_with_expected<'a>(
                                 last_value = Some(MirValue::Unit);
                             }
                         }
+                        // A `match` whose value nobody will use - the block is
+                        // in statement context, or the expected value is unit -
+                        // is a statement: its arms are lowered as statement
+                        // blocks rather than being required to produce a value
+                        // (GLYPH-88).
+                        Expr::Match {
+                            scrutinee,
+                            arms,
+                            span,
+                        } if !control_value_context || matches!(expected, Some(Type::Void)) => {
+                            let _ = lower_match(ctx, scrutinee, arms, false, *span, None);
+                            if control_value_context {
+                                last_value = Some(MirValue::Unit);
+                            }
+                        }
                         _ => {
                             last_value = lower_value_with_expected(ctx, expr, expected);
                         }
@@ -933,6 +950,13 @@ pub(crate) fn lower_block_with_expected<'a>(
                         Expr::Block(block) => {
                             let _ = lower_block_with_expected(ctx, block, None, false, false);
                             ctx.push_inst(MirInst::Nop);
+                        }
+                        Expr::Match {
+                            scrutinee,
+                            arms,
+                            span,
+                        } => {
+                            let _ = lower_match(ctx, scrutinee, arms, false, *span, None);
                         }
                         _ => {
                             let diags_before = ctx.diagnostics.len();

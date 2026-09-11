@@ -570,6 +570,32 @@ fn maybe(o: Option<i32>) -> Result<i32, str> {
 }
 ```
 
+A `match` used as a statement (its value is not bound, returned, or the tail
+of a non-void function) lowers each arm as a statement block, so an arm may
+end in an `if` without `else` or in a `while` (GLYPH-88, fixed). Only a
+`match` whose value is actually used requires every arm to produce one.
+
+```glyph
+enum Cmd { Fill(i32), Stop }
+
+fn step(c: Cmd) -> i32 {
+  let mut buf: Vec<i32> = Vec::new()
+  let mut stopped = false
+  match c {
+    Fill(n) => {
+      let mut i = 0
+      while i < n {               // fine: the loop's unit value is unused
+        buf.push(i)
+        i = i + 1
+      }
+    },
+    Stop => { if buf.len() == 0 { stopped = true } },   // fine: bare `if`
+  }
+  if stopped { ret -1 }
+  ret buf.len() as i32
+}
+```
+
 `cont` means `continue`; `break` means `break`.
 
 Note: `while true { ... }` no longer needs a trailing unreachable `ret` after

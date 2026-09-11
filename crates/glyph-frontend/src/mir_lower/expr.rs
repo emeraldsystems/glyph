@@ -9,13 +9,13 @@ use super::call::{call_types_compatible, lower_call, lower_method_call};
 use super::context::{LocalState, LowerCtx};
 use super::enums::{VariantLookupError, find_variant, resolve_enum_variant};
 use super::flow::{
-    lower_block_with_expected, lower_closure_rvalue, lower_for, lower_for_in, lower_if_value,
-    lower_while,
+    ensure_lowering_reported, lower_block_with_expected, lower_closure_rvalue, lower_for,
+    lower_for_in, lower_if, lower_if_value, lower_while,
 };
 use super::types::{tuple_struct_name, vec_elem_type_from_type};
 use super::value::{
-    bool_rvalue, coerce_to_bool, infer_numeric_result_type, infer_value_type, local_struct_name,
-    rvalue_from_value, rvalue_to_value, update_local_type_from_rvalue,
+    bool_rvalue, coerce_to_bool, expr_span, infer_numeric_result_type, infer_value_type,
+    local_struct_name, rvalue_from_value, rvalue_to_value, update_local_type_from_rvalue,
 };
 
 fn consume_value_local(ctx: &mut LowerCtx<'_>, value: &MirValue, span: Span) {
@@ -985,6 +985,45 @@ fn check_pattern_qualifier(
     }
 }
 
+/// Lower the arm of a `match` used as a statement, whose value is discarded.
+///
+/// The arm is lowered in statement context: a block whose last statement is
+/// an `if` without `else` or a `while` is simply a block of statements, the
+/// same as anywhere else, and a nested `match` is again a statement. Lowering
+/// such an arm as a *value* instead (what every `match` did before GLYPH-88)
+/// demanded a value from that trailing `if`/`while`, and the expected type it
+/// demanded was whatever an earlier arm's last expression happened to be
+/// (`Vec<T>` from a trailing `.push()`), producing "if expression is missing
+/// an else branch; expected a value of type 'Vec<T>'" for code whose value is
+/// never used.
+fn lower_match_arm_as_statement<'a>(ctx: &mut LowerCtx<'a>, expr: &'a Expr) {
+    match expr {
+        Expr::Block(block) => {
+            let _ = lower_block_with_expected(ctx, block, None, false, false);
+        }
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => {
+            let _ = lower_match(ctx, scrutinee, arms, false, *span, None);
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => lower_if(ctx, cond, then_block, else_block.as_ref()),
+        Expr::While { cond, body, .. } => lower_while(ctx, cond, body),
+        _ => {
+            let diags_before = ctx.diagnostics.len();
+            if lower_expr(ctx, expr).is_none() {
+                ensure_lowering_reported(ctx, diags_before, "match arm", expr_span(expr));
+            }
+        }
+    }
+}
+
 pub(crate) fn lower_match<'a>(
     ctx: &mut LowerCtx<'a>,
     scrutinee: &'a Expr,
@@ -1219,12 +1258,17 @@ pub(crate) fn lower_match<'a>(
             }
         }
 
-        let arm_expected_ty: Option<Type> = expected.cloned().or_else(|| {
-            result_local
-                .and_then(|l| ctx.locals.get(l.0 as usize))
-                .and_then(|l| l.ty.clone())
-        });
-        let arm_val = lower_value_with_expected(ctx, &arm.expr, arm_expected_ty.as_ref());
+        let arm_val = if require_value {
+            let arm_expected_ty: Option<Type> = expected.cloned().or_else(|| {
+                result_local
+                    .and_then(|l| ctx.locals.get(l.0 as usize))
+                    .and_then(|l| l.ty.clone())
+            });
+            lower_value_with_expected(ctx, &arm.expr, arm_expected_ty.as_ref())
+        } else {
+            lower_match_arm_as_statement(ctx, &arm.expr);
+            None
+        };
         if require_value {
             if let Some(val) = arm_val {
                 let res_local = result_local.expect("match result local missing");
