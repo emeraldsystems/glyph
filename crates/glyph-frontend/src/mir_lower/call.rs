@@ -421,7 +421,29 @@ pub(crate) fn lower_call<'a>(
     let mut temporary_argument_loans = Vec::new();
     let mut fnmut_arguments = HashSet::new();
     for (idx, arg) in args.iter().enumerate() {
-        let expected_arg = sig.params.get(idx).and_then(|ty| ty.as_ref());
+        let declared_arg = sig.params.get(idx).and_then(|ty| ty.as_ref());
+        // A generic enum constructor's payload slot is typed by the enum's
+        // type parameter; substitute the concrete argument from the expected
+        // result type (`Option<String>` for `Some("x")`) so a `str` view is
+        // heap-copied into the owned slot exactly as it is for a `String`
+        // function parameter (GLYPH-87).
+        let substituted_arg = match (&sig.enum_ctor, declared_arg, expected_ret) {
+            (
+                Some(ctor),
+                Some(Type::Param(param_name)),
+                Some(Type::App {
+                    base,
+                    args: type_args,
+                }),
+            ) if base == &ctor.enum_name => ctor
+                .generic_params
+                .iter()
+                .position(|p| p == param_name)
+                .and_then(|i| type_args.get(i))
+                .cloned(),
+            _ => None,
+        };
+        let expected_arg = substituted_arg.as_ref().or(declared_arg);
         let arg_val = lower_value_with_expected(ctx, arg, expected_arg)?;
         if let Some(expected_arg) = expected_arg {
             if !validate_unique_fnmut_argument(

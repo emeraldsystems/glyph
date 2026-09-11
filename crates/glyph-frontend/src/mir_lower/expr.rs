@@ -31,6 +31,103 @@ fn consume_value_local(ctx: &mut LowerCtx<'_>, value: &MirValue, span: Span) {
     let _ = ctx.consume_local(*local, Some(span));
 }
 
+/// The local behind `value` if it holds a borrowed `str` view (a string
+/// literal, a `str` binding or parameter, a `str` const) rather than an owned
+/// `String`.
+fn str_view_local(ctx: &LowerCtx<'_>, value: &MirValue) -> Option<LocalId> {
+    let MirValue::Local(local) = value else {
+        return None;
+    };
+    matches!(ctx.local_ty(*local), Some(Type::Str)).then_some(*local)
+}
+
+/// Emit an owned heap copy of the `str` view in `base` and return the new
+/// `String`-typed local that owns it.
+fn clone_str_view_to_owned(ctx: &mut LowerCtx<'_>, base: LocalId) -> LocalId {
+    let owned = ctx.fresh_local(None);
+    ctx.locals[owned.0 as usize].ty = Some(Type::String);
+    ctx.push_inst(MirInst::Assign {
+        local: owned,
+        value: Rvalue::StringClone { base },
+    });
+    owned
+}
+
+/// A `str` view that lands in a slot typed `String` must become an owned heap
+/// copy (GLYPH-87). `str` and `String` share one LLVM representation (a
+/// `char*`), so nothing in codegen can tell a pointer into the binary's
+/// read-only data from a `malloc`ed one: whoever ends up owning the `String`
+/// frees it, and freeing a literal aborts the process. Every expected-typed
+/// lowering path (`let x: String = ..`, `ret`, a function's implicit tail
+/// value, `if`/`match` arm values, call arguments, struct fields) funnels
+/// through here, so the copy is made exactly once, at the point where the
+/// view is first treated as owned. An already-owned `String` is left alone
+/// and moves as before.
+fn coerce_value_to_owned_string(
+    ctx: &mut LowerCtx<'_>,
+    value: MirValue,
+    expected: Option<&Type>,
+) -> MirValue {
+    if !matches!(expected, Some(Type::String)) {
+        return value;
+    }
+    match str_view_local(ctx, &value) {
+        Some(base) => MirValue::Local(clone_str_view_to_owned(ctx, base)),
+        None => value,
+    }
+}
+
+/// Rvalue counterpart of [`coerce_value_to_owned_string`]: a bare string
+/// literal (or a `str` read) headed for a `String` slot is first materialised
+/// as a `str` view and then heap-copied.
+fn coerce_rvalue_to_owned_string(
+    ctx: &mut LowerCtx<'_>,
+    rv: Rvalue,
+    expected: Option<&Type>,
+) -> Rvalue {
+    if !matches!(expected, Some(Type::String)) {
+        return rv;
+    }
+    match rv {
+        Rvalue::StringLit { .. }
+        | Rvalue::Deref {
+            ty: Type::Str, ..
+        } => {
+            let view = ctx.fresh_local(None);
+            ctx.locals[view.0 as usize].ty = Some(Type::Str);
+            ctx.push_inst(MirInst::Assign {
+                local: view,
+                value: rv,
+            });
+            Rvalue::Move(clone_str_view_to_owned(ctx, view))
+        }
+        Rvalue::Move(local) if matches!(ctx.local_ty(local), Some(Type::Str)) => {
+            Rvalue::Move(clone_str_view_to_owned(ctx, local))
+        }
+        other => other,
+    }
+}
+
+/// Comparison operands are read, never moved. `s == "x"` must leave `s`
+/// usable afterwards and still owned (so it is dropped once at scope exit)
+/// instead of silently consuming it. Before GLYPH-87 the accidental move was
+/// what hid the missing heap copy: a moved `String` is never freed.
+fn lower_comparison_operand<'a>(
+    ctx: &mut LowerCtx<'a>,
+    expr: &'a Expr,
+    expected: Option<&Type>,
+) -> Option<MirValue> {
+    if let Expr::Ident(ident, span) = expr
+        && let Some(local) = ctx.bindings.get(ident.0.as_str()).copied()
+        && matches!(ctx.local_ty(local), Some(Type::String))
+    {
+        return ctx
+            .check_local_available(local, Some(*span))
+            .then_some(MirValue::Local(local));
+    }
+    lower_value_with_expected(ctx, expr, expected)
+}
+
 fn type_is_copy(ty: &Type) -> bool {
     matches!(
         ty,
@@ -300,7 +397,20 @@ fn check_int_literal_range(ctx: &mut LowerCtx<'_>, expr: &Expr, expected: Option
     }
 }
 
+/// Lower `expr` as an rvalue with `expected` as the type of the slot it is
+/// about to fill. Besides threading the expectation into literal typing, this
+/// is where a borrowed `str` view is turned into an owned `String` when the
+/// slot is a `String` (see [`coerce_rvalue_to_owned_string`]).
 pub(crate) fn lower_expr_with_expected<'a>(
+    ctx: &mut LowerCtx<'a>,
+    expr: &'a Expr,
+    expected: Option<&Type>,
+) -> Option<Rvalue> {
+    let rv = lower_expr_with_expected_inner(ctx, expr, expected)?;
+    Some(coerce_rvalue_to_owned_string(ctx, rv, expected))
+}
+
+fn lower_expr_with_expected_inner<'a>(
     ctx: &mut LowerCtx<'a>,
     expr: &'a Expr,
     expected: Option<&Type>,
@@ -648,9 +758,22 @@ fn lower_binary<'a>(
     lhs: &'a Expr,
     rhs: &'a Expr,
 ) -> Option<Rvalue> {
+    let is_comparison = matches!(
+        op,
+        glyph_core::ast::BinaryOp::Eq
+            | glyph_core::ast::BinaryOp::Ne
+            | glyph_core::ast::BinaryOp::Lt
+            | glyph_core::ast::BinaryOp::Le
+            | glyph_core::ast::BinaryOp::Gt
+            | glyph_core::ast::BinaryOp::Ge
+    );
     // For contextual integer typing: if one side is a literal and the other
     // is a typed local, propagate the type to the literal side.
-    let lhs_val = lower_value(ctx, lhs)?;
+    let lhs_val = if is_comparison {
+        lower_comparison_operand(ctx, lhs, None)?
+    } else {
+        lower_value(ctx, lhs)?
+    };
     let lhs_ty = infer_value_type(&lhs_val, ctx);
     let rhs_expected = if let Some(ty) = &lhs_ty {
         if ty.is_int() || ty.is_float() {
@@ -661,7 +784,11 @@ fn lower_binary<'a>(
     } else {
         None
     };
-    let rhs_val = lower_value_with_expected(ctx, rhs, rhs_expected.as_ref())?;
+    let rhs_val = if is_comparison {
+        lower_comparison_operand(ctx, rhs, rhs_expected.as_ref())?
+    } else {
+        lower_value_with_expected(ctx, rhs, rhs_expected.as_ref())?
+    };
     // If rhs was typed but lhs was an untyped int literal, re-lower lhs
     // This handles `1 + pos` where pos is usize. Since lhs is already lowered
     // we can't re-lower it, but the coerce_int_binop in codegen handles this.
@@ -2007,7 +2134,19 @@ pub(crate) fn lower_value<'a>(ctx: &mut LowerCtx<'a>, expr: &'a Expr) -> Option<
     lower_value_with_expected(ctx, expr, None)
 }
 
+/// Lower `expr` to a value with `expected` as the type of the slot it is
+/// about to fill. Like [`lower_expr_with_expected`], this is the choke point
+/// that heap-copies a borrowed `str` view into a `String` slot.
 pub(crate) fn lower_value_with_expected<'a>(
+    ctx: &mut LowerCtx<'a>,
+    expr: &'a Expr,
+    expected: Option<&Type>,
+) -> Option<MirValue> {
+    let value = lower_value_with_expected_inner(ctx, expr, expected)?;
+    Some(coerce_value_to_owned_string(ctx, value, expected))
+}
+
+fn lower_value_with_expected_inner<'a>(
     ctx: &mut LowerCtx<'a>,
     expr: &'a Expr,
     expected: Option<&Type>,

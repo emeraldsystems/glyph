@@ -186,25 +186,22 @@ fn bare_tail_if_else_bool_runtime() {
 #[cfg(all(feature = "codegen", unix))]
 #[test]
 fn bare_tail_if_else_string_runtime() {
-    // `$"..."` with no interpolation holes still allocates a real owned
-    // String (unlike a bare string literal coerced to `String`, which hits
-    // an unrelated, pre-existing double-free bug independent of GLYPH-84 -
-    // reproducible even through the documented `ret if ... else ...`
-    // workaround). The result is bound to a `let` before comparing: comparing
-    // an unbound `String`-returning call result inline (`pick(0) != "zero"`)
-    // hits a second, likewise pre-existing and unrelated temporary-lifetime
-    // bug, independent of `if`/`else` entirely (reproduces with a plain
-    // non-branching function too), so neither is exercised here.
+    // Bare string literals in the branches and an unbound call result
+    // compared inline: both shapes used to double-free at exit (GLYPH-87,
+    // fixed - a `str` view landing in a `String` slot is now heap-copied
+    // once, and a comparison no longer moves its `String` operand). The
+    // `let`-bound form is kept as well so both paths stay covered here.
     let source = r#"
         fn pick(n: i32) -> String {
-          if n == 0 { $"zero" } else { $"other" }
+          if n == 0 { "zero" } else { "other" }
         }
 
         fn main() -> i32 {
+          if pick(0) != "zero" { ret 1 }
+          if pick(1) != "other" { ret 2 }
           let s0 = pick(0)
-          if s0 != "zero" { ret 1 }
-          let s1 = pick(1)
-          if s1 != "other" { ret 2 }
+          if s0 != "zero" { ret 3 }
+          if s0 != "zero" { ret 4 }
           ret 0
         }
     "#;

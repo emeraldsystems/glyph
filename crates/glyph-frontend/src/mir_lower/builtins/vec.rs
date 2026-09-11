@@ -4,7 +4,7 @@ use glyph_core::span::Span;
 use glyph_core::types::{Mutability, Type};
 
 use super::super::context::LowerCtx;
-use super::super::expr::lower_value;
+use super::super::expr::{lower_value, lower_value_with_expected};
 use super::super::types::vec_elem_type_from_type;
 
 pub(crate) fn lower_vec_len<'a>(
@@ -200,7 +200,11 @@ pub(crate) fn lower_vec_push<'a>(
             Type::I32
         });
 
-    let value = lower_value(ctx, &args[0])?;
+    // The pushed value lands in an element slot the Vec owns and will free,
+    // so lower it against the element type: a `str` literal pushed into a
+    // `Vec<String>` is heap-copied here rather than stored as a pointer into
+    // read-only data (GLYPH-87).
+    let value = lower_value_with_expected(ctx, &args[0], Some(&elem_type))?;
 
     let tmp = ctx.fresh_local(None);
     ctx.locals[tmp.0 as usize].ty = Some(Type::App {

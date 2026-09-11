@@ -40,6 +40,10 @@ pub(crate) struct EnumCtorInfo {
     pub(crate) enum_name: String,
     pub(crate) variant_index: usize,
     pub(crate) has_generics: bool,
+    /// The enum's declared type parameters, in order (`["T", "E"]` for
+    /// `Result<T, E>`), so a payload typed `Type::Param` can be mapped to
+    /// the matching argument of an expected `Type::App`.
+    pub(crate) generic_params: Vec<String>,
 }
 
 pub(crate) fn collect_function_signatures(
@@ -195,7 +199,8 @@ pub(crate) fn collect_function_signatures(
 
     // Enum variant constructors act like functions returning the enum type.
     for (enum_name, enum_ty) in &resolver.enum_types {
-        let has_generics = enum_has_generics(enum_name, module, resolver);
+        let generic_params = enum_generic_params(enum_name, module, resolver);
+        let has_generics = !generic_params.is_empty();
         for (idx, variant) in enum_ty.variants.iter().enumerate() {
             let ctor_name = format!("{}::{}", enum_name, variant.name);
             let mut params = Vec::new();
@@ -211,6 +216,7 @@ pub(crate) fn collect_function_signatures(
                     enum_name: enum_name.clone(),
                     variant_index: idx,
                     has_generics,
+                    generic_params: generic_params.clone(),
                 }),
             };
             if !signatures.contains_key(&ctor_name) {
@@ -410,11 +416,19 @@ pub(crate) fn collect_function_signatures(
     (signatures, diagnostics)
 }
 
-pub(crate) fn enum_has_generics(
+/// The declared type parameter names of `enum_name`, in declaration order
+/// (empty for a non-generic enum or an unknown name).
+pub(crate) fn enum_generic_params(
     enum_name: &str,
     module: &Module,
     resolver: &ResolverContext,
-) -> bool {
+) -> Vec<String> {
+    let names = |def: &glyph_core::ast::EnumDef| {
+        def.generic_params
+            .iter()
+            .map(|p| p.0.clone())
+            .collect::<Vec<_>>()
+    };
     if let Some(all_modules) = &resolver.all_modules {
         for (module_id, module) in &all_modules.modules {
             let module_prefix = module_id.replace('/', "::");
@@ -422,7 +436,7 @@ pub(crate) fn enum_has_generics(
                 if let Item::Enum(def) = item {
                     let qualified = format!("{}::{}", module_prefix, def.name.0);
                     if def.name.0 == enum_name || qualified == enum_name {
-                        return !def.generic_params.is_empty();
+                        return names(def);
                     }
                 }
             }
@@ -432,10 +446,10 @@ pub(crate) fn enum_has_generics(
     for item in &module.items {
         if let Item::Enum(def) = item {
             if def.name.0 == enum_name {
-                return !def.generic_params.is_empty();
+                return names(def);
             }
         }
     }
 
-    false
+    Vec::new()
 }

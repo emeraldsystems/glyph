@@ -118,6 +118,7 @@ Strings:
 
 - String literals like `"hi"` are `str`.
 - Use `String::from_str("...")` to allocate an owned `String`.
+- A `str` that lands in a `String` slot (a `String`-typed `let`, a `String` return value such as `fn f() -> String { "x" }`, a `String` parameter, a `Vec<String>` push, an `Option<String>` / `Result<String, _>` payload) is heap-copied there, once, and the `String` is then owned and dropped normally. Comparing strings with `==` / `!=` moves neither operand.
 - Use `s.clone()` to duplicate a `String` without moving it.
 - Hex escape sequences are supported: `"\x1B[31m"` embeds byte value `0x1B` (ESC). Format: `\xHH` where HH is two hex digits.
 

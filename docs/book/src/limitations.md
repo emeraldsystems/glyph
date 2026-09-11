@@ -488,6 +488,31 @@ fn main() -> i32 {
 }
 ```
 
+The other direction copies. A `str` view (a string literal, a `str` binding
+or parameter) that lands in a `String` slot - a `String`-typed `let`, a
+`String` return value (`fn f() -> String { "x" }`), a `String` parameter, a
+`Vec<String>` push, an `Option<String>` / `Result<String, _>` payload - is
+heap-copied at that point, exactly once, and the resulting `String` is owned
+and dropped like any other (GLYPH-87, fixed). Comparing strings with `==` /
+`!=` reads both operands and moves neither, so a `String` can be compared and
+then used or dropped normally.
+
+**Supported**
+
+```glyph
+fn label(n: i32) -> String {
+  if n == 0 { "zero" } else { "other" }   // each literal is copied once
+}
+
+fn main() -> i32 {
+  if label(0) != "zero" { ret 1 }         // the temporary is freed once
+  let s = label(1)
+  if s != "other" { ret 2 }               // `s` is still owned here
+  if s != "other" { ret 3 }
+  ret 0
+}
+```
+
 `print`/`println` only accept a string literal, an interpolated string, or a
 `str`/`String` value - not a bare number or other scalar. Interpolate with
 `$"{expr}"` to print non-string values.
