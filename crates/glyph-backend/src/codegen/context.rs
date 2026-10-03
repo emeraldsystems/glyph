@@ -3,6 +3,15 @@ use std::sync::Once;
 
 static LLVM_TARGET_INIT: Once = Once::new();
 
+pub(super) fn init_targets() {
+    LLVM_TARGET_INIT.call_once(|| unsafe {
+        LLVM_InitializeAllTargetInfos();
+        LLVM_InitializeAllTargets();
+        LLVM_InitializeAllTargetMCs();
+        LLVM_InitializeAllAsmPrinters();
+    });
+}
+
 impl CodegenContext {
     pub fn new(module_name: &str) -> Result<Self> {
         unsafe {
@@ -132,12 +141,7 @@ impl CodegenContext {
                 return Ok(());
             }
 
-            LLVM_TARGET_INIT.call_once(|| {
-                LLVM_InitializeAllTargetInfos();
-                LLVM_InitializeAllTargets();
-                LLVM_InitializeAllTargetMCs();
-                LLVM_InitializeAllAsmPrinters();
-            });
+            init_targets();
 
             let target_triple = self.effective_target_triple()?;
             LLVMSetTarget(self.module, target_triple.as_ptr());

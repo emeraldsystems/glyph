@@ -15,6 +15,15 @@ use llvm_sys::target::*;
 use llvm_sys::target_machine::*;
 use llvm_sys::{LLVMBuilder, LLVMContext, LLVMLinkage, LLVMModule};
 
+/// Object emission defaults to O0; release builds opt into LLVM's ordinary O2
+/// pipeline without changing floating-point arithmetic or enabling fast math.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OptimizationLevel {
+    #[default]
+    None,
+    Default,
+}
+
 pub struct CodegenContext {
     context: *mut LLVMContext,
     module: *mut LLVMModule,
@@ -72,6 +81,7 @@ mod map_debug;
 mod map_hash;
 mod map_layout;
 mod mutex;
+mod object;
 mod ownership;
 mod rvalue;
 mod spsc;

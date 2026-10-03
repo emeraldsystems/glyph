@@ -10,7 +10,7 @@ mod build_version;
 
 #[cfg(feature = "codegen")]
 use glyph_backend::{
-    codegen::CodegenContext,
+    codegen::{CodegenContext, OptimizationLevel},
     linker::{Linker, LinkerOptions},
 };
 use glyph_core::ast::Module;
@@ -50,7 +50,7 @@ enum GlyphCommand {
     },
     /// Build binaries described in glyph.toml
     Build {
-        /// Build the release profile
+        /// Build with LLVM O2 optimization (ordinary floating-point arithmetic)
         #[arg(long)]
         release: bool,
         /// Build only this binary
@@ -62,6 +62,7 @@ enum GlyphCommand {
     },
     /// Build then run a binary with optional args
     Run {
+        /// Build with LLVM O2 optimization (ordinary floating-point arithmetic)
         #[arg(long)]
         release: bool,
         #[arg(long)]
@@ -608,7 +609,18 @@ fn build_bin(
             .map_err(internal_err("failed to create codegen context"))?;
         ctx.codegen_module(&frontend_output.mir)
             .map_err(internal_err("codegen failed"))?;
-        ctx.emit_object_file(&obj_path)
+        let optimization = if profile == "release" {
+            OptimizationLevel::Default
+        } else {
+            OptimizationLevel::None
+        };
+        if verbose {
+            eprintln!(
+                "[glyph] optimization: {}",
+                if profile == "release" { "O2" } else { "O0" }
+            );
+        }
+        ctx.emit_object_file_with_optimization(&obj_path, optimization)
             .map_err(internal_err("failed to emit object file"))?;
 
         let linker = Linker::new();

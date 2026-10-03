@@ -293,6 +293,10 @@ glyph build --release
 glyph run --bin hello -- arg1 arg2
 ```
 
+Release builds run LLVM's O2 optimization pipeline and optimized machine-code
+emission. Plain `glyph build` uses O0. Both preserve ordinary floating-point
+arithmetic: release does not enable fast math or fuse multiply/add operations.
+
 ### Cases and Dependencies
 
 Glyph projects are organized into **cases** — the unit of compilation. A case can be a binary, a library, or both.
