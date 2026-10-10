@@ -266,3 +266,22 @@ After the three release blockers were fixed and merged: **21 PASS, 1 SKIP
 builds and answers HTTP 200; the new `std_hello via glyph-cli run (JIT)` row
 passes. Full `cargo test` on the same tree: 920 passed, 0 failed across 109
 test binaries. No open release blockers from this matrix.
+
+## Release v0.2.1 — 2026-10-10 (GLYPH-91)
+
+- **Source:** tag `v0.2.1` on `master`.
+- **Host:** macOS, arm64.
+- **Full suite:** `cargo test --offline --locked` passed 969 tests, with zero
+  failures or ignored tests across 114 result summaries.
+- **Matrix:** `just release-matrix` passed all 21 BLOCKER rows, with zero
+  failures; the one NON_GOAL row was skipped. Script exit status: 0.
+
+All executable rows in the historical table above pass in this run, including
+the `glyph-cli run` JIT path, the apex HTTP 200 round-trip, dependency cases,
+closures, and both sequencer contract fixtures. The sole skip remains the
+live GlyphAudio engine, which requires a separate checkout and audio hardware.
+
+The GLYPH-91 reproducer additionally builds with the installed compiler and
+returns `3`, keeping the local and transitively imported helpers distinct.
+Struct and enum name collisions remain a compiler limitation; this release
+fixes function identities only. No release blockers were found.
