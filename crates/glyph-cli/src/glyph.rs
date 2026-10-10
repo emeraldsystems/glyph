@@ -14,10 +14,10 @@ use glyph_backend::{
     linker::{Linker, LinkerOptions},
 };
 use glyph_core::ast::Module;
-use glyph_frontend::{FrontendOptions, compile_modules};
+use glyph_frontend::{FrontendOptions, compile_modules_with_aliases};
 
 mod module_loader;
-use module_loader::{discover_and_parse_modules, module_id_from_path};
+use module_loader::{discover_and_parse_modules, module_id_from_path, source_module_aliases};
 
 mod diagnostics;
 use diagnostics::{SourceInfo, format_diagnostic};
@@ -523,13 +523,14 @@ fn check_lib_case(root: &Path, manifest: &Manifest, verbose: bool) -> GlyphResul
 
     let (modules, sources) = load_case_modules(root, module_root, manifest)?;
 
-    let frontend_output = compile_modules(
+    let frontend_output = compile_modules_with_aliases(
         modules,
         &entry_module,
         FrontendOptions {
             emit_mir: true,
             include_std: true,
         },
+        source_module_aliases(&sources),
     );
 
     if !frontend_output.diagnostics.is_empty() {
@@ -568,13 +569,14 @@ fn build_bin(
 
     let (modules, sources) = load_case_modules(root, module_root, manifest)?;
 
-    let frontend_output = compile_modules(
+    let frontend_output = compile_modules_with_aliases(
         modules,
         &entry_module,
         FrontendOptions {
             emit_mir: true,
             include_std: true,
         },
+        source_module_aliases(&sources),
     );
 
     if !frontend_output.diagnostics.is_empty() {

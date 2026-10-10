@@ -25,6 +25,25 @@ pub struct ModuleLoadResult {
     pub diagnostics: Vec<glyph_core::diag::Diagnostic>,
 }
 
+/// The case loader exposes library entry sources both at `dependency` and at
+/// their file-derived path. Keep those imports while compiling one body.
+pub fn source_module_aliases(sources: &HashMap<String, SourceInfo>) -> HashMap<String, String> {
+    let mut by_path: HashMap<&Path, Vec<&String>> = HashMap::new();
+    for (module_id, source) in sources {
+        by_path.entry(&source.path).or_default().push(module_id);
+    }
+    let mut aliases = HashMap::new();
+    for module_ids in by_path.values_mut() {
+        // Prefer the full file-derived ID over the shorter dependency alias.
+        module_ids.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+        let canonical = module_ids[0];
+        for alias in module_ids.iter().skip(1) {
+            aliases.insert((*alias).clone(), canonical.clone());
+        }
+    }
+    aliases
+}
+
 /// Discover and parse all .glyph files in a directory tree
 pub fn discover_and_parse_modules(root: &Path) -> Result<ModuleLoadResult> {
     let mut modules = HashMap::new();

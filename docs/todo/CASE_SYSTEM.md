@@ -118,6 +118,10 @@ Cross-case function name collisions are not yet supported.
 
 This is a documented v0.1 limitation. Name mangling deferred to v0.2.
 
+GLYPH-91 follow-up: function names are now distinguished by their defining
+module when they collide, including functions reached through transitive
+imports. Struct and enum name collisions remain a limitation.
+
 ### Step 6: Handle lib-only cases (`glyph.rs`)
 
 When `glyph build` runs in a case with `[lib]` but no `[[bin]]`:

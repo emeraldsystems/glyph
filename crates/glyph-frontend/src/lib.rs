@@ -6,6 +6,7 @@ use glyph_core::{
 };
 
 mod closure_analysis;
+mod function_symbols;
 mod lexer;
 mod method_symbols;
 mod mir_lower;
@@ -23,7 +24,7 @@ pub use lexer::{LexOutput, lex};
 pub use mir_lower::lower_module;
 pub use module_resolver::{
     DependencyGraph, ImportScope, ModuleSymbols, MultiModuleContext, build_dependency_graph,
-    resolve_multi_module,
+    resolve_multi_module, resolve_multi_module_with_aliases,
 };
 pub use parser::{ParseOutput, parse};
 pub use resolver::{ResolverContext, resolve_types};
@@ -96,12 +97,24 @@ fn is_std_module(module_id: &str) -> bool {
 fn compile_multi_module_graph(
     modules: std::collections::HashMap<String, Module>,
     entry_module: &str,
+    module_aliases: std::collections::HashMap<String, String>,
 ) -> Result<MirModule, Vec<Diagnostic>> {
-    match module_resolver::resolve_multi_module(modules, entry_module, std::path::Path::new(".")) {
+    match module_resolver::resolve_multi_module_with_aliases(
+        modules,
+        entry_module,
+        std::path::Path::new("."),
+        module_aliases,
+    ) {
         Ok((multi_ctx, compile_order)) => {
             let mut merged = MirModule::default();
-            let mut seen_externs = std::collections::HashSet::new();
-            let mut seen_functions = std::collections::HashMap::new();
+            let entry_id = multi_ctx
+                .module_aliases
+                .get(entry_module)
+                .map_or(entry_module, String::as_str);
+            let has_entry_main = multi_ctx.modules[entry_id].items.iter().any(|item| {
+                matches!(item, glyph_core::ast::Item::Function(function) if function.name.0 == "main")
+            });
+            let mut seen_externs = std::collections::HashMap::new();
             let mut seen_structs = std::collections::HashMap::new();
             let mut seen_enums = std::collections::HashMap::new();
             let mut diagnostics = Vec::new();
@@ -124,15 +137,6 @@ fn compile_multi_module_graph(
                             name,
                             &module_id,
                             &mut seen_enums,
-                            &mut diagnostics,
-                        );
-                    }
-                    for name in &symbols.functions {
-                        check_name_collision(
-                            "function",
-                            name,
-                            &module_id,
-                            &mut seen_functions,
                             &mut diagnostics,
                         );
                     }
@@ -175,10 +179,41 @@ fn compile_multi_module_graph(
                 merged.functions.extend(lowered.functions);
 
                 for ex in lowered.extern_functions {
-                    if seen_externs.insert(ex.name.clone()) {
+                    if has_entry_main
+                        && (ex.name == "main"
+                            || ex.link_name.as_deref().unwrap_or(&ex.name) == "main")
+                    {
+                        diagnostics.push(
+                            Diagnostic::error(
+                                "extern symbol 'main' conflicts with the executable entry function",
+                                None,
+                            )
+                            .with_module_id(module_id.clone()),
+                        );
+                        continue;
+                    }
+                    if let Some(existing) = seen_externs.get(&ex.name) {
+                        if existing != &ex {
+                            diagnostics.push(
+                                Diagnostic::error(
+                                    format!(
+                                        "extern function '{}' has conflicting declarations",
+                                        ex.name
+                                    ),
+                                    None,
+                                )
+                                .with_module_id(module_id.clone()),
+                            );
+                        }
+                    } else {
+                        seen_externs.insert(ex.name.clone(), ex.clone());
                         merged.extern_functions.push(ex);
                     }
                 }
+            }
+
+            if !diagnostics.is_empty() {
+                return Err(diagnostics);
             }
 
             let mut merged = merged;
@@ -198,6 +233,21 @@ pub fn compile_modules(
     entry_module: &str,
     opts: FrontendOptions,
 ) -> FrontendOutput {
+    compile_modules_with_aliases(
+        modules,
+        entry_module,
+        opts,
+        std::collections::HashMap::new(),
+    )
+}
+
+/// Compile alternate import paths for the same source as one module body.
+pub fn compile_modules_with_aliases(
+    modules: std::collections::HashMap<String, Module>,
+    entry_module: &str,
+    opts: FrontendOptions,
+    module_aliases: std::collections::HashMap<String, String>,
+) -> FrontendOutput {
     let module = modules.get(entry_module).cloned();
     let mut diagnostics = Vec::new();
     let mut mir = MirModule::default();
@@ -208,7 +258,7 @@ pub fn compile_modules(
             None,
         ));
     } else if opts.include_std {
-        match compile_multi_module_graph(modules, entry_module) {
+        match compile_multi_module_graph(modules, entry_module, module_aliases) {
             Ok(compiled) => mir = compiled,
             Err(diags) => diagnostics.extend(diags),
         }
@@ -507,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_module_rejects_function_name_collisions() {
+    fn multi_module_preserves_distinct_function_symbols() {
         let modules = HashMap::from([
             (
                 "main".to_string(),
@@ -532,14 +582,10 @@ mod tests {
             },
         );
 
-        let message = output
-            .diagnostics
-            .iter()
-            .find(|d| d.message.contains("function 'helper' defined in both"))
-            .map(|d| d.message.as_str());
-        let Some(message) = message else {
-            panic!("diags: {:?}", output.diagnostics);
-        };
-        assert!(message.contains("'a'") && message.contains("'b'"));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let names: std::collections::HashSet<_> =
+            output.mir.functions.iter().map(|f| &f.name).collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"main".to_string()));
     }
 }

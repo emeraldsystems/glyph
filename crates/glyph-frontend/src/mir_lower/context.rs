@@ -326,7 +326,8 @@ impl<'a> LowerCtx<'a> {
                 CallableSendProvenance::OwnedClosure {
                     origin: format!(
                         "{}::__glyph_closure_{}",
-                        function.name.0, closure.closure_id
+                        resolver.local_function_symbol(&function.name.0),
+                        closure.closure_id
                     ),
                     captures: closure
                         .captures
@@ -351,7 +352,7 @@ impl<'a> LowerCtx<'a> {
             };
             context
                 .callable_return_provenance
-                .insert(function.name.0.clone(), provenance);
+                .insert(resolver.local_function_symbol(&function.name.0), provenance);
         }
         context
     }

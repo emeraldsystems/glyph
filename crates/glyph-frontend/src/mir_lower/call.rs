@@ -873,7 +873,9 @@ pub(crate) fn lower_method_call<'a>(
     ctx.push_inst(MirInst::Assign {
         local: tmp,
         value: Rvalue::Call {
-            name: mangled_name,
+            name: sig
+                .as_ref()
+                .map_or(mangled_name, |sig| sig.target_name.clone()),
             args: all_args,
         },
     });

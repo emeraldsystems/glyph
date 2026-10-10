@@ -827,6 +827,20 @@ pub(super) fn resolve_ffi_type(name: &str) -> Option<Type> {
 }
 
 impl ResolverContext {
+    pub(crate) fn function_symbol(&self, module_id: &str, name: &str) -> String {
+        self.all_modules.as_ref().map_or_else(
+            || name.to_string(),
+            |modules| modules.function_symbol(module_id, name),
+        )
+    }
+
+    pub(crate) fn local_function_symbol(&self, name: &str) -> String {
+        self.current_module.as_ref().map_or_else(
+            || name.to_string(),
+            |module| self.function_symbol(module, name),
+        )
+    }
+
     /// Look up a struct type by name
     pub fn get_struct(&self, name: &str) -> Option<&StructType> {
         canonical_runtime_struct_leaf(name)
@@ -877,6 +891,17 @@ impl ResolverContext {
         // Case 1: Qualified name (module::symbol)
         if name.contains("::") {
             return self.resolve_qualified_symbol(name);
+        }
+
+        // Function signatures bind local declarations before selective
+        // imports. Intrinsic recognition must use the same binding so a
+        // local `spawn`, for example, stays an ordinary Glyph function.
+        if let Some(module_id) = &self.current_module {
+            if let Some(local @ ResolvedSymbol::Function(_, _)) =
+                self.resolve_in_module(module_id, name)
+            {
+                return Some(local);
+            }
         }
 
         // Case 2: Check direct imports (selective imports)

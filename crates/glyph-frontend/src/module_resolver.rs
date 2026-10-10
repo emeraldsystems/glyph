@@ -152,10 +152,20 @@ impl DependencyGraph {
 pub fn build_dependency_graph(
     modules: &HashMap<String, Module>,
 ) -> Result<DependencyGraph, Vec<Diagnostic>> {
+    build_dependency_graph_with_aliases(modules, &HashMap::new())
+}
+
+fn build_dependency_graph_with_aliases(
+    modules: &HashMap<String, Module>,
+    aliases: &HashMap<String, String>,
+) -> Result<DependencyGraph, Vec<Diagnostic>> {
     let mut graph = DependencyGraph::new();
     let mut diagnostics = Vec::new();
 
     for (module_id, module) in modules {
+        if aliases.contains_key(module_id) {
+            continue;
+        }
         for import in &module.imports {
             // Convert import path to module ID
             let dep_module_id = import.path.segments.join("/");
@@ -172,7 +182,8 @@ pub fn build_dependency_graph(
                 continue;
             }
 
-            graph.add_dependency(module_id.clone(), dep_module_id);
+            let dependency = aliases.get(&dep_module_id).unwrap_or(&dep_module_id);
+            graph.add_dependency(module_id.clone(), dependency.clone());
         }
 
         // Ensure module is represented even if it has no imports
@@ -212,6 +223,25 @@ pub struct MultiModuleContext {
 
     /// Module symbols: module_id -> ModuleSymbols
     pub module_symbols: HashMap<String, ModuleSymbols>,
+
+    /// Alternate module IDs referring to the same library source.
+    pub module_aliases: HashMap<String, String>,
+
+    /// Collision-safe MIR names, keyed by canonical module ID and source name.
+    pub function_symbols: HashMap<(String, String), String>,
+}
+
+impl MultiModuleContext {
+    pub(crate) fn function_symbol(&self, module_id: &str, name: &str) -> String {
+        let canonical = self
+            .module_aliases
+            .get(module_id)
+            .map_or(module_id, String::as_str);
+        self.function_symbols
+            .get(&(canonical.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
 }
 
 /// Symbols exported by a module
@@ -366,9 +396,20 @@ fn build_import_scopes(
 /// Main entry point for multi-module resolution
 /// Returns the multi-module context and compilation order
 pub fn resolve_multi_module(
+    modules: HashMap<String, Module>,
+    entry_module: &str,
+    root_dir: &Path,
+) -> Result<(MultiModuleContext, Vec<String>), Vec<Diagnostic>> {
+    resolve_multi_module_with_aliases(modules, entry_module, root_dir, HashMap::new())
+}
+
+/// Resolve modules with explicit aliases supplied by a source-aware loader.
+/// Aliases retain their import spelling but compile a single canonical body.
+pub fn resolve_multi_module_with_aliases(
     mut modules: HashMap<String, Module>,
     entry_module: &str,
     _root_dir: &Path, // Reserved for future use
+    module_aliases: HashMap<String, String>,
 ) -> Result<(MultiModuleContext, Vec<String>), Vec<Diagnostic>> {
     // Inject built-in std modules if they are not already provided by the user
     for (id, module) in std_modules() {
@@ -382,8 +423,39 @@ pub fn resolve_multi_module(
         )]);
     }
 
+    let mut aliases = HashMap::new();
+    for alias in module_aliases.keys() {
+        let mut current = alias.as_str();
+        let mut visited = HashSet::new();
+        while let Some(target) = module_aliases.get(current) {
+            if !visited.insert(current) {
+                return Err(vec![Diagnostic::error(
+                    format!("circular module alias involving '{alias}'"),
+                    None,
+                )]);
+            }
+            current = target;
+        }
+        let Some(canonical) = modules.get(current) else {
+            return Err(vec![Diagnostic::error(
+                format!("module alias '{alias}' targets missing module '{current}'"),
+                None,
+            )]);
+        };
+        if modules.get(alias) != Some(canonical) {
+            return Err(vec![Diagnostic::error(
+                format!("module alias '{alias}' does not share the source of '{current}'"),
+                None,
+            )]);
+        }
+        aliases.insert(alias.clone(), current.to_string());
+    }
+    let entry_module = aliases
+        .get(entry_module)
+        .map_or(entry_module, String::as_str);
+
     // Step 1: Build dependency graph
-    let dep_graph = build_dependency_graph(&modules)?;
+    let dep_graph = build_dependency_graph_with_aliases(&modules, &aliases)?;
 
     // Step 2: Detect circular imports
     if let Some(cycle) = dep_graph.find_cycle() {
@@ -427,10 +499,15 @@ pub fn resolve_multi_module(
     // Step 5: Build import scopes (with collision detection)
     let import_scopes = build_import_scopes(&modules, &module_symbols)?;
 
+    let function_symbols =
+        crate::function_symbols::collect_function_symbols(&modules, &compile_order, entry_module);
+
     let context = MultiModuleContext {
         modules,
         import_scopes,
         module_symbols,
+        module_aliases: aliases,
+        function_symbols,
     };
 
     Ok((context, compile_order))

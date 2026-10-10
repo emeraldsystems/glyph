@@ -85,3 +85,41 @@ fn main() -> i32 {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("hi"));
 }
+
+#[test]
+fn duplicate_helpers_across_cases_and_library_entry_aliases_execute_correctly() {
+    let temp = TempDir::new().unwrap();
+    let workspace = temp.path();
+    let lib_dir = workspace.join("my_lib");
+    let app_dir = workspace.join("my_app");
+    write_file(
+        &lib_dir.join("glyph.toml"),
+        "[package]\nname = \"my_lib\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/api.glyph\"\n",
+    );
+    write_file(
+        &lib_dir.join("src/api.glyph"),
+        "from utils import helper\nfn answer() -> i32 { ret helper() }\n",
+    );
+    write_file(
+        &lib_dir.join("src/utils.glyph"),
+        "fn helper() -> i32 { ret 2 }",
+    );
+    write_file(
+        &app_dir.join("glyph.toml"),
+        "[package]\nname = \"my_app\"\nversion = \"0.1.0\"\n\n[dependencies]\nmy_lib = { path = \"../my_lib\" }\n\n[[bin]]\nname = \"my_app\"\npath = \"src/main.glyph\"\n",
+    );
+    write_file(
+        &app_dir.join("src/main.glyph"),
+        "from my_lib import answer as first\nfrom my_lib/api import answer as second\nimport my_lib\nfn helper() -> i32 { ret 1 }\nfn main() -> i32 { let f: FnOnce<(), i32> = my_lib::answer\nret helper() + first() + second() + f() }\n",
+    );
+
+    cargo_bin_cmd!("glyph")
+        .current_dir(&app_dir)
+        .arg("build")
+        .assert()
+        .success();
+    let output = Command::new(app_dir.join("target/debug/my_app"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+}

@@ -103,6 +103,10 @@ Under the hood, Glyph loads the dependency's source files and merges them into
 the module graph with the case name as a prefix. The existing import resolution
 handles the rest — no special syntax is needed.
 
+Functions in separate modules or cases can share a name. Each module resolves
+its own functions and imports independently, so a helper in a transitive
+dependency does not conflict with a local helper.
+
 ## Building
 
 Use `glyph build` or `glyph run` from the case root (the directory containing
@@ -129,8 +133,7 @@ resolves the graph in topological order and detects cycles.
 
 - **Path-based dependencies only** — there is no package registry yet.
 - **No visibility system** — all items in a dependency are importable.
-- **Name collisions** — if two cases define functions or types with the same
-  name, the compiler emits an error. Name mangling is planned for a future
-  release.
+- **Type name collisions** — structs and enums in separate cases must have
+  distinct names.
 - **Flat namespace** — all dependency names must be unique across the entire
   dependency graph.

@@ -134,7 +134,8 @@ pub(crate) fn lower_function(
         .as_ref()
         .and_then(|t| crate::resolver::resolve_type_expr_to_type(t, resolver));
 
-    let mut ctx = LowerCtx::new(resolver, module, fn_sigs, func.name.0.clone());
+    let target_name = resolver.local_function_symbol(&func.name.0);
+    let mut ctx = LowerCtx::new(resolver, module, fn_sigs, target_name.clone());
     ctx.fn_ret_type = ret_type.clone();
     if let Some(ret) = ret_type.as_ref()
         && type_contains_borrow(ret, resolver, &mut std::collections::HashSet::new())
@@ -194,7 +195,7 @@ pub(crate) fn lower_function(
     if closure_analysis_failed {
         ctx.push_inst(MirInst::Return(None));
         let lowered = MirFunction {
-            name: func.name.0.clone(),
+            name: target_name,
             ret_type,
             params: param_locals,
             locals: ctx.locals,
@@ -254,7 +255,7 @@ pub(crate) fn lower_function(
     }
 
     let lowered = MirFunction {
-        name: func.name.0.clone(),
+        name: target_name,
         ret_type,
         params: param_locals,
         locals: ctx.locals,
